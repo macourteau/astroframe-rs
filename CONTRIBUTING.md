@@ -2,12 +2,12 @@
 
 Thanks for looking at this. The crate is small and deliberately opinionated, so the most useful
 thing you can read before changing behaviour is
-[the design document](https://github.com/macourteau/astroframe/blob/main/docs/design/2026-08-18-astroframe-library.md) — it is a decision record
+[the design document](https://github.com/macourteau/astroframe-rs/blob/main/docs/design/2026-08-18-astroframe-library.md) — it is a decision record
 rather than an interface listing, and it says why each rule is what it is.
 
 ## Read this first if you are about to simplify the arithmetic
 
-[`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe/blob/main/docs/intentional-patterns.md) exists because parts of
+[`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/intentional-patterns.md) exists because parts of
 `src/normalize.rs` look wrong and are not. The normalization form is
 multiply-by-rounded-`f32`-reciprocal rather than the idiomatic division, and the two disagree
 on 0.78% of 16-bit levels by one ULP. **The decoded bits are part of the public API**, so that

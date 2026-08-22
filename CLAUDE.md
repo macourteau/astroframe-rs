@@ -2,7 +2,7 @@
 
 ## The design document is the source of truth
 
-[`docs/design/2026-08-18-astroframe-library.md`](https://github.com/macourteau/astroframe/blob/main/docs/design/2026-08-18-astroframe-library.md)
+[`docs/design/2026-08-18-astroframe-library.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/design/2026-08-18-astroframe-library.md)
 (`Status: Implemented`) is the specification this crate is graded against, and it is a decision
 record rather than an interface listing. Before changing behaviour, read the section that owns
 the rule. The five load-bearing homes are § Normalization (the arithmetic and the range),
@@ -10,8 +10,8 @@ the rule. The five load-bearing homes are § Normalization (the arithmetic and t
 classes), § The caps (every limit), and § Deliberate divergences from prior art.
 
 Choices the document leaves open, and the resolutions taken, are in
-[`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe/blob/main/docs/implementation-decisions.md). Code that looks wrong
-and is not is in [`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe/blob/main/docs/intentional-patterns.md) — read that
+[`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/implementation-decisions.md). Code that looks wrong
+and is not is in [`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/intentional-patterns.md) — read that
 before "simplifying" anything in `src/normalize.rs`.
 
 ## Releases are driven by `Cargo.toml`, not by commit messages

@@ -1,7 +1,7 @@
 # Invariant coverage map
 
 Required by § Invariants of
-[the design document](https://github.com/macourteau/astroframe/blob/main/docs/design/2026-08-18-astroframe-library.md).
+[the design document](https://github.com/macourteau/astroframe-rs/blob/main/docs/design/2026-08-18-astroframe-library.md).
 
 Most acceptance criteria check that a particular behaviour is right. These five are different:
 they are properties the design promises to hold **everywhere**, so a single counter-example

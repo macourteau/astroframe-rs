@@ -69,7 +69,7 @@ One primitive, shared by every container, so the two formats cannot drift apart.
 deliberately **not** the idiomatic `x as f32 / 65535.0` — the two forms disagree by one ULP on
 0.78% of 16-bit levels. **The decoded bits are part of the public API**, so that difference is
 a breaking change rather than a cleanup. See
-[`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe/blob/main/docs/intentional-patterns.md)
+[`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/intentional-patterns.md)
 before touching it.
 
 ## Features
@@ -91,13 +91,13 @@ stays true. Raising it is a minor bump at `0.x`.
 
 ## Documentation
 
-- [The design document](https://github.com/macourteau/astroframe/blob/main/docs/design/2026-08-18-astroframe-library.md)
+- [The design document](https://github.com/macourteau/astroframe-rs/blob/main/docs/design/2026-08-18-astroframe-library.md)
   — the specification this crate is graded against, and a record of why each rule is what it is.
-- [`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe/blob/main/docs/implementation-decisions.md)
+- [`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/implementation-decisions.md)
   — choices the design left to the implementer.
-- [`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe/blob/main/docs/intentional-patterns.md)
+- [`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/intentional-patterns.md)
   — code that looks wrong and is not.
-- [`CONTRIBUTING.md`](https://github.com/macourteau/astroframe/blob/main/CONTRIBUTING.md)
+- [`CONTRIBUTING.md`](https://github.com/macourteau/astroframe-rs/blob/main/CONTRIBUTING.md)
   — what to run before opening a pull request.
 
 ## Licence
