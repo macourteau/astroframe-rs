@@ -24,7 +24,7 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Pinned rather than floating. `-D warnings` against `@stable` means every six-week
       # Rust release can turn this red on a crate nobody has touched, because new lints
       # arrive and the first anyone knows of it is a merge that will not land. The weekly
@@ -73,7 +73,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98
       - uses: Swatinem/rust-cache@v2
       # The cargo features *are* the untested configuration unless CI builds their powerset.
@@ -96,7 +96,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The 2024 edition's resolver is MSRV-aware for dependency *selection* only. It does
       # not check that this crate's own code compiles on the floor it declares, so without
       # this job the declared version is an unverified claim and a consumer discovers the lie.
@@ -127,7 +127,7 @@ jobs:
       matrix:
         target: [i686-unknown-linux-gnu, wasm32-wasip1]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98
         with:
           targets: ${{ matrix.target }}
@@ -164,7 +164,7 @@ jobs:
     name: Licences
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -193,7 +193,7 @@ jobs:
     # No toolchain and no cache: this is checkout plus shell, and it is the cheapest gate
     # in the file.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Criteria that are greps
         run: |
           set -eu
@@ -282,7 +282,7 @@ jobs:
       #   `checksum` feature, and computes no runtime value at all.
       BANNED_GREP_ALLOW: "typenum"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98
       - uses: Swatinem/rust-cache@v2
       # The ban reaches "any crate that uses them internally", which a grep of this crate
@@ -344,7 +344,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The release workflow creates `v$version` *from* the manifest, so the two agree by
       # construction. This is what catches a tag pushed by hand.
       - run: |
