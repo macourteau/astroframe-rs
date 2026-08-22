@@ -1,0 +1,39 @@
+name: Toolchain drift
+
+# CI pins its toolchain so a new lint cannot block a merge on a crate nobody has touched.
+# This is what makes sure a new lint is still *seen*. A failure here is a note to bump the
+# pin in ci.yml, not a defect.
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    name: Clippy on current stable
+    runs-on: ubuntu-latest
+    if: vars.DRIFT_ENABLED == 'true'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    if: vars.DRIFT_ENABLED == 'true'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Licences are the push-time gate in ci.yml. Advisories are checked here instead, so a
+      # fresh RUSTSEC advisory against a transitive dependency arrives as a scheduled signal
+      # rather than turning an unrelated push red — while still arriving.
+      - run: cargo deny --all-features check advisories

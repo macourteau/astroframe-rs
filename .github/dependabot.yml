@@ -1,0 +1,47 @@
+version: 2
+
+updates:
+  # Cargo is deliberately ungrouped. The automerge workflow withholds automerge from any
+  # pre-1.0 dependency's minor bump, and that decision reads `previous-version` from the
+  # update's metadata — which is not meaningful on a grouped pull request, where
+  # `update-type` is the highest change across the whole group. Grouping here would silently
+  # defeat the floor.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # `fuzz/` is its own workspace with its own lockfile, so the entry above does not reach it
+  # and an unlisted lockfile is one nothing updates. Ungrouped for the same reason.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+    ignore:
+      # dtolnay/rust-toolchain's version-shaped refs are *Rust* versions, not action
+      # versions: `@1.98` is a branch that installs Rust 1.98.0. So a bump here does not
+      # update an action, it changes the compiler CI builds with — and it will happily
+      # propose a Rust that does not exist. Moving that pin is a deliberate decision, and
+      # the weekly `Toolchain drift` workflow is what signals when it is worth making.
+      - dependency-name: dtolnay/rust-toolchain

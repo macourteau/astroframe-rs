@@ -1,0 +1,384 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "3"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Pinned rather than floating. `-D warnings` against `@stable` means every six-week
+      # Rust release can turn this red on a crate nobody has touched, because new lints
+      # arrive and the first anyone knows of it is a merge that will not land. The weekly
+      # toolchain-drift workflow runs clippy on stable without gating anything, so a new
+      # lint arrives as a scheduled note instead. Bump this deliberately when that reports.
+      - uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          # Enforces `#![warn(missing_docs)]` and catches broken intra-doc links, which are
+          # easy to introduce here: rustdoc reads a specification citation like `[23]` as a
+          # link.
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test --locked --all-features
+      # The corpus is 84 GB, lives on one machine, and carries observatory coordinates at
+      # full precision. No lane may depend on it. The corpus-backed tests are `#[ignore]`d
+      # and read this variable, so the guard is that the variable is never set here.
+      - name: The corpus is never a CI dependency
+        run: |
+          if [ -n "${ASTROFRAME_CORPUS:-}" ]; then
+            echo "ASTROFRAME_CORPUS is set in CI. The corpus is machine-local and must" >&2
+            echo "never be a CI dependency." >&2
+            exit 1
+          fi
+          echo "ASTROFRAME_CORPUS is unset, as required"
+      # These two are strict subsets of the `cargo test`
+      # above, which already builds and runs both binaries, so they are steps rather than
+      # jobs: a separate job buys a second runner and a second full compile for no coverage.
+      # They stay named so a failure still says which criterion broke.
+      - name: Criterion — peak decode memory, allocation half
+        run: cargo test --locked --all-features --test peak_memory
+      - name: Criterion — fuzz corpus replays on stable
+        run: cargo test --locked --all-features --test fuzz_replay
+      # Cheap early warning that packaging works at all: it catches an `exclude` that drops
+      # a file the build needs, which no ordinary build ever sees.
+      - run: cargo package --locked --all-features
+
+  build:
+    name: Feature powerset
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: Swatinem/rust-cache@v2
+      # The cargo features *are* the untested configuration unless CI builds their powerset.
+      # The empty set is not a curiosity: with both formats off the crate still compiles and
+      # still exposes the header types and the normalization primitive, and every constructor
+      # returns Unsupported. That is a documented, supported configuration.
+      - name: Every feature combination
+        run: |
+          set -eu
+          failed=""
+          for f in "" fits xisf checksum fits,xisf fits,checksum xisf,checksum fits,xisf,checksum; do
+            echo "::group::features [$f]"
+            cargo build --locked --no-default-features --features "$f" || failed="${failed} [$f]"
+            echo "::endgroup::"
+          done
+          [ -z "$failed" ] || { echo "FAILED:${failed}" >&2; exit 1; }
+      - run: cargo build --locked --all-features --examples
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The 2024 edition's resolver is MSRV-aware for dependency *selection* only. It does
+      # not check that this crate's own code compiles on the floor it declares, so without
+      # this job the declared version is an unverified claim and a consumer discovers the lie.
+      #
+      # Reading the floor out of the manifest is what makes the check honest: pinning it here
+      # instead would need a second assertion that the two agree, and that assertion is the
+      # thing that goes stale.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "Cargo.toml declares no rust-version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      - run: cargo check --locked --all-features --all-targets
+
+  targets:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [i686-unknown-linux-gnu, wasm32-wasip1]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: 32-bit C runtime
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
+      - uses: taiki-e/install-action@v2
+        if: matrix.target == 'wasm32-wasip1'
+        with:
+          tool: wasmtime
+      # **The exhaustive numeric tests**, not the whole suite. This lane exists to prove the
+      # bit-exactness guarantee on architectures CI does not otherwise run: i686 exercises
+      # the checked u64-to-usize narrowing, which is why the caps suite joins it there, and
+      # wasm32 exercises the NaN carve-out, WebAssembly leaving a NaN result's payload and
+      # sign bit nondeterministic. The memory criteria are deliberately excluded — they write
+      # a 52 MB fixture and size a 104 MB destination, which says nothing about 32-bit
+      # correctness and much about the runner. A wasmtime guest has no preopened filesystem,
+      # so anything touching a real file cannot run there and would say nothing if it did.
+      - name: Exhaustive numeric tests
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+        run: |
+          set -eu
+          if [ "${{ matrix.target }}" = "i686-unknown-linux-gnu" ]; then
+            cargo test --locked --all-features --target ${{ matrix.target }} \
+              --test normalization --test fits_caps
+          else
+            cargo test --locked --all-features --target ${{ matrix.target }} \
+              --test normalization
+          fi
+
+  deny:
+    name: Licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      # Not ceremony. The crate's premise is that it is written from published specifications
+      # alone and so can be permissively licensed; a transitive copyleft dependency would
+      # silently destroy that, and no grep for derived names would catch it.
+      #
+      # Advisories are checked on the weekly schedule rather than here, so a fresh RUSTSEC
+      # advisory against a transitive dependency does not turn an unrelated push red.
+      - run: cargo deny --all-features check licenses
+      - name: Both licence files ship, and the manifest declares the pair
+        run: |
+          set -eu
+          test -f LICENSE-MIT    || { echo "LICENSE-MIT is missing" >&2; exit 1; }
+          test -f LICENSE-APACHE || { echo "LICENSE-APACHE is missing" >&2; exit 1; }
+          grep -qE '^license[[:space:]]*=[[:space:]]*"MIT OR Apache-2.0"' Cargo.toml \
+            || { echo 'Cargo.toml must declare license = "MIT OR Apache-2.0"' >&2; exit 1; }
+          echo "both licence files ship and the manifest declares the pair"
+
+  greps:
+    name: Grep-shaped criteria
+    runs-on: ubuntu-latest
+    # No toolchain and no cache: this is checkout plus shell, and it is the cheapest gate
+    # in the file.
+    steps:
+      - uses: actions/checkout@v5
+      - name: Criteria that are greps
+        run: |
+          set -eu
+          fail() { echo "FAIL: $1" >&2; exit 1; }
+
+          # Every check below runs over *tracked* files. A working-tree grep would also read
+          # local scratch that was never committed, which is both a false positive and the
+          # wrong question: what matters is what this repository publishes.
+
+          # Fused and fast-math helpers are banned on the decode path, because this crate
+          # performs the first floating-point rounding in any pipeline built on it.
+          #
+          # Line comments are stripped before grepping. That is not laxity: the argument for
+          # why these are banned is written *in* the code that must not use them, so a grep
+          # over raw source flags its own rationale, and the only way to keep it green would
+          # be to delete the explanation. Stripping comments keeps the check on what executes.
+          hits="$(git ls-files 'src/*.rs' \
+                  | xargs grep -nE 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' \
+                  | sed 's|//.*||' \
+                  | grep -E 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "banned numeric construct on the decode path"; }
+
+          # Invariant I1's mechanical enforcement: layer 2 lives alone, so a format cannot
+          # grow its own arithmetic without the dependency edge becoming visible in review.
+          hits="$(grep -nE '^\s*use\s+crate::(fits|xisf)' src/normalize.rs || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "src/normalize.rs imports a format module"; }
+
+          # No committed frame carries observatory coordinates, in two parts.
+          #
+          # First: no frame is committed at all. Fixtures are built byte by byte in the test
+          # source, never checked in as opaque blobs, so a real header cannot arrive as a
+          # file. This is what discharges the OBSERVER/TELESCOP/INSTRUME/OBJECT half of the
+          # criterion's name list — those are identity fields, and a real frame is their
+          # exposure vector.
+          hits="$(git ls-files '*.fits' '*.fit' '*.fts' '*.xisf' '*.xish' '*.xisb' 'test-data/*' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "a frame file is committed; fixtures are built in test source"; }
+
+          # Second: no site coordinate at real precision in the source-embedded fixtures. The
+          # name list is the load-bearing part, because the obvious one is wrong: measured
+          # against the corpus, most site coordinates arrive under LAT-OBS/LONG-OBS rather
+          # than SITELAT/SITELONG, and the XISF surface is a property. A grep keyed only on
+          # the two obvious FITS spellings passes full-precision coordinates through.
+          #
+          # The precision test is the discriminator. A real header carries roughly 10 cm
+          # precision — five or more fractional digits — where a synthetic fixture needing a
+          # plausible-looking latitude uses two.
+          hits="$(git ls-files 'src/*' 'tests/*' 'examples/*' \
+                  | xargs grep -nE '(SITELAT|SITELONG|LAT-OBS|LONG-OBS|OBSGEO-[A-Z]|Observation:Location:[A-Za-z]+)' \
+                  | grep -E '[0-9]+\.[0-9]{5,}' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "a committed fixture carries a site coordinate at real precision"; }
+
+          # No machine-local absolute path in committed content. `examples/` is in scope for
+          # the same reason `tests/` is, and more so: every example takes a frame path, and
+          # the tempting way to write one is to bake in the path the author tested with.
+          hits="$(git ls-files 'src/*' 'tests/*' 'docs/*' 'examples/*' '*.toml' '*.md' \
+                  | xargs grep -nE '[A-Z]:\\|/Users/|/home/[a-z]' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "a machine-local absolute path is committed"; }
+
+          # The crate is written from the published specifications alone. Descriptive prose
+          # naming PixInsight is fine and expected — the rule is about names.
+          hits="$(git ls-files 'src/*' 'tests/*' 'examples/*' \
+                  | grep -iE '(pixinsight|pcl|pleiades)' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "a source file name is derived from another implementation"; }
+          hits="$(grep -nE '^\s*(pub\s+)?(mod|use)\s+.*(pixinsight|pleiades)' -r src/ || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "a module name is derived from another implementation"; }
+
+          # The converted XISF specification is not redistributed. On a public repository
+          # this is a copyright matter rather than a hygiene one.
+          if git ls-files --error-unmatch 'reference/*.md' 'reference/*.html' >/dev/null 2>&1; then
+            fail "a converted specification file is committed under reference/"
+          fi
+
+          echo "all grep-shaped criteria pass"
+
+  deps-greps:
+    name: Dependency tree
+    runs-on: ubuntu-latest
+    env:
+      # Reviewed exceptions, one line of justification each. A hit anywhere is a release
+      # blocker *pending review of whether that code sits on a decode path* — this is that
+      # review, recorded, not a way around it.
+      #
+      #   typenum — `powi` on Z0/PInt/NInt is type-level *integer* exponentiation evaluated
+      #   by the compiler. No f32 or f64 is involved anywhere in the crate. It reaches the
+      #   graph through digest -> crypto-common -> hybrid-array, i.e. only with the
+      #   `checksum` feature, and computes no runtime value at all.
+      BANNED_GREP_ALLOW: "typenum"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: Swatinem/rust-cache@v2
+      # The ban reaches "any crate that uses them internally", which a grep of this crate
+      # alone does not discharge.
+      #
+      # **`cargo vendor` has no `--no-dev` flag.** So the scoping is done the other way
+      # round — vendor the whole graph, which is all cargo will do, then restrict the grep to
+      # the packages `cargo tree --edges normal` reports. That matters rather than being
+      # tidy: the dev-dependency `fitsrs` pulls `wcs` and `mapproj`, spherical-projection
+      # crates full of `to_radians` and `powi`, and an unscoped grep fails on its first run
+      # because of code no build of this library ever compiles.
+      - name: The non-dev dependency tree carries no banned construct
+        run: |
+          set -eu
+          cargo vendor --locked --versioned-dirs vendor/ >/dev/null
+
+          cargo tree --locked --all-features --edges normal --prefix none --no-dedupe \
+            | sed 's/ (\*)$//' \
+            | awk 'NF>=2 {print $1 "-" substr($2,2)}' \
+            | sort -u > normal-graph.txt
+          count="$(wc -l < normal-graph.txt)"
+          [ "$count" -gt 1 ] || { echo "cargo tree produced ${count} packages — refusing to pass on an empty graph" >&2; exit 1; }
+          echo "non-dev graph: ${count} packages"
+
+          # A whitelist that can rot silently is worse than none, so every entry must still
+          # be in the graph.
+          for allowed in $BANNED_GREP_ALLOW; do
+            grep -q "^${allowed}-" normal-graph.txt \
+              || { echo "BANNED_GREP_ALLOW names '${allowed}', which is no longer in the non-dev graph. Remove it." >&2; exit 1; }
+          done
+
+          scanned=0
+          hits=""
+          while read -r dir; do
+            [ -d "vendor/${dir}" ] || continue          # the root crate is not vendored
+            skip=""
+            for allowed in $BANNED_GREP_ALLOW; do
+              case "$dir" in "${allowed}-"*) skip=1 ;; esac
+            done
+            [ -n "$skip" ] && { echo "skipping ${dir} (reviewed exception)"; continue; }
+            scanned=$((scanned + 1))
+            found="$(grep -rnE 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' "vendor/${dir}" || true)"
+            [ -n "$found" ] && hits="${hits}${found}\n"
+          done < normal-graph.txt
+
+          [ "$scanned" -gt 1 ] || { echo "scanned ${scanned} vendor directories — refusing to pass" >&2; exit 1; }
+          echo "scanned ${scanned} vendored crates"
+
+          if [ -n "$hits" ]; then
+            printf '%b' "$hits"
+            echo "FAIL: a banned numeric construct appears in the non-dev dependency tree." >&2
+            echo "This is a release blocker pending review of whether that code sits on a decode path." >&2
+            exit 1
+          fi
+          echo "the non-dev dependency tree is clean"
+
+  tag-matches-manifest:
+    name: Tag matches the manifest
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+      # The release workflow creates `v$version` *from* the manifest, so the two agree by
+      # construction. This is what catches a tag pushed by hand.
+      - run: |
+          set -eu
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}." >&2
+            echo "The manifest is authoritative — retag, do not edit history." >&2
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml version ${version}"
+
+  # The single required check. It exists so that a conditional job can be skipped without
+  # leaving a required check pending forever, and so that adding a job later does not mean
+  # re-pointing branch protection.
+  ci-ok:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [build-test, build, msrv, targets, deny, greps, deps-greps, tag-matches-manifest]
+    if: always()
+    steps:
+      - name: Fail unless every job succeeded or was deliberately skipped
+        # The results arrive through the environment rather than interpolated into the
+        # script. GitHub Actions expressions accept single-quoted strings only, so a
+        # double-quoted separator is a workflow-level syntax error that rejects the whole
+        # file before any job starts — and passing it through `env` sidesteps the nested
+        # quoting problem entirely.
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "A required job reported '$r'" >&2; exit 1 ;;
+            esac
+          done

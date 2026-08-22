@@ -1,0 +1,66 @@
+[package]
+name = "astroframe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Decode-only reader for FITS and XISF astronomical image frames"
+repository = "https://github.com/macourteau/astroframe"
+keywords = ["fits", "xisf", "astronomy", "astrophotography", "decoder"]
+categories = ["encoding", "parser-implementations", "science"]
+readme = "README.md"
+exclude = ["/reference", "/docs", "/fuzz", "/test-data"]
+
+# Without this docs.rs builds default features only, and the feature-gated half of the API
+# — every XISF type and the checksum surface — documents as though it does not exist.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["fits", "xisf", "checksum"]
+fits = []
+xisf = ["dep:quick-xml", "dep:lz4_flex", "dep:flate2", "dep:ruzstd", "dep:base64"]
+checksum = ["dep:sha1", "dep:sha2", "dep:sha3"]
+
+[dependencies]
+thiserror = "2.0"
+
+quick-xml = { version = "0.41", optional = true }
+lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["std", "safe-decode", "checked-decode"] }
+flate2 = { version = "1.1", optional = true }
+ruzstd = { version = "0.9", optional = true, default-features = false, features = ["std"] }
+base64 = { version = "0.23", optional = true, default-features = false, features = ["std"] }
+
+sha1 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+sha3 = { version = "0.12", optional = true }
+
+[dev-dependencies]
+# An independent FITS decoder to differential-test against.
+fitsrs = "0.4.1"
+# Fixtures are built byte by byte in the test source, which for a compressed or checksummed
+# XISF block means compressing and hashing there too. These are the same crates the library
+# decodes with, listed again because an integration test is a separate crate and cannot reach
+# a dependency through the library.
+flate2 = "1.1"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+sha1 = "0.11"
+sha2 = "0.11"
+sha3 = "0.12"
+
+[profile.test]
+opt-level = 2
+
+# Release code with symbols, for `samply record`. Profiling the `release` profile itself is
+# useless here: the corpus decode spends most of its time inside inlined codec code, and
+# without debug info the profile is raw addresses -- samply resolves nothing and every frame
+# reads as `0x6afe4`. `debug = 1` is line tables only, which is what a sampling profiler needs
+# and costs no run-time speed.
+#
+#   cargo build --profile profiling --all-features --tests
+#   ASTROFRAME_CORPUS=/path/to/corpus samply record \
+#     target/profiling/deps/decode_throughput-<hash> --ignored --nocapture
+[profile.profiling]
+inherits = "release"
+debug = 1

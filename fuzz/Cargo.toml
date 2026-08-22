@@ -1,0 +1,67 @@
+[package]
+name = "astroframe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+# Kept out of the parent workspace: cargo-fuzz builds this with nightly and sanitizer flags,
+# while the library's floor is stable 1.88. The `fuzz` lane is allowed to lag and must never
+# become a gate on the stable build or a reason to raise the MSRV.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.astroframe]
+path = ".."
+features = ["fits", "xisf", "checksum"]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fits_header"
+path = "fuzz_targets/fits_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xisf_header"
+path = "fuzz_targets/xisf_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xisf_block"
+path = "fuzz_targets/xisf_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_any"
+path = "fuzz_targets/decode_any.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_sequential"
+path = "fuzz_targets/decode_sequential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_alloc"
+path = "fuzz_targets/decode_alloc.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,110 @@
+# The filename is load-bearing and must not change: crates.io matches a Trusted Publishing
+# configuration by workflow *filename*, so renaming this file breaks publishing silently
+# rather than loudly.
+name: Release
+
+# The manifest is the release trigger. Bumping `version` in Cargo.toml *is* the release
+# action, so the event that matters is that edit landing on the default branch.
+#
+# Deliberately not a schedule: GitHub disables scheduled workflows after 60 days of
+# repository inactivity, and a hands-off release lane that stops running without saying so
+# is worse than no automation.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancelled. Creating a tag is not idempotent between the existence check and the
+# create, which is how a release half-happens.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Tag and publish
+    runs-on: ubuntu-latest
+    # Stays skipped until the variable is set. Releasing is not merely unconfigured before
+    # then, it is wrong: a crate that does not yet exist on crates.io cannot be published
+    # through Trusted Publishing at all, so the first publish is a deliberate manual one
+    # with a token, and this lane takes over afterwards.
+    if: vars.RELEASE_ENABLED == 'true'
+    permissions:
+      contents: write   # create the tag and the release
+      id-token: write   # exchange for a short-lived crates.io token
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read the version the manifest declares
+        id: v
+        run: |
+          set -eu
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ -n "$version" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+
+          # Cargo.lock records this crate's own version too, and a stale lockfile is the one
+          # way the manifest can lie about what a consumer resolves. Scoped to this crate's
+          # own stanza rather than any `version =` line: Cargo.lock carries one per package,
+          # so a bump to a version some dependency already happens to carry once passed a
+          # naive grep — the exact skew this guard exists to catch.
+          if ! awk -v v="$version" '
+               /^name = "astroframe"$/ { in_pkg = 1; next }
+               /^\[\[package\]\]/      { in_pkg = 0 }
+               in_pkg && $0 == "version = \"" v "\"" { found = 1 }
+               END { exit !found }' Cargo.lock; then
+            echo "Cargo.lock does not record version ${version}; run 'cargo update -w' and commit." >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "manifest declares ${version}, and the lockfile agrees"
+
+      - name: Has this version been tagged already?
+        id: tagged
+        env:
+          TAG: v${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${TAG} already exists — nothing to release. Bump Cargo.toml to cut one."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} does not exist yet"
+          fi
+
+      # Trusted Publishing over OIDC: no registry token is stored anywhere. Note the
+      # bootstrap caveat above — a crate that does not yet exist on crates.io cannot be
+      # published this way, so the very first publish is a manual one with a real token.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.tagged.outputs.exists == 'false'
+
+      - name: Publish
+        if: steps.tagged.outputs.exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --all-features
+
+      # Tagged only after the publish succeeds. A tag for a version that is not on the
+      # registry is the confusing half-state; a publish with no tag is trivially fixed.
+      - name: Tag
+        if: steps.tagged.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${TAG}" \
+            -f sha="${GITHUB_SHA}" >/dev/null
+          echo "created ${TAG}"

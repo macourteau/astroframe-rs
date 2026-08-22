@@ -1,0 +1,43 @@
+# cargo-deny configuration.
+#
+# This is not ceremony. The crate's entire premise is that it is written from published
+# specifications alone, and so can be permissively licensed. A transitive copyleft
+# dependency would silently destroy that, and no grep for derived names would catch it.
+
+[graph]
+all-features = true
+
+[licenses]
+# Permissive only. Every entry below is present in the current graph or is a licence this
+# crate would accept without further thought; adding one is a deliberate act.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+# An allowlist entry the current graph happens not to use is not a finding. The list is a
+# statement of what this crate accepts, not an inventory of what it currently pulls.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+# Licences are the push-time gate. Advisories are checked on the weekly schedule instead, so
+# a fresh RUSTSEC advisory against a transitive dependency arrives as a signal rather than
+# turning an unrelated push red.
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,1034 @@
+//! The three-tier API.
+//!
+//! "Tier" is about how much of the file a caller asks for; it is unrelated to the two
+//! *layers*, which are about what the bytes have been turned into.
+//!
+//! - **Tier 1 — header only.** Constructing a [`Reader`] parses the first header unit and
+//!   stops; no pixel byte is read. A tool sweeping a night's frames for pixel scale and
+//!   timestamps pays only this.
+//! - **Tier 2 — whole-image decode into a destination.** [`Reader::read_image_into`] fills a
+//!   caller-owned buffer, so a batch consumer allocates once and reuses across frames.
+//! - **Tier 3 — chunked delivery.** [`Reader::chunks`] is the pull form,
+//!   [`Reader::for_each_chunk`] the push form implemented by driving it.
+//!
+//! **Tier 2 is implemented on top of tier 3**, which makes "streamed and whole-buffer decode
+//! produce bit-identical buffers" true by construction rather than by two code paths
+//! agreeing. No separate optimized whole-image path may be added later: invariant I2 would
+//! then rest on a test rather than on structure.
+
+use std::ops::{ControlFlow, Range as OpsRange};
+use std::path::Path;
+
+use crate::error::{Error, Result};
+use crate::header::{Bounds, BoundsUnavailable, Header};
+use crate::image::Image;
+use crate::limits::{Limits, narrow};
+use crate::normalize::{Normalizer, Range};
+use crate::samples::{SampleSlice, Samples};
+use crate::source::{Seekable, Sequential, Source};
+
+/// One contiguous run of one channel's samples, in native form.
+///
+/// It borrows the reader's scratch buffer rather than owning anything, which is why the
+/// cursor is a `while let` loop rather than an `Iterator`.
+///
+/// Chunk extent is the reader's choice and is independent of
+/// [`Granularity`](crate::Granularity) — a `WholeImage` source still delivers chunks, it
+/// simply had to read everything before the first one.
+#[derive(Debug)]
+pub struct Chunk<'a> {
+    channel: u32,
+    range: OpsRange<usize>,
+    samples: SampleSlice<'a>,
+}
+
+impl<'a> Chunk<'a> {
+    /// The **file's** channel index, never renumbered to zero under `select_channel`.
+    ///
+    /// [`Image::channel`] runs the other way, indexing the image's own channels. The two
+    /// numbering schemes are deliberate and neither is derivable from the other.
+    pub fn channel(&self) -> u32 {
+        self.channel
+    }
+
+    /// The sample range this chunk covers, in **destination coordinates** — offsets into the
+    /// buffer the caller supplied.
+    ///
+    /// So assembling a buffer from chunks is a copy at the stated offset with no
+    /// recalculation. The distinction only bites under `select_channel`, where file and
+    /// destination coordinates diverge: the range is always the destination's, the channel
+    /// index always the file's.
+    pub fn range(&self) -> OpsRange<usize> {
+        self.range.clone()
+    }
+
+    /// The samples themselves, in the file's own type.
+    pub fn samples(&self) -> SampleSlice<'a> {
+        self.samples
+    }
+}
+
+/// The pull form of chunked delivery.
+///
+/// Constructing one commits the reader to the pixel phase; every error the phase raises
+/// surfaces from [`Chunks::next_chunk`].
+#[derive(Debug)]
+pub struct Chunks<'a, S: Source> {
+    reader: &'a mut Reader<S>,
+}
+
+impl<S: Source> Chunks<'_, S> {
+    /// The next chunk, or `None` at the end of the image.
+    ///
+    /// A chunk borrows the reader's scratch buffer, so this is a
+    /// `while let Some(chunk) = chunks.next_chunk()?` loop rather than an `Iterator` — the
+    /// idiomatic Rust answer for lending iteration.
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>> {
+        match self.reader.advance_chunk()? {
+            None => Ok(None),
+            Some(meta) => {
+                let samples = self.reader.scratch_slice(meta.len);
+                Ok(Some(Chunk {
+                    channel: meta.channel,
+                    range: meta.start..meta.start + meta.len,
+                    samples,
+                }))
+            }
+        }
+    }
+}
+
+/// Where a chunk's samples land and which channel they belong to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkMeta {
+    /// The file's channel index.
+    pub(crate) channel: u32,
+    /// Offset into the caller's destination buffer.
+    pub(crate) start: usize,
+    /// How many samples.
+    pub(crate) len: usize,
+}
+
+/// What the reader was configured to produce, handed to a format decoder when the pixel
+/// phase begins.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PixelPlan {
+    /// The file channel the caller narrowed to, if any.
+    ///
+    /// With both format features disabled no decoder ever reads this (see `dispatch!` below),
+    /// so it is dead code in that configuration specifically, not in general.
+    #[cfg_attr(not(any(feature = "fits", feature = "xisf")), allow(dead_code))]
+    pub(crate) selected_channel: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Header,
+    Pixel,
+}
+
+enum Inner {
+    #[cfg(feature = "fits")]
+    Fits(Box<crate::fits::Decoder>),
+    #[cfg(feature = "xisf")]
+    Xisf(Box<crate::xisf::Decoder>),
+    // `Reader::build` never produces one — `sniff` always returns `Err(Unsupported)` first
+    // (see `dispatch!` below) — but the variant still has to exist for `Inner` to be a type at
+    // all, so the compiler's dead-code check is right and is silenced deliberately.
+    #[cfg(not(any(feature = "fits", feature = "xisf")))]
+    #[allow(dead_code)]
+    NoFormat,
+}
+
+/// Dispatch one method across whichever format decoders are compiled in.
+///
+/// The result type is spelled at every call site rather than inferred. That is not
+/// ceremony: with **both** format features disabled the match has no arms but the
+/// no-format one, whose body diverges, so there is nothing for the compiler to infer from
+/// — and that configuration is a documented, supported one, in which the crate still
+/// exposes `Header`, `Samples` and the normalization primitive and every constructor
+/// returns `Unsupported`.
+macro_rules! dispatch {
+    ($inner:expr, $d:ident => $body:expr, $ty:ty) => {{
+        let out: $ty = match $inner {
+            #[cfg(feature = "fits")]
+            Inner::Fits($d) => $body,
+            #[cfg(feature = "xisf")]
+            Inner::Xisf($d) => $body,
+            #[cfg(not(any(feature = "fits", feature = "xisf")))]
+            Inner::NoFormat => {
+                unreachable!("no format is compiled in, so no Reader was ever constructed")
+            }
+        };
+        // With both format features disabled, `NoFormat` is the only arm and it diverges, so
+        // `out` is unreachable to the compiler at every one of this macro's ~34 call sites.
+        // That configuration is supported (§ Operations), so the warning is silenced once
+        // here rather than at each site.
+        #[allow(unreachable_code)]
+        out
+    }};
+}
+
+/// Reads a FITS or XISF source, one image at a time.
+///
+/// `Send` when its source is, and `Sync` when its source is — the auto traits apply, since
+/// nothing here has interior mutability. Every useful method takes `&mut self`, so a shared
+/// `&Reader` is sound but buys nothing; that is a statement about the API, not about `Sync`.
+pub struct Reader<S: Source> {
+    source: S,
+    limits: Limits,
+    inner: Inner,
+    phase: Phase,
+    /// Set by `with_bounds`; per-image, cleared by `next_image`.
+    bounds_override: Option<(f64, f64)>,
+    /// Set by `select_channel`; per-image, cleared by `next_image`.
+    selected_channel: Option<u32>,
+    /// `next_image()` advances, against `Limits::images_per_source`.
+    ///
+    /// `u64` rather than `u32`, so a `u32::MAX` cap stays comparable: `saturating_add(1)` on a
+    /// `u32` counter would itself saturate at `u32::MAX`, and the cap would then never trip no
+    /// matter how far past it the source runs.
+    advances: u64,
+    /// Whether the current image's pixel phase has been started.
+    pixels_started: bool,
+    /// Set when a pixel-phase call has returned an error. See [`Reader::advance_chunk`].
+    pixels_failed: bool,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            #[cfg(feature = "fits")]
+            Inner::Fits(_) => "Fits",
+            #[cfg(feature = "xisf")]
+            Inner::Xisf(_) => "Xisf",
+            #[cfg(not(any(feature = "fits", feature = "xisf")))]
+            Inner::NoFormat => "NoFormat",
+        };
+        f.write_str(name)
+    }
+}
+
+impl<S: Source + std::fmt::Debug> std::fmt::Debug for Reader<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reader")
+            .field("format", &self.inner)
+            .field("phase", &self.phase)
+            .field("advances", &self.advances)
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------- constructors
+
+impl Reader<Seekable<std::io::BufReader<std::fs::File>>> {
+    /// Open a file. Seekable, so block order does not matter and the source length is known.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_limits(path, Limits::default())
+    }
+
+    /// [`Reader::open`] with the caller's caps.
+    pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Reader::seekable_with_limits(std::io::BufReader::new(file), limits)
+    }
+}
+
+impl<R: std::io::Read> Reader<Sequential<R>> {
+    /// Read forward-only — a pipe, a socket, a decompressed stream.
+    ///
+    /// Skipping is read-and-discard, so a block behind the cursor is [`Error::Unsupported`]
+    /// rather than a silent buffer, and there is no source length for the geometry check to
+    /// use.
+    pub fn sequential(source: R) -> Result<Self> {
+        Self::sequential_with_limits(source, Limits::default())
+    }
+
+    /// [`Reader::sequential`] with the caller's caps.
+    pub fn sequential_with_limits(source: R, limits: Limits) -> Result<Self> {
+        Reader::build(Sequential::new(source), limits)
+    }
+}
+
+impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
+    /// Read a seekable source.
+    ///
+    /// Decoding from an **in-memory buffer** is `Reader::seekable(Cursor::new(bytes))`; no
+    /// separate constructor exists, because a `Cursor` already is a seekable source and a
+    /// third entry point would only be an alias.
+    pub fn seekable(source: R) -> Result<Self> {
+        Self::seekable_with_limits(source, Limits::default())
+    }
+
+    /// [`Reader::seekable`] with the caller's caps.
+    pub fn seekable_with_limits(source: R, limits: Limits) -> Result<Self> {
+        Reader::build(Seekable::new(source)?, limits)
+    }
+}
+
+// With both format features disabled, `Reader::build` (below) always returns `Err` before a
+// `Reader` exists, so every method in this block is unreachable in that configuration and the
+// locals that only feed a `dispatch!` call — the reader's own arguments to the decoder it
+// dispatches to — read as unused. That configuration is supported (§ Operations), so the lint
+// is silenced for it specifically rather than papering over a real unused binding elsewhere.
+#[cfg_attr(not(any(feature = "fits", feature = "xisf")), allow(unused_variables))]
+impl<S: Source> Reader<S> {
+    fn build(mut source: S, limits: Limits) -> Result<Self> {
+        let mut signature = [0u8; 8];
+        source.read_exact(&mut signature).map_err(|e| match e {
+            Error::Malformed(_) => {
+                Error::malformed("source is shorter than the 8 bytes needed to identify a format")
+            }
+            other => other,
+        })?;
+
+        let inner = Self::sniff(&signature, &mut source, &limits)?;
+
+        Ok(Reader {
+            source,
+            limits,
+            inner,
+            phase: Phase::Header,
+            bounds_override: None,
+            selected_channel: None,
+            advances: 0,
+            pixels_started: false,
+            pixels_failed: false,
+        })
+    }
+
+    #[allow(unused_variables)]
+    fn sniff(signature: &[u8; 8], source: &mut S, limits: &Limits) -> Result<Inner> {
+        if signature.starts_with(b"SIMPLE") {
+            #[cfg(feature = "fits")]
+            {
+                return Ok(Inner::Fits(Box::new(crate::fits::Decoder::new(
+                    signature, source, limits,
+                )?)));
+            }
+            #[cfg(not(feature = "fits"))]
+            return Err(Error::unsupported(
+                "this build has the `fits` feature disabled",
+            ));
+        }
+        if signature.starts_with(b"XISF") {
+            if signature != b"XISF0100" {
+                return Err(Error::unsupported(format!(
+                    "XISF signature {:?}: this version reads XISF 1.0 only",
+                    String::from_utf8_lossy(signature)
+                )));
+            }
+            #[cfg(feature = "xisf")]
+            {
+                return Ok(Inner::Xisf(Box::new(crate::xisf::Decoder::new(
+                    source, limits,
+                )?)));
+            }
+            #[cfg(not(feature = "xisf"))]
+            return Err(Error::unsupported(
+                "this build has the `xisf` feature disabled",
+            ));
+        }
+        Err(Error::malformed(format!(
+            "leading bytes {:?} match neither the FITS `SIMPLE` card nor the XISF `XISF0100` \
+             signature",
+            String::from_utf8_lossy(signature)
+        )))
+    }
+
+    /// The caps this reader was built with.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    // ------------------------------------------------------------ header phase
+
+    /// The current image's header, or `None` until the first successful
+    /// [`Reader::next_image`].
+    ///
+    /// Owned rather than borrowed: a borrow would hold the reader immutably while every
+    /// pixel-phase method needs `&mut self`.
+    ///
+    /// **Fetch it after configuring the reader.** `select_channel` narrows the reported
+    /// channel count, so a header taken *before* that call still describes the file's full
+    /// channel count and would size a buffer the narrowed reader then rejects.
+    pub fn header(&self) -> Option<Header> {
+        let base = dispatch!(&self.inner, d => d.header(), Option<&Header>)?;
+        let mut header = base.clone();
+
+        if let Some(k) = self.selected_channel {
+            if let Some(g) = header.geometry.as_mut() {
+                g.channels = 1;
+            }
+            header.channel_index = Some(k);
+        }
+
+        if let Some((lo, hi)) = self.bounds_override {
+            let declared = match &base.bounds {
+                Bounds::CallerSupplied { declared, .. } => declared.clone(),
+                // Both arms need the file's own text, not a re-rendered numeric pair: a
+                // `Declared` bounds parsed successfully but must still report what the file
+                // wrote (`1.500e+03`, not `1500`), and an `InvalidDeclared` one never parsed
+                // at all.
+                Bounds::Declared(..) | Bounds::Unavailable(BoundsUnavailable::InvalidDeclared) => {
+                    dispatch!(&self.inner, d => d.declared_bounds_text(), Option<String>)
+                }
+                _ => None,
+            };
+            header.bounds = Bounds::CallerSupplied {
+                effective: (lo, hi),
+                declared,
+            };
+        }
+
+        Some(header)
+    }
+
+    /// Advance to the next image, uniformly across both formats and every file layout.
+    ///
+    /// Construction selects no image, so a single-image source returns `true` then `false`.
+    /// End of source is `Ok(false)`, not an error.
+    ///
+    /// ```no_run
+    /// # fn f(reader: &mut astroframe::Reader<impl astroframe::Source>) -> astroframe::Result<()> {
+    /// while reader.next_image()? {
+    ///     // …decode the current image…
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The images-per-source cap counts **advances**, not HDUs, so a FITS file with three
+    /// hundred tables between two images is nowhere near it.
+    ///
+    /// Reader state is per-image: `with_bounds` and `select_channel` are cleared here. The
+    /// alternative silently carries a `Float32` image's bounds onto the `UInt16` image after
+    /// it, which a multi-image XISF file makes reachable.
+    ///
+    /// Always legal after an early stop: whatever remains of an abandoned image's data is
+    /// skipped first.
+    pub fn next_image(&mut self) -> Result<bool> {
+        if self.pixels_started {
+            let src = &mut self.source;
+            let limits = &self.limits;
+            dispatch!(&mut self.inner, d => d.abandon(src, limits), Result<()>)?;
+        }
+
+        self.phase = Phase::Header;
+        self.bounds_override = None;
+        self.selected_channel = None;
+        self.pixels_started = false;
+        self.pixels_failed = false;
+
+        let src = &mut self.source;
+        let limits = &self.limits;
+        let advanced = dispatch!(&mut self.inner, d => d.next_image(src, limits), Result<bool>)?;
+
+        // The cap counts **occurrences**, so it is checked only once the decoder confirms
+        // there is another one. Counting the advance first makes the terminating call -- the
+        // one that reports end of source -- count against the cap, so a file holding exactly
+        // the cap cannot be walked to its end. § The caps says *more than* the cap is
+        // `LimitExceeded`, and a 256-image mosaic is not more than 256.
+        if advanced {
+            self.advances = self.advances.saturating_add(1);
+            if self.advances > u64::from(self.limits.images_per_source) {
+                return Err(Error::limit(format!(
+                    "images per source: this source holds more than the {} image occurrences \
+                     the cap allows",
+                    self.limits.images_per_source
+                )));
+            }
+        }
+        Ok(advanced)
+    }
+
+    // ----------------------------------------------------------- configuration
+
+    /// Override the representable range the normalized output maps against.
+    ///
+    /// **Its operands are physical values** — post-`BSCALE`/`BZERO`, the units the range map
+    /// works in. So on a `BITPIX = 16`, `BZERO = 32768` frame the pair that reproduces the
+    /// default range is `(0, 65535)`, and `(-32768, 32767)` yields a different image rather
+    /// than the same one written another way.
+    ///
+    /// Refuses the same values a file-declared `bounds` is refused for — the range validity
+    /// rule in [`Range::new`] — but as [`Error::InvalidRequest`] rather than
+    /// [`Error::Malformed`], the caller being the one at fault.
+    ///
+    /// May be called again before the pixel phase begins, and the **last call wins**; a
+    /// second call is not an error. Each call is validated on its own, so a rejected second
+    /// call leaves the first in force rather than clearing the range.
+    pub fn with_bounds(&mut self, lo: f64, hi: f64) -> Result<()> {
+        self.require_header_phase("with_bounds")?;
+        if Range::new(lo, hi).is_none() {
+            return Err(Error::invalid_request(format!(
+                "with_bounds({lo}, {hi}): 1.0f32 / ((hi - lo) as f32) must be finite, positive \
+                 and normal"
+            )));
+        }
+        self.bounds_override = Some((lo, hi));
+        Ok(())
+    }
+
+    /// Narrow the reader to one channel of the file.
+    ///
+    /// The reported channel count becomes `1` and the expected destination length becomes
+    /// `width * height`, so a caller sizing a buffer from the header is right by
+    /// construction — **provided it fetches the header after this call**.
+    ///
+    /// May be called again before the pixel phase begins, and the last call wins; it narrows
+    /// from the *file's* channels each time, not from the previous narrowing.
+    ///
+    /// At a position whose channel count is `None` this is [`Error::InvalidRequest`] for
+    /// every `k`, there being no channel count for `k` to be within.
+    pub fn select_channel(&mut self, k: u32) -> Result<()> {
+        self.require_header_phase("select_channel")?;
+        let channels = dispatch!(&self.inner, d => d.header(), Option<&Header>)
+            .and_then(|h| h.channels())
+            .ok_or_else(|| {
+                Error::invalid_request(format!(
+                    "select_channel({k}): this position reports no channel count"
+                ))
+            })?;
+        if k >= channels {
+            return Err(Error::invalid_request(format!(
+                "select_channel({k}): the file declares {channels} channels"
+            )));
+        }
+        self.selected_channel = Some(k);
+        Ok(())
+    }
+
+    fn require_header_phase(&self, what: &str) -> Result<()> {
+        if self.phase == Phase::Pixel {
+            return Err(Error::invalid_request(format!(
+                "{what}: the pixel phase has begun; configuration is fixed from that point"
+            )));
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------- pixel phase
+
+    /// Chunked delivery, pull form.
+    ///
+    /// Constructing the cursor is enough to commit the reader to the pixel phase — the
+    /// boundary is not deferred to the first [`Chunks::next_chunk`], because a caller holding
+    /// a cursor has already committed the reader. Infallible: every error the phase raises
+    /// surfaces from `next_chunk`.
+    ///
+    /// Dropping the cursor ends delivery without error, leaving the reader positioned
+    /// mid-image; [`Reader::next_image`] is still legal and skips whatever remains.
+    pub fn chunks(&mut self) -> Chunks<'_, S> {
+        self.phase = Phase::Pixel;
+        // A new cursor is a new stream over the current image, so the next `next_chunk` runs
+        // the pixel-phase order again from the top. Re-reading the same image is legal only
+        // on a seekable source; on a sequential one the rewind is `Unsupported`, which is
+        // where that rule is enforced rather than here.
+        self.pixels_started = false;
+        self.pixels_failed = false;
+        Chunks { reader: self }
+    }
+
+    /// Chunked delivery, push form — implemented by driving [`Reader::chunks`].
+    ///
+    /// The callback returns [`ControlFlow`], so a caller can stop early without inventing an
+    /// error. A callback needing to fail with its own error keeps it in captured state and
+    /// returns `Break`; the break carries no payload for exactly that reason.
+    pub fn for_each_chunk<F>(&mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&Chunk<'_>) -> ControlFlow<()>,
+    {
+        let mut chunks = self.chunks();
+        while let Some(chunk) = chunks.next_chunk()? {
+            if f(&chunk).is_break() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode native samples into a caller-owned buffer.
+    ///
+    /// The `Samples` variant must match the header's sample format — a mismatch is
+    /// [`Error::InvalidRequest`], not a silent conversion — and the length is checked with
+    /// `==`, not `>=`: an oversized slice is as much a caller error as an undersized one.
+    ///
+    /// On a part-way failure the buffer is left in an **unspecified** state, holding any
+    /// mixture of decoded and stale data. It is the caller's buffer, so the library neither
+    /// zeroes it nor restores it; a caller reusing one across frames must treat a failed
+    /// decode as having invalidated it.
+    pub fn read_samples_into(&mut self, dst: &mut Samples) -> Result<()> {
+        let header = self.current_header_for_pixels()?;
+        let format = header.sample_format().ok_or_else(|| {
+            Error::invalid_request("read_samples_into: this position reports no sample format")
+        })?;
+        if dst.format() != format {
+            return Err(Error::invalid_request(format!(
+                "read_samples_into: destination is {:?}, the file stores {format:?}",
+                dst.format()
+            )));
+        }
+        let expected = self.destination_len(&header)?;
+        if dst.len() != expected {
+            return Err(Error::invalid_request(format!(
+                "read_samples_into: destination holds {} samples, this image produces {expected}",
+                dst.len()
+            )));
+        }
+        self.check_output_bytes(output_bytes(expected, u64::from(format.bytes()))?)?;
+
+        let mut chunks = self.chunks();
+        while let Some(chunk) = chunks.next_chunk()? {
+            copy_samples(&chunk, dst)?;
+        }
+        Ok(())
+    }
+
+    /// Decode normalized `f32` into a caller-owned buffer.
+    ///
+    /// The destination length is `width * height * channels` as the *header* reports them,
+    /// which is `width * height` after `select_channel`. Checked with `==`.
+    ///
+    /// Refused when no representable range is in force — [`Error::Unsupported`] for a source
+    /// whose format defines no default (a FITS float frame, or FITS integer scaling outside
+    /// the unsigned convention), [`Error::Malformed`] for an image whose declared `bounds` is
+    /// missing or invalid. [`Reader::with_bounds`] is the escape hatch for both. Native
+    /// samples still decode in either case: a frame that cannot be *normalized* is not
+    /// thereby a frame that cannot be *read*.
+    ///
+    /// On a part-way failure the buffer is left in an unspecified state, as
+    /// [`Reader::read_samples_into`] describes.
+    pub fn read_image_into(&mut self, dst: &mut [f32]) -> Result<()> {
+        let header = self.current_header_for_pixels()?;
+        let expected = self.destination_len(&header)?;
+        if dst.len() != expected {
+            return Err(Error::invalid_request(format!(
+                "read_image_into: destination holds {} samples, this image produces {expected}",
+                dst.len()
+            )));
+        }
+        self.check_output_bytes(output_bytes(expected, 4)?)?;
+
+        let normalizer = self.normalizer(&header)?;
+
+        let mut chunks = self.chunks();
+        while let Some(chunk) = chunks.next_chunk()? {
+            let range = chunk.range();
+            // Not a file defect: `range` comes from this same call's own chunk arithmetic,
+            // already checked above against `dst.len() == expected`. A mismatch here can only
+            // be this crate's chunking disagreeing with itself, and `Error::Malformed` would
+            // misreport that as a bad file — exactly the report a caller's documented "skip
+            // this frame" response then quietly absorbs, hiding the regression rather than
+            // surfacing it. Panicking is what the fits and xisf `slice_samples` helpers already
+            // do for the identical class of failure (a decoder-internal invariant, not
+            // something any file's bytes can reach).
+            let out = dst.get_mut(range.clone()).unwrap_or_else(|| {
+                panic!(
+                    "internal invariant violated: chunk covers destination range {range:?}, \
+                     beyond the {expected} sample destination this call already validated"
+                )
+            });
+            normalize_chunk(&normalizer, &chunk, out);
+        }
+        Ok(())
+    }
+
+    /// The allocating convenience wrapper over [`Reader::read_image_into`].
+    ///
+    /// On failure this yields an error and **no** `Image`, never a half-filled one.
+    pub fn read_image(&mut self) -> Result<Image> {
+        let header = self.current_header_for_pixels()?;
+        let expected = self.destination_len(&header)?;
+        self.check_output_bytes(output_bytes(expected, 4)?)?;
+        let mut data = vec![0.0f32; expected];
+        self.read_image_into(&mut data)?;
+        let header = self.header().expect("header exists in the pixel phase");
+        Ok(Image { header, data })
+    }
+
+    // ----------------------------------------------------------------- internals
+
+    /// The header every pixel-phase entry point starts from, with the phase's first two
+    /// checks already applied.
+    ///
+    /// The total-samples cap is one of them, and it lives here rather than at each call site
+    /// because that is what fixes its place in the pixel-phase order: **first**, before the
+    /// declared-size-versus-geometry cross-check `begin_pixels` runs and before either byte
+    /// cap. A frame declaring an impossible sample count is `LimitExceeded` on the geometry it
+    /// declared, not `Malformed` on the size cross-check and not `LimitExceeded` naming a
+    /// destination that only exists because the declaration was believed.
+    fn current_header_for_pixels(&self) -> Result<Header> {
+        let header = self
+            .header()
+            .ok_or_else(|| Error::invalid_request("no image is selected; call next_image first"))?;
+        if let Some(decline) = header.decline_reason() {
+            return Err(decline.to_error());
+        }
+        self.check_total_samples()?;
+        Ok(header)
+    }
+
+    /// The destination length in samples, from the header's own (possibly narrowed) geometry.
+    fn destination_len(&self, header: &Header) -> Result<usize> {
+        let g = header.geometry.ok_or_else(|| {
+            Error::invalid_request("this position reports no geometry, so no buffer size follows")
+        })?;
+        narrow(g.total_samples(), "destination length")
+    }
+
+    fn check_output_bytes(&self, bytes: u64) -> Result<()> {
+        if bytes > self.limits.decoded_output_bytes {
+            return Err(Error::limit(format!(
+                "decoded output bytes: this decode writes {bytes} bytes, above the {} byte cap",
+                self.limits.decoded_output_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the normalization primitive for the current image, or say why there is none.
+    fn normalizer(&self, header: &Header) -> Result<Normalizer> {
+        let (lo, hi) = match header.bounds() {
+            Bounds::FormatDefault(lo, hi) | Bounds::Declared(lo, hi) => (*lo, *hi),
+            Bounds::CallerSupplied {
+                effective: (lo, hi),
+                ..
+            } => (*lo, *hi),
+            Bounds::Unavailable(BoundsUnavailable::NoFormatDefault) => {
+                return Err(Error::unsupported(
+                    "this source defines no representable range for normalized output; decode \
+                     native samples, or supply one with with_bounds",
+                ));
+            }
+            Bounds::Unavailable(BoundsUnavailable::InvalidDeclared) => {
+                return Err(Error::malformed(
+                    "the declared bounds are missing or fail the range validity rule; native \
+                     samples still decode, and with_bounds overrides",
+                ));
+            }
+        };
+        let range = Range::new(lo, hi).ok_or_else(|| {
+            Error::malformed(format!(
+                "range {lo}:{hi} fails the validity rule on 1.0f32 / ((hi - lo) as f32)"
+            ))
+        })?;
+        Ok(Normalizer::new(header.scaling(), range))
+    }
+
+    /// Drive the format decoder one chunk forward, beginning the pixel phase if needed.
+    /// One chunk, and the guarantee that a failed decode stays failed.
+    ///
+    /// **A pixel-phase error poisons the image.** A decoder that has failed part-way through a
+    /// compressed block holds state that no longer describes the file — a codec abandoned
+    /// mid-stream, a stream replaced by the uncompressed reader while its subblock could not be
+    /// opened — and asking it for the next chunk then produces *something*, which is the one
+    /// outcome § The organizing principle rules out: "a frame it cannot decode under its
+    /// documented rules is an error, never a best guess". Left ungated, a tier-3 caller that
+    /// logs an error and keeps pulling was handed the block's own compressed bytes as pixels
+    /// and then a clean end of image.
+    ///
+    /// It is `InvalidRequest` rather than a repeat of the original error: the file's fault was
+    /// already reported once, and pulling again after being told the decode failed is the
+    /// caller's. `next_image` clears it, so the poison scopes to the image that failed.
+    fn advance_chunk(&mut self) -> Result<Option<ChunkMeta>> {
+        if self.pixels_failed {
+            return Err(Error::invalid_request(
+                "this image's decode already failed; its remaining chunks cannot be trusted. \
+                 Advance to the next image, or start a fresh cursor with chunks() to retry \
+                 this one — which a seekable source allows and a sequential one refuses",
+            ));
+        }
+        let out = self.advance_chunk_inner();
+        if out.is_err() {
+            self.pixels_failed = true;
+        }
+        out
+    }
+
+    fn advance_chunk_inner(&mut self) -> Result<Option<ChunkMeta>> {
+        if !self.pixels_started {
+            // Carries the total-samples cap with it, which is why it runs before anything
+            // sizes a buffer.
+            self.current_header_for_pixels()?;
+            let plan = PixelPlan {
+                selected_channel: self.selected_channel,
+            };
+            let src = &mut self.source;
+            let limits = &self.limits;
+            dispatch!(&mut self.inner, d => d.begin_pixels(src, limits, &plan), Result<()>)?;
+            self.pixels_started = true;
+        }
+        let src = &mut self.source;
+        let limits = &self.limits;
+        dispatch!(&mut self.inner, d => d.next_chunk(src, limits), Result<Option<ChunkMeta>>)
+    }
+
+    /// The total-samples cap, evaluated **first** in the pixel phase, on the **file's**
+    /// declared geometry alone — which is why every tier-2 entry point calls it before it
+    /// touches its byte cap, and `advance_chunk` calls it before the decoder is started. It is
+    /// idempotent, so running it at both places costs nothing.
+    ///
+    /// `select_channel` does not narrow what it counts: it is the check that runs before any
+    /// buffer is sized and before any sample width is known, and rejecting a hostile
+    /// declaration that early is the whole of what it is for. Fixing it first is what makes a
+    /// frame declaring an impossible sample count `LimitExceeded` rather than `Malformed` on
+    /// the size cross-check.
+    fn check_total_samples(&self) -> Result<()> {
+        let header = dispatch!(&self.inner, d => d.header(), Option<&Header>);
+        let Some(g) = header.and_then(|h| h.geometry) else {
+            return Ok(());
+        };
+        let total = g.total_samples();
+        if total > self.limits.total_samples {
+            return Err(Error::limit(format!(
+                "total samples: the file declares {}x{}x{} = {total} samples, above the {} cap",
+                g.width, g.height, g.channels, self.limits.total_samples
+            )));
+        }
+
+        // The declared sample count must also have a *byte* extent this crate can compute, and
+        // that is a separate question from the cap above, because the cap is the caller's to
+        // raise — § The caps contemplates a workstation tool raising it, and this repo's own
+        // tests set it to `u64::MAX`. At that setting every geometry passes the comparison, and
+        // the products downstream of it (a staging row, the destination's byte size, a sample's
+        // offset within the block) are then free to overflow `u64`: panicking under the
+        // overflow checks every test and fuzz build runs with, and wrapping into an undersized
+        // buffer or an absurd allocation elsewhere.
+        //
+        // This bounds the *products of the geometry* — a staging row, the destination's byte
+        // size, a sample's offset within the block — because each is at most `total x width`,
+        // and `width` is the widest of the stored sample and the `f32` this crate normalizes
+        // into, both being sized from the same count. It does **not** bound everything
+        // downstream, and claiming so would be the kind of comment this crate has already been
+        // caught by: two sites add a *file offset* on top of such a product (a FITS data-unit
+        // start, an XISF attachment position), and an offset is not a factor of the geometry.
+        // So this is one cheap check that removes a whole class early, not a proof that covers
+        // those sites.
+        //
+        // The two are bounded differently, and this comment previously said they were bounded
+        // the same way — "by the bytes the source has actually produced ... each of them is
+        // written checked in its own right". That was true of one of them:
+        //
+        // * FITS's `data_start` is a position the source **reached**, so it is bounded by the
+        //   reading. And `file_row * row_bytes` is strictly less than the frame's byte extent,
+        //   which this gate has already refused if it does not fit `u64`. Nothing is left over
+        //   for the sum to overflow into.
+        //   (`fits_caps::a_row_offset_past_u64_is_refused_rather_than_computed` asserts it.)
+        // * XISF's `position` is **declared**, parsed straight out of a `location` attribute,
+        //   and no reading bounds it on a source whose length the reader cannot see. That site
+        //   was a bare `+` and it overflowed; it is `checked_mul`/`checked_add` now.
+        //   (`adversarial::a_row_offset_past_u64_is_refused_rather_than_computed`.)
+        //
+        // The rule the two divide on: a **declared** offset needs its own arithmetic checked,
+        // an **observed** one is bounded by the bytes that produced it.
+        //
+        // Overflow is `LimitExceeded` rather than `Malformed`: the file may be perfectly
+        // well-formed, and it is this crate's address space that cannot hold it — the same
+        // answer the narrowing rule gives.
+        let width = header
+            .and_then(|h| h.sample_format)
+            .map_or(4, |f| u64::from(f.bytes()).max(4));
+        if total.checked_mul(width).is_none() {
+            return Err(Error::limit(format!(
+                "total samples: the file declares {}x{}x{} = {total} samples, whose size in \
+                 bytes overflows the 64-bit arithmetic every size computation here runs in",
+                g.width, g.height, g.channels
+            )));
+        }
+        Ok(())
+    }
+
+    fn scratch_slice(&self, len: usize) -> SampleSlice<'_> {
+        dispatch!(&self.inner, d => d.scratch(len), SampleSlice<'_>)
+    }
+}
+
+/// A destination's size in bytes, checked.
+///
+/// The gate in `check_total_samples` already rules out a sample count whose byte extent
+/// overflows, so this cannot fail today. It is written checked anyway because § The caps makes
+/// that the rule for every size computation, and because the gate's guarantee is an argument
+/// rather than a local fact: this is the site that would silently wrap if the argument ever
+/// stopped holding, and wrapping here sizes an allocation from the remainder.
+fn output_bytes(samples: usize, width: u64) -> Result<u64> {
+    (samples as u64).checked_mul(width).ok_or_else(|| {
+        Error::limit(format!(
+            "decoded output bytes: {samples} samples at {width} bytes each overflows the \
+             64-bit arithmetic every size computation here runs in"
+        ))
+    })
+}
+
+/// Normalize one chunk into its slice of the destination.
+fn normalize_chunk(n: &Normalizer, chunk: &Chunk<'_>, out: &mut [f32]) {
+    match chunk.samples() {
+        SampleSlice::U8(s) => n.normalize_into(s, out),
+        SampleSlice::U16(s) => n.normalize_into(s, out),
+        SampleSlice::U32(s) => n.normalize_into(s, out),
+        SampleSlice::U64(s) => n.normalize_into(s, out),
+        SampleSlice::I16(s) => n.normalize_into(s, out),
+        SampleSlice::I32(s) => n.normalize_into(s, out),
+        SampleSlice::I64(s) => n.normalize_into(s, out),
+        SampleSlice::F32(s) => n.normalize_into(s, out),
+        SampleSlice::F64(s) => n.normalize_into(s, out),
+    }
+}
+
+/// Copy one chunk into its slice of a native-sample destination.
+fn copy_samples(chunk: &Chunk<'_>, dst: &mut Samples) -> Result<()> {
+    macro_rules! arm {
+        ($src:expr, $variant:ident) => {{
+            // `read_samples_into` has already required the destination's variant to match
+            // the header's sample format, the chunk's variant comes from scratch built from
+            // that same format, and `dst` is borrowed mutably for the whole loop, so it
+            // cannot change underneath. A mismatch is this crate contradicting itself, not a
+            // caller mistake -- and `InvalidRequest` would have told the caller to fix
+            // something they did nothing wrong in.
+            let Samples::$variant(out) = dst else {
+                unreachable!(
+                    "internal invariant violated: the destination's sample variant changed \
+                     mid-decode, after `read_samples_into` matched it against the header"
+                );
+            };
+            let range = chunk.range();
+            // See the matching comment in `read_image_into`: this is the same decoder-internal
+            // invariant, not a file defect, so it panics rather than misreporting `Malformed`.
+            let target = out.get_mut(range.clone()).unwrap_or_else(|| {
+                panic!("internal invariant violated: chunk covers destination range {range:?}, beyond it")
+            });
+            target.copy_from_slice($src);
+            Ok(())
+        }};
+    }
+    match chunk.samples() {
+        SampleSlice::U8(s) => arm!(s, U8),
+        SampleSlice::U16(s) => arm!(s, U16),
+        SampleSlice::U32(s) => arm!(s, U32),
+        SampleSlice::U64(s) => arm!(s, U64),
+        SampleSlice::I16(s) => arm!(s, I16),
+        SampleSlice::I32(s) => arm!(s, I32),
+        SampleSlice::I64(s) => arm!(s, I64),
+        SampleSlice::F32(s) => arm!(s, F32),
+        SampleSlice::F64(s) => arm!(s, F64),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The auto-trait claim in `Reader`'s own doc comment and in § The API, pinned so it
+    /// cannot rot again. It already had: both homes said `Reader` is "deliberately **not**
+    /// `Sync`" on the grounds that every useful method takes `&mut self` — an argument about
+    /// the API's usefulness, not about the soundness of sharing a `&T`, and the compiler
+    /// never agreed with it. A property asserted only in prose is a property nothing checks.
+    #[test]
+    fn reader_is_send_and_sync_when_its_source_is() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Reader<crate::source::Seekable<std::io::Cursor<Vec<u8>>>>>();
+        assert_sync::<Reader<crate::source::Seekable<std::io::Cursor<Vec<u8>>>>>();
+    }
+
+    /// A chunk's destination range disagreeing with the buffer it was already
+    /// checked against is this crate's own chunking arithmetic contradicting itself, not
+    /// anything a file can cause — so it panics instead of returning `Error::Malformed`,
+    /// matching the `slice_samples` helpers in `src/fits/decoder.rs` and
+    /// `src/xisf/decoder.rs`, which face the identical class of failure.
+    #[test]
+    #[should_panic(expected = "internal invariant violated")]
+    fn copy_samples_panics_when_a_chunks_range_exceeds_the_destination() {
+        let chunk = Chunk {
+            channel: 0,
+            range: 0..4,
+            samples: SampleSlice::U8(&[1, 2, 3, 4]),
+        };
+        let mut dst = Samples::U8(vec![0u8; 2]);
+        let _ = copy_samples(&chunk, &mut dst);
+    }
+
+    /// At `images_per_source = u32::MAX`, a `u32` advance counter's
+    /// `saturating_add(1)` sticks at `u32::MAX` instead of crossing it, so the cap comparison
+    /// never fires. Reaches into `Reader`'s private fields directly rather than actually
+    /// driving four billion advances.
+    #[cfg(feature = "xisf")]
+    #[test]
+    fn images_per_source_cap_still_trips_at_u32_max() {
+        let two_images = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<xisf xmlns="http://www.pixinsight.com/xisf" version="1.0">"#,
+            r#"<Image geometry="1:1:1" sampleFormat="UInt8" location="embedded">"#,
+            r#"<Data encoding="hex">00</Data></Image>"#,
+            r#"<Image geometry="1:1:1" sampleFormat="UInt8" location="embedded">"#,
+            r#"<Data encoding="hex">00</Data></Image></xisf>"#
+        );
+        let mut bytes = b"XISF0100".to_vec();
+        bytes.extend_from_slice(&(two_images.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(two_images.as_bytes());
+
+        let limits = Limits {
+            images_per_source: u32::MAX,
+            ..Limits::default()
+        };
+        let mut reader =
+            Reader::sequential_with_limits(std::io::Cursor::new(bytes), limits).unwrap();
+        assert!(reader.next_image().unwrap(), "the fixture's first image");
+
+        // Skip past four billion advances instead of performing them.
+        reader.advances = u64::from(u32::MAX);
+
+        let err = reader
+            .next_image()
+            .expect_err("the fixture's second image crosses the cap from u32::MAX advances");
+        assert!(
+            matches!(err, Error::LimitExceeded(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `with_bounds` overriding a file-declared `bounds` must report the file's own
+    /// text verbatim, not a numeric pair re-rendered through a formatter — `1.500e+03` becomes
+    /// `1500` that way, which is precisely the "re-rendering a number through a formatter can
+    /// lose digits" failure § Decisions the implementer must not silently change bans for keyword values.
+    #[cfg(feature = "xisf")]
+    #[test]
+    fn overriding_a_declared_bounds_preserves_the_files_verbatim_text() {
+        // A minimal monolithic XISF unit, built by hand rather than through
+        // `tests/common/xisf.rs`: this module cannot reach that helper (it lives outside a
+        // Reader unit test's edit boundary here), and one embedded-block image needs none of
+        // its attachment-offset machinery.
+        let image = concat!(
+            r#"<Image geometry="1:1:1" sampleFormat="UInt8" bounds="0.0000:1.500e+03" "#,
+            r#"location="embedded"><Data encoding="hex">00</Data></Image>"#
+        );
+        let header = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf xmlns="http://www.pixinsight.com/xisf" version="1.0">{image}</xisf>"#
+        );
+        let mut bytes = b"XISF0100".to_vec();
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(header.as_bytes());
+
+        let mut reader = Reader::sequential(std::io::Cursor::new(bytes)).unwrap();
+        assert!(reader.next_image().unwrap());
+        assert_eq!(
+            reader.header().unwrap().bounds(),
+            &Bounds::Declared(0.0, 1500.0),
+            "fixture sanity check: the file's declared bounds must parse before the override \
+             matters"
+        );
+        reader.with_bounds(0.0, 100.0).unwrap();
+
+        match reader.header().unwrap().bounds() {
+            Bounds::CallerSupplied {
+                declared,
+                effective,
+            } => {
+                assert_eq!(declared.as_deref(), Some("0.0000:1.500e+03"));
+                assert_eq!(*effective, (0.0, 100.0));
+            }
+            other => panic!("unexpected bounds: {other:?}"),
+        }
+    }
+}

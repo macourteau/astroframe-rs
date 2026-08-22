@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Third-party specifications are NOT redistributed from this repo.
+# tools/xisf-spec-to-md.py is ours and is committed; its output is a
+# format-shifted copy of Pleiades Astrophoto's documentation and stays local.
+/reference/*.md
+/reference/*.html
+!/reference/README.md
+
+# Test corpora (large, and may carry observatory location metadata)
+/test-data/
+
+# cargo vendor output from the deps-greps lane, when run locally
+/vendor/
+/normal-graph.txt
+
+# cargo-fuzz build output. The corpus and crash artifacts are deliberately NOT ignored:
+# every crash the fuzzer finds is committed as a regression seed, and the replay step is
+# what replays them on stable.
+/fuzz/target/
+
+# Machine-local notes, never committed
+*.local.*

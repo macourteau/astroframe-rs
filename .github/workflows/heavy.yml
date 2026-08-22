@@ -1,0 +1,67 @@
+name: Fuzz
+
+# Scheduled and manual, deliberately not a pull-request check: fuzzing on a pull request
+# either finds nothing within the budget it is given or blocks a merge on a run nobody
+# sized for it. The lane exists because a fuzz target nobody runs is decoration — it
+# compiles, it is never exercised, and this crate's hardening claim rests on it.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+      max_len:
+        description: Maximum input length in bytes
+        default: "4194304"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # Actions minutes are billed while the repository is private and free once it is public,
+    # and a full firing of this matrix is roughly an hour of runner time. It stays off until
+    # the variable is set.
+    if: vars.FUZZ_ENABLED == 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decode_any
+          - decode_alloc
+          - decode_sequential
+          - fits_header
+          - xisf_block
+          - xisf_header
+    steps:
+      - uses: actions/checkout@v5
+      # cargo-fuzz needs a nightly toolchain for its sanitizer flags while this crate's
+      # floor is stable 1.88. So this lane is pinned to nightly, is allowed to lag, and must
+      # never become a gate on the stable build or a reason to raise the MSRV. The
+      # *regression* half of fuzzing — replaying the committed corpus — runs on stable in
+      # `ci.yml`, which is what makes that separation affordable.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: |
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ inputs.seconds || '300' }} \
+            -max_len=${{ inputs.max_len || '4194304' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 30
+          if-no-files-found: ignore
