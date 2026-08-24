@@ -31,8 +31,11 @@ jobs:
     # and a full firing of this matrix is roughly an hour of runner time. It stays off until
     # the variable is set.
     if: vars.FUZZ_ENABLED == 'true'
-    continue-on-error: true
     strategy:
+      # What keeps one target's crash from cancelling the other five. `continue-on-error`
+      # is not the tool for that job and must not come back: at the job level it makes the
+      # run conclude green whatever happens, so a crash — or a lane that fails to build at
+      # all — reports as success and nobody hears about it.
       fail-fast: false
       matrix:
         target:
@@ -54,8 +57,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # `cargo fuzz` defaults `--target` to the triple it was itself built for, and the
+      # prebuilt binary installed above is a musl one. Left to default it therefore builds
+      # the fuzzers against a musl std that this gnu toolchain does not carry — and a
+      # sanitizer cannot instrument a statically linked libc in any case, so the two errors
+      # arrive together. Naming the host triple keeps the fuzzers on the toolchain that is
+      # actually installed.
       - run: |
-          cargo fuzz run ${{ matrix.target }} -- \
+          cargo fuzz run --target "$(rustc -vV | sed -n 's/^host: //p')" \
+            ${{ matrix.target }} -- \
             -max_total_time=${{ inputs.seconds || '300' }} \
             -max_len=${{ inputs.max_len || '4194304' }}
       - uses: actions/upload-artifact@v7
