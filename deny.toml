@@ -36,6 +36,14 @@ wildcards = "deny"
 # a fresh RUSTSEC advisory against a transitive dependency arrives as a signal rather than
 # turning an unrelated push red.
 yanked = "warn"
+# An unmaintained advisory against a crate this repository does not depend on directly is
+# not actionable. RUSTSEC-2024-0436 reaches the graph as fitsrs → wcs → paste, and no
+# release of either intermediate drops it, so the alternative to this setting is a lane
+# that stays red over something no change here can make go away — which trains the reader
+# to ignore the one place a real advisory would appear. It narrows the unmaintained class
+# alone: a vulnerability advisory against any crate in the graph, dev-dependency or not,
+# still fails the check, as does an unmaintained one against a direct dependency.
+unmaintained = "workspace"
 
 [sources]
 unknown-registry = "deny"
