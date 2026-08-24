@@ -31,8 +31,11 @@ jobs:
     # and a full firing of this matrix is roughly an hour of runner time. It stays off until
     # the variable is set.
     if: vars.FUZZ_ENABLED == 'true'
-    continue-on-error: true
     strategy:
+      # What keeps one target's crash from cancelling the other five. `continue-on-error`
+      # is not the tool for that job and must not come back: at the job level it makes the
+      # run conclude green whatever happens, so a crash — or a lane that fails to build at
+      # all — reports as success and nobody hears about it.
       fail-fast: false
       matrix:
         target:
