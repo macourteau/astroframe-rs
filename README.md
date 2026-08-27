@@ -7,6 +7,10 @@ exposure, gain, pixel scale, pointing, timestamps — and the pixels themselves,
 file's own sample type or normalized to `f32` in `[0,1]`, row-major and channel-planar.
 Nothing in it writes a frame.
 
+It is pure Rust end to end: no C library, no `-sys` crate, and no build-time toolchain
+beyond `cargo`. The compression and hashing dependencies are Rust implementations, and the
+crate itself sets `#![forbid(unsafe_code)]`.
+
 ```toml
 [dependencies]
 astroframe = "0.1"
