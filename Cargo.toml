@@ -27,7 +27,10 @@ thiserror = "2.0"
 
 quick-xml = { version = "0.41", optional = true }
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["std", "safe-decode", "checked-decode"] }
-flate2 = { version = "1.1", optional = true }
+# `rust_backend` is flate2's own default and selects miniz_oxide. It is named here rather
+# than inherited so that the crate's pure-Rust claim rests on this manifest rather than on
+# an upstream default staying what it is. Every sibling codec pins its features the same way.
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
 ruzstd = { version = "0.9", optional = true, default-features = false, features = ["std"] }
 base64 = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 
