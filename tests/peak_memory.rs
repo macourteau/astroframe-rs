@@ -1,9 +1,9 @@
 //! *Peak decode memory meets the stated target* — the allocation half.
 //!
-//! The criterion has **two forms, because a scheduled-only check lets the regression it
-//! exists to catch merge green**: an allocation bound on every push (this file), and a
-//! resident-memory measurement on the scheduled lane, where a quiet machine makes it
-//! meaningful (`tests/peak_memory_resident.rs`).
+//! The criterion has **two forms, because a check no lane runs lets the regression it exists
+//! to catch merge green**: an allocation bound on every push (this file), and a
+//! resident-memory measurement invoked by hand, where a quiet machine makes it meaningful
+//! (`tests/peak_memory_resident.rs`).
 //!
 //! Both express the same thing as a multiple of the **destination buffer**. The destination
 //! is allocated before the measured region begins, so what is counted here is everything the
