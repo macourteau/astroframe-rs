@@ -9,7 +9,23 @@ repository = "https://github.com/macourteau/astroframe-rs"
 keywords = ["fits", "xisf", "astronomy", "astrophotography", "decoder"]
 categories = ["encoding", "parser-implementations", "science"]
 readme = "README.md"
-exclude = ["/reference", "/docs", "/fuzz", "/test-data"]
+# What a consumer unpacking the `.crate` can use, and nothing else. `CLAUDE.md` is an
+# instruction file for work in this repository rather than consumer documentation, and its
+# links point into `/docs`, which this same list excludes — so shipping it publishes a page
+# of dead links. The repository's own machinery goes with it: the workflows, the licence
+# policy, the specification-fetching scripts and the ignore file all describe how this
+# repository is developed, which happens on GitHub rather than in a registry tarball.
+exclude = [
+    "/.github",
+    "/.gitignore",
+    "/CLAUDE.md",
+    "/deny.toml",
+    "/docs",
+    "/fuzz",
+    "/reference",
+    "/test-data",
+    "/tools",
+]
 
 # Without this docs.rs builds default features only, and the feature-gated half of the API
 # — every XISF type and the checksum surface — documents as though it does not exist.
