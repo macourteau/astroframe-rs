@@ -82,6 +82,27 @@ jobs:
             echo "${TAG} does not exist yet"
           fi
 
+      # The suite runs *here*, against the exact commit about to be published, rather than
+      # being inherited from the CI workflow. Those two run concurrently on the same push and
+      # nothing orders them, so without this step a publish can complete before `ci-ok`
+      # reports. `cargo publish`'s own verification step is a build, and a build is not a test
+      # run: a commit that compiles and fails `cargo test` publishes clean. Publishing is the
+      # one irreversible thing this repository does — a yank leaves the version visible and
+      # still resolvable for anything that already locked it — so it is the one place worth
+      # paying for a second run of a suite CI is also running.
+      #
+      # Gating the workflow on CI through `workflow_run` was the alternative, and it loses on
+      # every axis this file already cares about. The filename is load-bearing for Trusted
+      # Publishing, so the wiring cannot be moved into a file named for what it does;
+      # `workflow_run` supports no `paths:` filter, so the manifest-changed trigger would have
+      # to be reimplemented as an in-job diff against the previous commit; and a mis-wired
+      # trigger does not fail, it silently never fires, which is the failure mode every other
+      # comment in this file is written against. A test step cannot be mis-wired: it either
+      # runs and passes, or the release stops.
+      - name: Test the commit being published
+        if: steps.tagged.outputs.exists == 'false'
+        run: cargo test --locked --all-features
+
       # Trusted Publishing over OIDC: no registry token is stored anywhere. Note the
       # bootstrap caveat above — a crate that does not yet exist on crates.io cannot be
       # published this way, so the very first publish is a manual one with a real token.

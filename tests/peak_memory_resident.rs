@@ -1,16 +1,18 @@
 //! *Peak decode memory meets the stated target* — the resident-memory half.
 //!
 //! The other half, the allocation bound in `tests/peak_memory.rs`, runs on every push. This
-//! one is **scheduled**, because resident memory only means something on a quiet machine: it
-//! measures what the operating system actually holds, which a busy runner and an allocator
-//! that has not returned pages to the OS both perturb.
+//! one is **invoked by hand**, because resident memory only means something on a quiet
+//! machine: it measures what the operating system actually holds, which a busy runner and an
+//! allocator that has not returned pages to the OS both perturb. A threshold widened until a
+//! shared runner could not fail it would stop being a measurement, so no CI lane runs it and
+//! `CLAUDE.md` carries the invocation beside the corpus run.
 //!
 //! Peak RSS is sampled by a thread polling during the decode rather than read from the
 //! kernel's high-water mark afterwards, because that mark never decreases — building the
 //! 52 MB fixture would leave it above anything the decode could show.
 //!
 //! Linux only. It **skips cleanly** elsewhere rather than failing, since `/proc` is where the
-//! figure comes from and the scheduled lane runs on Linux runners.
+//! figure comes from.
 
 mod common;
 
@@ -77,9 +79,10 @@ impl Drop for Scratch {
 
 /// `#[ignore]`d so the per-push `test` job does not run it. Resident memory only means
 /// something on a quiet machine — a runner building three other jobs perturbs it — which is
-/// why the design puts this half on the scheduled lane. The scheduled job passes `--ignored`.
+/// why the design puts this half on a maintainer-local invocation rather than in a lane.
+/// `CLAUDE.md`'s local verification list carries the command.
 #[test]
-#[ignore = "resident-memory measurement; scheduled lane only, needs a quiet machine"]
+#[ignore = "resident-memory measurement; maintainer-local, needs a quiet machine"]
 fn peak_resident_memory_meets_the_stated_target() {
     if resident_bytes().is_none() {
         eprintln!("skipping: resident-memory measurement needs /proc, so this runs on Linux only");
@@ -113,7 +116,7 @@ fn peak_resident_memory_meets_the_stated_target() {
     let allowed = destination_bytes / 4; // 1.25x the destination, minus the destination
     // Printed because an RSS sample can legitimately come back at zero — the sampler is a
     // thread and the decode is short — and a bound satisfied by measuring nothing is a pass
-    // that means nothing. The lane's log is where that shows.
+    // that means nothing. `--nocapture` is where that shows.
     println!(
         "FITS 25 MP: peak {peak} baseline {baseline} above {above} allowed {allowed} \
          destination {destination_bytes}"
