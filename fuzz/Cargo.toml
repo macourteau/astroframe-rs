@@ -14,8 +14,10 @@ rust-version = "1.88"
 cargo-fuzz = true
 
 [dependencies]
+# `xisf_block` takes a typed `(&[u8], &[u8])` input, which reaches `Arbitrary` through
+# libfuzzer-sys's own re-export. No target names the crate or derives the trait, so it is not
+# a direct dependency here.
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.astroframe]
 path = ".."
