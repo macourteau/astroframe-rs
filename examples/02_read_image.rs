@@ -22,22 +22,24 @@ fn main() -> astroframe::Result<()> {
     let mut buffer: Vec<f32> = Vec::new();
 
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        let header = reader.current_header()?;
         if header.decline_reason().is_some() {
             continue;
         }
 
-        // Every geometry accessor is `Option` — a declined position has no geometry, and a
-        // malformed one may be missing pieces. Past `decline_reason` they are present.
-        let (Some(w), Some(h), Some(c)) = (header.width(), header.height(), header.channels())
-        else {
+        // The geometry is `Option` — a declined position has no geometry, and a malformed one
+        // may be missing pieces. Past `decline_reason` it is present, and the three axes move
+        // as a unit, so it is one `Option` rather than three.
+        let Some(g) = header.geometry() else {
             continue;
         };
+        let (w, h, c) = (g.width, g.height, g.channels);
 
         // Reuse one buffer across frames. `read_image_into` requires an exactly-sized
-        // destination and returns `InvalidRequest` otherwise, rather than silently truncating.
+        // destination and returns `InvalidRequest` otherwise, rather than silently truncating,
+        // and `destination_len` is that same count computed by the reader.
         buffer.clear();
-        buffer.resize(w as usize * h as usize * c as usize, 0.0);
+        buffer.resize(reader.destination_len()?, 0.0);
 
         // Not every frame has a representable range — a FITS float frame typically does not,
         // and normalized output is refused rather than invented. That is `Unsupported`, and it

@@ -22,24 +22,20 @@ fn main() -> astroframe::Result<()> {
     let mut reader = Reader::open(&path)?;
 
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        let header = reader.current_header()?;
         if header.decline_reason().is_some() {
             continue;
         }
-        let (Some(w), Some(h), Some(c), Some(format)) = (
-            header.width(),
-            header.height(),
-            header.channels(),
-            header.sample_format(),
-        ) else {
+        let (Some(g), Some(format)) = (header.geometry(), header.sample_format()) else {
             continue;
         };
 
         // The destination is typed by the file's own format rather than chosen by the caller:
         // handing `read_samples_into` a mismatched variant is `InvalidRequest`, not a
-        // conversion.
-        let mut samples = Samples::zeroed(format, w as usize * h as usize * c as usize);
-        reader.read_samples_into(&mut samples)?;
+        // conversion. `read_samples` allocates one of the right variant and the right length,
+        // which is the layer-1 counterpart of `read_image`; over many frames prefer
+        // `Samples::zeroed` once and `read_samples_into` in the loop.
+        let samples = reader.read_samples()?;
 
         // `Samples` is the owned enum, one variant per sample width. Unlike `Bounds` and
         // `Granularity` it is deliberately **closed** — no `#[non_exhaustive]` — so this match
@@ -57,7 +53,10 @@ fn main() -> astroframe::Result<()> {
             Samples::F32(v) => float_summary(v.iter().map(|&x| f64::from(x))),
             Samples::F64(v) => float_summary(v.iter().copied()),
         };
-        println!("{w}x{h}x{c}  {format:?}  {summary}");
+        println!(
+            "{}x{}x{}  {format:?}  {summary}",
+            g.width, g.height, g.channels
+        );
     }
     Ok(())
 }

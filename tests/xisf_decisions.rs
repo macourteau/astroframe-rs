@@ -33,7 +33,7 @@ use common::xisf::{
     PREAMBLE, Unit, base64, be_u16, checksum_attr, expected_u16, hex, le_f32, le_u8, le_u16, lz4,
     repeating_u16, samples, shuffle, with_header, zlib,
 };
-use common::{assert_same_bits, kind};
+use common::{Streams, assert_granularity, assert_same_bits, kind};
 
 // ------------------------------------------------------------------ helpers
 
@@ -61,7 +61,7 @@ fn attached_u16(extra: &str, stored: Vec<u8>) -> Vec<u8> {
 fn read_one(bytes: Vec<u8>) -> (Header, Vec<f32>) {
     let mut reader = seekable(bytes).expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"), "one image");
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header().expect("the advanced position");
     let image = reader.read_image().expect("the image decodes");
     assert!(
         !reader.next_image().expect("the walk ends"),
@@ -619,7 +619,9 @@ fn section_8_3_white_space_and_sign_spellings_are_accepted_around_plain_text_sca
     assert_eq!(header.offset(), Some(0.0));
     // A `bounds` a writer wrote redundantly is `Declared`, not `FormatDefault`: §11.5.1 only
     // says such a `bounds` *should not* be written, so real writers produce it.
-    assert_eq!(*header.bounds(), astroframe::Bounds::Declared(0.0, 65535.0));
+    assert!(
+        matches!(header.bounds(), astroframe::Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 65535.0)
+    );
 }
 
 /// Row *The header is parsed namespace-aware, matching elements by local name*.
@@ -940,7 +942,7 @@ fn attached_image(attrs: &str, stored: Vec<u8>) -> Vec<u8> {
 fn first_header(bytes: Vec<u8>) -> Header {
     let mut reader = seekable(bytes).expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    reader.header().expect("an advanced reader has a header")
+    reader.current_header().expect("the advanced position")
 }
 
 /// The geometry three, as a triple, so the representability rule is one assertion.
@@ -1121,7 +1123,11 @@ fn the_three_subblock_checks_hold_and_subblocks_without_compression_is_malformed
         stored.clone(),
     );
     let header = decodes_to(good, &levels, "a well-formed subblock split");
-    assert_eq!(header.granularity(), Granularity::Block { subblocks: 2 });
+    assert_granularity(
+        header.granularity(),
+        Streams::Block(2),
+        "a well-formed subblock split",
+    );
 
     // The attribute describes how compressed data was split; on an uncompressed block it
     // describes nothing. This crate's decision, not a spec rule.
@@ -1287,7 +1293,7 @@ fn a_mismatched_attachment_digest_surfaces_at_the_pixel_call_not_at_construction
     let wrong = checksum_attr("sha-1", &le_u16(&[7u16; 12]));
     let mut reader = seekable(attached_u16(&wrong, stored)).expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header().expect("the advanced position");
     // Tier 1 stays free for an attachment: nothing was read, so nothing was verified, and the
     // position is not declined.
     assert!(header.decline_reason().is_none(), "tier 1 reads no block");
@@ -1759,7 +1765,9 @@ fn every_reported_attribute_is_reachable_by_its_own_accessor() {
     // A redundant `bounds` still reports `Declared`, not `FormatDefault`: §11.5.1 only says
     // such a `bounds` *should not* be written, so real writers produce it — and a consumer's
     // envelope predicate has to be able to see the difference.
-    assert_eq!(*header.bounds(), astroframe::Bounds::Declared(0.0, 65535.0));
+    assert!(
+        matches!(header.bounds(), astroframe::Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 65535.0)
+    );
     assert_eq!(header.color_space(), Some(ColorSpace::Rgb));
     assert_eq!(header.pixel_storage(), Some(PixelStorage::Planar));
     assert_eq!(header.image_id(), Some("light_0042"));
@@ -1808,9 +1816,8 @@ fn every_reported_attribute_is_reachable_by_its_own_accessor() {
     // An integer image with no `bounds` takes §8.5.5's [0, 2ⁿ − 1] default, and `bounds()`
     // carries the pair so a tier-3 caller normalizing chunks reads the range directly instead
     // of re-deriving it from the sample width.
-    assert_eq!(
-        *header.bounds(),
-        astroframe::Bounds::FormatDefault(0.0, 65535.0)
+    assert!(
+        matches!(header.bounds(), astroframe::Bounds::FormatDefault(r) if r.lo() == 0.0 && r.hi() == 65535.0)
     );
 }
 
@@ -1936,16 +1943,16 @@ fn granularity_is_the_worst_floor_not_the_first() {
 
     // Every row's pixels are asserted here as well as its reported floor, which is what makes
     // the reported value describe a decode that happens rather than one that does not.
-    let rows: Vec<(&str, Vec<u8>, Granularity)> = vec![
+    let rows: Vec<(&str, Vec<u8>, Streams)> = vec![
         (
             "uncompressed, no checksum",
             attached_u16("", plain.clone()),
-            Granularity::Rows,
+            Streams::Rows,
         ),
         (
             "zlib, no shuffling, no checksum",
             attached_u16(&format!(r#"compression="zlib:{size}""#), zlib(&plain)),
-            Granularity::Rows,
+            Streams::Rows,
         ),
         (
             // `Block` is reachable *only* this way: zlib and zstd already stream by rows, and
@@ -1955,7 +1962,7 @@ fn granularity_is_the_worst_floor_not_the_first() {
                 &format!(r#"compression="lz4:{size}" subblocks="{lz4_list}""#),
                 lz4_split.clone(),
             ),
-            Granularity::Block { subblocks: 2 },
+            Streams::Block(2),
         ),
         (
             // `subblocks` only blocks a promotion; it never lowers a `Rows` floor.
@@ -1964,7 +1971,7 @@ fn granularity_is_the_worst_floor_not_the_first() {
                 &format!(r#"compression="zlib:{size}" subblocks="{zlib_list}""#),
                 zlib_split,
             ),
-            Granularity::Rows,
+            Streams::Rows,
         ),
         (
             "subblocks + shuffling",
@@ -1972,7 +1979,7 @@ fn granularity_is_the_worst_floor_not_the_first() {
                 &format!(r#"compression="lz4+sh:{size}:2" subblocks="{shuffled_list}""#),
                 shuffled_split.clone(),
             ),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
         (
             // The digest covers the whole **stored** block (§10.5), which `subblocks` does not
@@ -1982,7 +1989,7 @@ fn granularity_is_the_worst_floor_not_the_first() {
                 &format!(r#"compression="lz4:{size}" subblocks="{lz4_list}" {checksummed_split}"#),
                 lz4_split.clone(),
             ),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
         (
             "checksummed + shuffled + subblocked",
@@ -1992,24 +1999,24 @@ fn granularity_is_the_worst_floor_not_the_first() {
                 ),
                 shuffled_split,
             ),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
         (
             // The pixels were fully materialized during the header parse, so no part of the
             // input remains to stream.
             "embedded",
             embedded_u16("", r#"encoding="base64""#, &base64(&plain)),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
         (
             "one lz4 block covering the image",
             attached_u16(&format!(r#"compression="lz4:{size}""#), lz4(&plain)),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
         (
             "one checksummed block covering the image",
             attached_u16(&checksummed_plain, plain.clone()),
-            Granularity::WholeImage,
+            Streams::WholeImage,
         ),
     ];
 
@@ -2017,7 +2024,7 @@ fn granularity_is_the_worst_floor_not_the_first() {
         // Reported *before* the decode, which is the whole point of the accessor — a caller
         // decides how to buffer from it rather than discovering the answer afterwards.
         let header = first_header(bytes.clone());
-        assert_eq!(header.granularity(), want, "{what}");
+        assert_granularity(header.granularity(), want, what);
         decodes_to(bytes, &levels, what);
     }
 }
@@ -2196,9 +2203,11 @@ fn baseline_conformance_reads_uint8_uint16_and_float32_samples() {
     ))
     .expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header().expect("the advanced position");
     assert_eq!(header.sample_format(), Some(SampleFormat::F32));
-    assert_eq!(*header.bounds(), astroframe::Bounds::Declared(0.0, 1.0));
+    assert!(
+        matches!(header.bounds(), astroframe::Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1.0)
+    );
 
     // Layer 1 first — the file's own sample type, before any normalization.
     let mut native = Samples::zeroed(SampleFormat::F32, 12);

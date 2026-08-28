@@ -1,18 +1,14 @@
-//! Everything parsed before pixels.
-//!
-//! The organizing rule — report what the file says, interpret nothing — only means something
-//! if the reported facts are reachable, and most of the XISF ones are XML *attributes*,
-//! neither `FITSKeyword` nor `Property` elements, so no keyword lookup reaches them.
-//! [`Header`] exposes them as typed accessors, format-independent where the two formats
-//! agree.
+//! Everything parsed before pixels. The user-facing prose lives on [`Header`] itself, which
+//! is where a caller meets it.
 
 use std::sync::Arc;
 
 use crate::error::Error;
 use crate::metadata::{
-    Cfa, DisplayFunction, Keyword, KeywordSet, Keywords, Properties, PropertySet, Resolution,
+    Cfa, DisplayFunction, Keyword, KeywordSet, Keywords, Properties, Property, PropertySet,
+    Resolution,
 };
-use crate::normalize::Scaling;
+use crate::normalize::{Range, Scaling};
 use crate::samples::SampleFormat;
 
 /// FITS `ROWORDER`, reported and applied to nothing.
@@ -46,6 +42,7 @@ pub enum RowOrder {
 
 impl RowOrder {
     /// Classify a `ROWORDER` value.
+    #[must_use]
     pub fn classify(value: &str) -> RowOrder {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("TOP-DOWN") {
@@ -55,6 +52,29 @@ impl RowOrder {
         } else {
             RowOrder::Other(Arc::from(trimmed))
         }
+    }
+
+    /// The spelling a file writes, which is what a consumer re-emitting the fact needs.
+    ///
+    /// The two recognized values report the convention's own upper-case spelling rather than
+    /// whatever case the file used; [`RowOrder::Other`] reports its payload verbatim.
+    ///
+    /// [`RowOrder::Unspecified`] reports the **empty string**, and that is the honest answer
+    /// rather than a placeholder: the state means the file carried no `ROWORDER` card, so a
+    /// consumer re-emitting it writes no card.
+    pub fn as_str(&self) -> &str {
+        match self {
+            RowOrder::TopDown => "TOP-DOWN",
+            RowOrder::BottomUp => "BOTTOM-UP",
+            RowOrder::Unspecified => "",
+            RowOrder::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for RowOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -101,6 +121,7 @@ pub enum Orientation {
 
 impl Orientation {
     /// Classify an `orientation` attribute's value.
+    #[must_use]
     pub fn classify(value: &str) -> Orientation {
         match value {
             "0" => Orientation::Identity,
@@ -114,6 +135,34 @@ impl Orientation {
             other => Orientation::Other(Arc::from(other)),
         }
     }
+
+    /// The §11.5.2 spelling a file writes, which is what a consumer re-emitting the attribute
+    /// needs. [`Orientation::Other`] reports its payload verbatim.
+    ///
+    /// ```
+    /// use astroframe::Orientation;
+    ///
+    /// assert_eq!(Orientation::classify("90;flip").as_str(), "90;flip");
+    /// ```
+    pub fn as_str(&self) -> &str {
+        match self {
+            Orientation::Identity => "0",
+            Orientation::Flip => "flip",
+            Orientation::Rotate90 => "90",
+            Orientation::Rotate90Flip => "90;flip",
+            Orientation::Rotate270 => "-90",
+            Orientation::Rotate270Flip => "-90;flip",
+            Orientation::Rotate180 => "180",
+            Orientation::Rotate180Flip => "180;flip",
+            Orientation::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for Orientation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// XISF `colorSpace` (§11.5.2 Table 14), reported. No conversion is performed.
@@ -121,15 +170,33 @@ impl Orientation {
 /// Decoding depends on this enumeration, so an unrecognized spelling is a hard error rather
 /// than an `Other` variant. `CIELab` is recognized and declined — [`Error::Unsupported`] —
 /// which is a different outcome from a spelling the specification does not define.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ColorSpace {
     /// `Gray`. The default when the attribute is absent — never inferred from channel count.
+    #[default]
     Gray,
     /// `RGB`.
     Rgb,
     /// `CIELab`. Recognized, and declined by this version.
     CieLab,
+}
+
+impl ColorSpace {
+    /// The §11.5.2 Table 14 spelling a file writes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ColorSpace::Gray => "Gray",
+            ColorSpace::Rgb => "RGB",
+            ColorSpace::CieLab => "CIELab",
+        }
+    }
+}
+
+impl std::fmt::Display for ColorSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// XISF `pixelStorage` (§11.5.2 Table 13), reported.
@@ -177,6 +244,7 @@ pub enum ImageType {
 
 impl ImageType {
     /// Classify an `imageType` attribute's value.
+    #[must_use]
     pub fn classify(value: &str) -> ImageType {
         use ImageType as T;
         match value {
@@ -197,6 +265,36 @@ impl ImageType {
             "WeightMap" => T::WeightMap,
             other => T::Other(Arc::from(other)),
         }
+    }
+
+    /// The §11.5.1 Table 12 spelling a file writes. [`ImageType::Other`] reports its payload
+    /// verbatim.
+    pub fn as_str(&self) -> &str {
+        use ImageType as T;
+        match self {
+            T::Bias => "Bias",
+            T::Dark => "Dark",
+            T::Flat => "Flat",
+            T::Light => "Light",
+            T::MasterBias => "MasterBias",
+            T::MasterDark => "MasterDark",
+            T::MasterFlat => "MasterFlat",
+            T::MasterLight => "MasterLight",
+            T::DefectMap => "DefectMap",
+            T::RejectionMapHigh => "RejectionMapHigh",
+            T::RejectionMapLow => "RejectionMapLow",
+            T::BinaryRejectionMapHigh => "BinaryRejectionMapHigh",
+            T::BinaryRejectionMapLow => "BinaryRejectionMapLow",
+            T::SlopeMap => "SlopeMap",
+            T::WeightMap => "WeightMap",
+            T::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for ImageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -228,15 +326,18 @@ pub enum Bounds {
     Unavailable(BoundsUnavailable),
     /// The format's own default applied.
     ///
-    /// Carries the pair, so a tier-3 caller normalizing chunks with the public primitive
-    /// reads the range directly instead of re-deriving it from the sample width.
-    FormatDefault(f64, f64),
+    /// Carries the validated [`Range`], so a tier-3 caller normalizing chunks with the public
+    /// primitive builds a [`Normalizer`](crate::Normalizer) from it directly — no re-deriving
+    /// it from the sample width, and no fallible reconstruction of a range this crate has
+    /// already checked. The endpoints stay reachable as [`Range::lo`] and [`Range::hi`].
+    FormatDefault(Range),
     /// The file stated this range.
-    Declared(f64, f64),
+    Declared(Range),
     /// `with_bounds` overrode whatever the file said.
+    #[non_exhaustive]
     CallerSupplied {
         /// The range in force.
-        effective: (f64, f64),
+        effective: Range,
         /// What the file stated — its own text verbatim whenever it declared a `bounds` at
         /// all, usable or not, and `None` only when it declared none. So an override never
         /// erases the evidence, and overriding an override erases none either.
@@ -257,6 +358,7 @@ pub enum Granularity {
     /// Row by row.
     Rows,
     /// One subblock at a time.
+    #[non_exhaustive]
     Block {
         /// The number of independently-deliverable pieces — the only thing a caller can act
         /// on.
@@ -326,21 +428,37 @@ impl DeclineReason {
     }
 
     pub(crate) fn to_error(&self) -> Error {
-        match self.class {
-            DeclineClass::Malformed => Error::Malformed(self.reason.to_string()),
-            DeclineClass::Unsupported => Error::Unsupported(self.reason.to_string()),
-            DeclineClass::LimitExceeded => Error::LimitExceeded(self.reason.to_string()),
-            DeclineClass::ChecksumMismatch => Error::ChecksumMismatch(self.reason.to_string()),
-        }
+        Error::from(self)
     }
 }
 
-/// The geometry three, reported as a unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Geometry {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) channels: u32,
+/// The same rendering [`Error`] gives the class this decline would raise, so a log line reads
+/// alike whether the position was reported or decoded.
+impl std::fmt::Display for DeclineReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let class = match self.class {
+            DeclineClass::Malformed => "malformed",
+            DeclineClass::Unsupported => "unsupported",
+            DeclineClass::LimitExceeded => "limit exceeded",
+            DeclineClass::ChecksumMismatch => "checksum mismatch",
+        };
+        write!(f, "{class}: {}", self.reason)
+    }
+}
+
+/// The geometry three, reported as a unit — which is the invariant the three
+/// [`Header`] accessors state in prose and this type states in the type system.
+///
+/// [`Header::geometry`] hands one back; `width`, `height` and `channels` stay for a caller
+/// wanting one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Geometry {
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Channel count — `1` after `select_channel`.
+    pub channels: u32,
 }
 
 impl Geometry {
@@ -371,6 +489,11 @@ impl Geometry {
 }
 
 /// Everything parsed before pixels.
+///
+/// The organizing rule — report what the file says, interpret nothing — only means something
+/// if the reported facts are reachable, and most of the XISF ones are XML *attributes*,
+/// neither `FITSKeyword` nor `Property` elements, so no keyword lookup reaches them. `Header`
+/// exposes them as typed accessors, format-independent where the two formats agree.
 ///
 /// Returned by value rather than by borrow: a borrow would hold the `Reader` immutably while
 /// every pixel-phase method needs `&mut self`, so the obvious usage — read the geometry, size
@@ -444,6 +567,16 @@ impl Header {
     /// configuring the reader**. See [`Header::width`] for when this is `None`.
     pub fn channels(&self) -> Option<u32> {
         self.geometry.map(|g| g.channels)
+    }
+
+    /// The three axes as one value, which is the all-or-nothing invariant
+    /// [`Header::width`] states in prose said in the type system instead.
+    ///
+    /// `None` in exactly the cases the three accessors report `None`, and `Some` in exactly
+    /// the cases they report `Some` — a caller sizing a destination reads one `Option` rather
+    /// than reassembling three.
+    pub fn geometry(&self) -> Option<Geometry> {
+        self.geometry
     }
 
     /// The stored sample width.
@@ -589,12 +722,29 @@ impl Header {
     ///
     /// Empty for FITS.
     ///
+    /// **Duplicates are reported, exactly as [`Header::keywords`] reports duplicate cards.**
+    /// Nothing in §11.1 makes an identifier unique within an image, and a root-level
+    /// `<Property>` reached through several `<Reference>` elements is reported once per
+    /// occurrence besides. So a repeated identifier is a list rather than a collision, and
+    /// [`Header::property`] answering with the first is a documented selection rather than an
+    /// assumption that there is only one.
+    ///
     /// A [`Properties`] view rather than a slice. The report is the same list in the same
     /// order; what differs is that it is never materialized, because a merged list per image
     /// is a copy of the whole root `<Metadata>` list per image and nothing bounds that against
     /// the input. `PropertySet` carries the arithmetic.
     pub fn properties(&self) -> Properties<'_> {
         self.properties.view()
+    }
+
+    /// Look a property up by **exact** identifier match, returning the **first** in document
+    /// order — the rule [`Header::get`] follows for keywords.
+    ///
+    /// An identifier is a case-sensitive token in §11.1.1, so this does not case-fold either.
+    /// Every occurrence of a repeated identifier stays reachable through
+    /// [`Header::properties`].
+    pub fn property(&self, id: &str) -> Option<&Property> {
+        self.properties.view().iter().find(|p| p.id() == id)
     }
 
     /// The XISF `ColorFilterArray`, if the image carries one.

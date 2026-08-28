@@ -19,7 +19,7 @@
 //! cargo run --release --example 07_channels_and_bounds -- frame.fits 1
 //! ```
 
-use astroframe::{Bounds, Reader, SampleSlice, Samples};
+use astroframe::{Bounds, Reader};
 
 fn main() -> astroframe::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -46,12 +46,12 @@ fn main() -> astroframe::Result<()> {
     if !reader.next_image()? {
         return Ok(());
     }
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header()?;
     if header.decline_reason().is_some() {
         println!("the first position is declined");
         return Ok(());
     }
-    let (Some(w), Some(h), Some(c)) = (header.width(), header.height(), header.channels()) else {
+    let Some(g) = header.geometry() else {
         return Ok(());
     };
 
@@ -65,20 +65,19 @@ fn main() -> astroframe::Result<()> {
     // `select_channel` narrows the decode itself rather than slicing afterwards: with `Planar`
     // storage the unwanted channels are contiguous and get skipped outright, so this is less
     // I/O and a smaller destination, not just less output.
-    let dest_len = match channel {
-        Some(k) => {
-            if k >= c {
-                eprintln!("channel {k} is beyond the frame's {c}");
-                std::process::exit(1);
-            }
-            reader.select_channel(k)?;
-            println!("decoding channel {k} of {c}");
-            w as usize * h as usize
+    if let Some(k) = channel {
+        if k >= g.channels {
+            eprintln!("channel {k} is beyond the frame's {}", g.channels);
+            std::process::exit(1);
         }
-        None => w as usize * h as usize * c as usize,
-    };
+        reader.select_channel(k)?;
+        println!("decoding channel {k} of {}", g.channels);
+    }
 
-    let mut buffer = vec![0.0f32; dest_len];
+    // Sized by the reader, **after** the configuration above: `destination_len` reports what
+    // this reader will produce, so narrowing shrinks it and no rule about which header to
+    // measure has to be remembered.
+    let mut buffer = vec![0.0f32; reader.destination_len()?];
     reader.read_image_into(&mut buffer)?;
 
     let finite: Vec<f32> = buffer.iter().copied().filter(|s| !s.is_nan()).collect();
@@ -98,40 +97,26 @@ fn measure_range(path: &str) -> astroframe::Result<Option<(f64, f64)>> {
     if !reader.next_image()? {
         return Ok(None);
     }
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header()?;
     if header.decline_reason().is_some() {
         return Ok(None);
     }
-    let (Some(w), Some(h), Some(c), Some(format)) = (
-        header.width(),
-        header.height(),
-        header.channels(),
-        header.sample_format(),
-    ) else {
+    if header.geometry().is_none() || header.sample_format().is_none() {
         return Ok(None);
-    };
+    }
 
-    let mut samples = Samples::zeroed(format, w as usize * h as usize * c as usize);
-    reader.read_samples_into(&mut samples)?;
+    let samples = reader.read_samples()?;
 
+    // `iter_f64` is the crate's own widening — `Sample::widen`, the step the normalization
+    // itself performs — applied to whichever width the file holds, so measuring a range needs
+    // no match over the nine variants and introduces no rounding of its own.
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
-    let mut take = |v: f64| {
-        if !v.is_nan() {
-            lo = lo.min(v);
-            hi = hi.max(v);
+    for value in samples.as_slice().iter_f64() {
+        if !value.is_nan() {
+            lo = lo.min(value);
+            hi = hi.max(value);
         }
-    };
-    match samples.as_slice() {
-        SampleSlice::U8(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::U16(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::U32(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::U64(v) => v.iter().for_each(|&x| take(x as f64)),
-        SampleSlice::I16(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::I32(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::I64(v) => v.iter().for_each(|&x| take(x as f64)),
-        SampleSlice::F32(v) => v.iter().for_each(|&x| take(f64::from(x))),
-        SampleSlice::F64(v) => v.iter().for_each(|&x| take(x)),
     }
     if lo.is_finite() && hi.is_finite() {
         Ok(Some((lo, hi)))

@@ -15,13 +15,10 @@ mod common;
 use std::io::Cursor;
 use std::ops::ControlFlow;
 
-use astroframe::{
-    Bounds, Granularity, Header, Normalizer, Orientation, PixelStorage, Range, Reader, RowOrder,
-    SampleSlice, Samples, Source,
-};
+use astroframe::{Bounds, Header, Orientation, PixelStorage, Reader, RowOrder, Samples, Source};
 
 use common::xisf::{self, Unit};
-use common::{Hdu, assert_same_bits, file, kind};
+use common::{Hdu, Streams, assert_granularity, assert_same_bits, file, kind};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -142,41 +139,7 @@ fn xisf_lz4_subblocks(width: u32, height: u32, channels: u32, levels: &[u16]) ->
 /// Advance to the first image and hand back its header.
 fn first_image<S: Source>(reader: &mut Reader<S>) -> Header {
     assert!(reader.next_image().expect("advance"), "a first image");
-    reader.header().expect("an advanced reader has a header")
-}
-
-/// The range actually in force, as the primitive a tier-3 caller would build.
-///
-/// Tier 3 delivers *native* samples, so assembling a normalized buffer from chunks means
-/// running the same public primitive tier 2 runs. That is what makes the bit-identity
-/// assertion meaningful rather than tautological.
-fn normalizer_for(header: &Header) -> Normalizer {
-    let (lo, hi) = match header.bounds() {
-        Bounds::FormatDefault(lo, hi) | Bounds::Declared(lo, hi) => (*lo, *hi),
-        Bounds::CallerSupplied {
-            effective: (lo, hi),
-            ..
-        } => (*lo, *hi),
-        other => panic!("this fixture has no representable range: {other:?}"),
-    };
-    Normalizer::new(
-        header.scaling(),
-        Range::new(lo, hi).expect("the fixture's range is valid"),
-    )
-}
-
-fn normalize_slice(n: &Normalizer, samples: SampleSlice<'_>, out: &mut [f32]) {
-    match samples {
-        SampleSlice::U8(s) => n.normalize_into(s, out),
-        SampleSlice::U16(s) => n.normalize_into(s, out),
-        SampleSlice::U32(s) => n.normalize_into(s, out),
-        SampleSlice::U64(s) => n.normalize_into(s, out),
-        SampleSlice::I16(s) => n.normalize_into(s, out),
-        SampleSlice::I32(s) => n.normalize_into(s, out),
-        SampleSlice::I64(s) => n.normalize_into(s, out),
-        SampleSlice::F32(s) => n.normalize_into(s, out),
-        SampleSlice::F64(s) => n.normalize_into(s, out),
-    }
+    reader.current_header().expect("the advanced position")
 }
 
 /// Whole-buffer decode of the currently selected image.
@@ -190,15 +153,21 @@ fn whole_buffer<S: Source>(reader: &mut Reader<S>, len: usize) -> Vec<f32> {
 
 /// The same image assembled from `chunks()`, copying each chunk at `chunk.range()`.
 ///
+/// Tier 3 delivers *native* samples, so assembling a normalized buffer means running the
+/// **shipped** primitive: `Reader::normalizer` for the range actually in force, then
+/// `Chunk::normalize_into` per chunk. Reimplementing either here would grade a copy of the
+/// crate's arithmetic against the crate's, which is the tautology the bit-identity criterion
+/// exists to avoid.
+///
 /// Copying at the stated range is what makes the destination-coordinates contract meaningful:
 /// a chunk consumer recalculating the offset itself would grade its own arithmetic instead.
-fn from_chunks<S: Source>(reader: &mut Reader<S>, header: &Header, len: usize) -> Vec<f32> {
-    let n = normalizer_for(header);
+fn from_chunks<S: Source>(reader: &mut Reader<S>, len: usize) -> Vec<f32> {
+    let n = reader.normalizer().expect("the fixture has a range");
     let mut dst = vec![f32::NAN; len];
     let mut cursor = reader.chunks();
     while let Some(chunk) = cursor.next_chunk().expect("a chunk") {
         let range = chunk.range();
-        normalize_slice(&n, chunk.samples(), &mut dst[range]);
+        chunk.normalize_into(&n, &mut dst[range]);
     }
     dst
 }
@@ -208,13 +177,13 @@ fn from_chunks<S: Source>(reader: &mut Reader<S>, header: &Header, len: usize) -
 /// `for_each_chunk` is a wrapper over the pull form, so this grades the wrapper — that it
 /// delivers every chunk exactly once and hands the callback the same ranges — rather than the
 /// delivery machinery a second time.
-fn from_for_each_chunk<S: Source>(reader: &mut Reader<S>, header: &Header, len: usize) -> Vec<f32> {
-    let n = normalizer_for(header);
+fn from_for_each_chunk<S: Source>(reader: &mut Reader<S>, len: usize) -> Vec<f32> {
+    let n = reader.normalizer().expect("the fixture has a range");
     let mut dst = vec![f32::NAN; len];
     reader
         .for_each_chunk(|chunk| {
             let range = chunk.range();
-            normalize_slice(&n, chunk.samples(), &mut dst[range]);
+            chunk.normalize_into(&n, &mut dst[range]);
             ControlFlow::Continue(())
         })
         .expect("push-form delivery");
@@ -230,10 +199,8 @@ fn decode_first(bytes: &[u8]) -> Vec<f32> {
 }
 
 fn expected_len(header: &Header) -> usize {
-    let w = header.width().expect("geometry") as usize;
-    let h = header.height().expect("geometry") as usize;
-    let c = header.channels().expect("geometry") as usize;
-    w * h * c
+    let g = header.geometry().expect("geometry");
+    g.width as usize * g.height as usize * g.channels as usize
 }
 
 /// The `f32` a level normalizes to under the default 16-bit range, written out longhand.
@@ -298,23 +265,23 @@ fn cross_format_bit_identity_lz4_shuffled() {
 fn streaming_equals_whole_buffer_bit_for_bit() {
     let data = levels(32);
     let cube = levels(36);
-    let cases: [(&str, Vec<u8>, Granularity, &[u16]); 6] = [
+    let cases: [(&str, Vec<u8>, Streams, &[u16]); 6] = [
         (
             "FITS",
             fits_unsigned_u16(8, 4, 1, &data),
-            Granularity::Rows,
+            Streams::Rows,
             &data,
         ),
         (
             "FITS NAXIS = 3",
             fits_unsigned_u16(4, 3, 3, &cube),
-            Granularity::Rows,
+            Streams::Rows,
             &cube,
         ),
         (
             "XISF uncompressed",
             xisf_uncompressed(8, 4, 1, &data),
-            Granularity::Rows,
+            Streams::Rows,
             &data,
         ),
         (
@@ -322,19 +289,19 @@ fn streaming_equals_whole_buffer_bit_for_bit() {
             // ones a destination-coordinate error shows up in first.
             "XISF Normal, three channels",
             xisf_interleaved(4, 3, 3, &cube),
-            Granularity::Rows,
+            Streams::Rows,
             &cube,
         ),
         (
             "XISF lz4 + subblocks",
             xisf_lz4_subblocks(8, 4, 1, &data),
-            Granularity::Block { subblocks: 2 },
+            Streams::Block(2),
             &data,
         ),
         (
             "XISF zlib+sh",
             xisf_shuffled("zlib", 8, 4, 1, &data),
-            Granularity::WholeImage,
+            Streams::WholeImage,
             &data,
         ),
     ];
@@ -342,17 +309,19 @@ fn streaming_equals_whole_buffer_bit_for_bit() {
     for (what, bytes, granularity, planar_levels) in cases {
         let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
         let header = first_image(&mut reader);
-        assert_eq!(
+        assert_granularity(
             header.granularity(),
             granularity,
-            "{what}: the reported granularity is what makes this case the one it claims to be"
+            &format!(
+                "{what}: the reported granularity is what makes this case the one it claims to be"
+            ),
         );
         let len = expected_len(&header);
 
         let whole = whole_buffer(&mut reader, len);
-        let chunked = from_chunks(&mut reader, &header, len);
+        let chunked = from_chunks(&mut reader, len);
         assert_same_bits(&chunked, &whole, what);
-        let pushed = from_for_each_chunk(&mut reader, &header, len);
+        let pushed = from_for_each_chunk(&mut reader, len);
         assert_same_bits(&pushed, &whole, &format!("{what}: push form"));
 
         // Against the pinned form as well, so a delivery defect shared by both paths — which
@@ -1044,7 +1013,7 @@ fn with_bounds_and_select_channel_reset_across_next_image() {
     );
     assert_eq!(header.channel_index(), None, "and so is its report");
     assert!(
-        matches!(header.bounds(), Bounds::FormatDefault(0.0, 65535.0)),
+        matches!(header.bounds(), Bounds::FormatDefault(r) if r.lo() == 0.0 && r.hi() == 65535.0),
         "with_bounds was cleared too, so the format default is back in force"
     );
 
@@ -1176,10 +1145,14 @@ fn a_narrowed_chunk_reports_the_file_index_and_narrowed_destination_coordinates(
             let mut reader = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
             first_image(&mut reader);
             reader.select_channel(k).expect("a channel the file has");
-            let header = reader.header().expect("the narrowed header");
 
             let mut assembled = vec![f32::NAN; plane];
-            let n = normalizer_for(&header);
+            assert_eq!(
+                reader.destination_len().expect("the narrowed destination"),
+                plane,
+                "{what}: the reader sizes the narrowed destination itself"
+            );
+            let n = reader.normalizer().expect("the fixture has a range");
             let mut seen = 0usize;
             let mut cursor = reader.chunks();
             while let Some(chunk) = cursor.next_chunk().expect("a chunk") {
@@ -1194,7 +1167,7 @@ fn a_narrowed_chunk_reports_the_file_index_and_narrowed_destination_coordinates(
                     "{what}: the range is in the narrowed buffer's coordinates, not the file's: {range:?}"
                 );
                 seen += range.len();
-                normalize_slice(&n, chunk.samples(), &mut assembled[range]);
+                chunk.normalize_into(&n, &mut assembled[range]);
             }
             assert_eq!(
                 seen, plane,

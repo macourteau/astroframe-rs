@@ -440,6 +440,7 @@ bytes have been turned into.
         │                                                  │
         │  header phase — parsed at construction           │
         │    · header() -> Option<Header>         [tier 1] │
+        │    · current_header() -> Result<Header> [tier 1] │
         │        · geometry · keywords · properties        │
         │        · row_order() · granularity()             │
         │    · next_image()                                │
@@ -449,9 +450,12 @@ bytes have been turned into.
         │    · select_channel(k)                           │
         │                                                  │
         │  pixel phase — on demand                         │
+        │    · destination_len() -> Result<usize>          │
+        │    · normalizer() -> Result<Normalizer>          │
         │    · chunks() -> Chunks                 [tier 3] │
         │    · for_each_chunk(|chunk| ..)         [tier 3] │
         │    · read_samples_into(&mut Samples)    [tier 2] │
+        │    · read_samples() -> Samples          [tier 2] │
         │    · read_image_into(&mut [f32])        [tier 2] │
         │    · read_image() -> Image              [tier 2] │
         └──────────────────────────────────────────────────┘
@@ -489,8 +493,10 @@ diverge: the range is always the destination's, the channel index always the fil
 extent is the reader's choice and is independent of `Granularity` — a `WholeImage` source
 still delivers chunks, it simply had to read everything before the first one. Callers
 wanting normalized `f32` use tier 2, or normalize a chunk themselves with the same public
-primitive, which is what makes the *Streaming equals whole-buffer* criterion's bit-identity
-assertion meaningful rather than tautological.
+primitive — `reader.normalizer()` once for the image, `chunk.normalize_into(&n, dst)` per
+chunk — which is what makes the *Streaming equals whole-buffer* criterion's bit-identity
+assertion meaningful rather than tautological: the assembled buffer is compared against
+`read_image_into`, and both ran the same primitive rather than two copies of it.
 
 Two spellings, one of them a wrapper over the other:
 
@@ -576,9 +582,9 @@ for the declined one.
 | State | Meaning |
 | --- | --- |
 | `Unavailable(reason)` | No usable range exists, and it **carries which** — `NoFormatDefault` for a FITS float frame or FITS integer scaling outside the unsigned convention, `InvalidDeclared` for any image whose declared `bounds` is missing or fails the validity rule. The two raise different classes from `read_image_into` (`Unsupported` and `Malformed`), so a caller holding an `Unavailable` must be able to tell them apart. `InvalidDeclared` applies to **integer** images too |
-| `FormatDefault(lo,hi)` | The format's own default applied. It carries the pair, so a tier-3 caller normalizing chunks with the public primitive reads the range directly instead of re-deriving it from the sample width |
-| `Declared(lo,hi)` | The file stated this range |
-| `CallerSupplied { effective, declared }` | `with_bounds` overrode whatever the file said. `declared` still reports what the file stated — the file's own text verbatim whenever it declared a `bounds` at all, usable or not, and `None` only when it declared none — so an override never erases the evidence |
+| `FormatDefault(Range)` | The format's own default applied. It carries the **validated `Range`**, not a pair of `f64`, so a tier-3 caller normalizing chunks with the public primitive builds a `Normalizer` from it directly instead of re-deriving the range from the sample width and re-validating what this crate has already checked. `range.lo()` and `range.hi()` are the endpoints |
+| `Declared(Range)` | The file stated this range |
+| `CallerSupplied { effective: Range, declared }` | `with_bounds` overrode whatever the file said. `declared` still reports what the file stated — the file's own text verbatim whenever it declared a `bounds` at all, usable or not, and `None` only when it declared none — so an override never erases the evidence. The variant is itself `#[non_exhaustive]`, since the attribute on the enum says nothing about a struct variant's fields, and a caller matches `{ effective, .. }` |
 
 `scaling()` reports `None` or `Fits { bscale, bzero }`. FITS **always** reports `Fits`,
 materializing the `BSCALE = 1`, `BZERO = 0` defaults when the keywords are absent, so
@@ -709,7 +715,10 @@ seekable source; on a sequential one it is `Unsupported`.
   not an error.
 - Every public enum except `Samples` and the borrowed chunk-sample mirror is
   `#[non_exhaustive]`; those two are deliberately closed, for the reason § Deferred and
-  out of scope gives.
+  out of scope gives. The attribute on an enum says nothing about a **struct variant's
+  fields**, so the two struct variants — `Bounds::CallerSupplied` and `Granularity::Block` —
+  carry it themselves as well. A caller matches them with a trailing `..`, and adding a field
+  to either is then an addition rather than a break.
 - `Reader` is `Send` when its source is, and `Sync` when its source is. That every useful
   method takes `&mut self` does not bear on it: `Sync` is about whether sharing a `&T` across
   threads is *sound*, not about whether `&T`'s API does anything useful. `Reader` holds no
@@ -736,6 +745,35 @@ seekable source; on a sequential one it is `Unsupported`.
 - `offset()` reports §11.5.2's `0` default when the attribute is absent, in the same way
   `resolution()` and `display_function()` report theirs. All three defaults belong to XISF,
   so all three accessors report `None` on a FITS frame rather than the number.
+- `current_header()` is `header()` as a `Result`. `header()` keeps its `Option`, which is a
+  fact about a reader *before* its first advance; inside the documented
+  `while next_image()? { … }` loop that `None` is unreachable, and a library whose headline
+  snippet opens with an `expect` on its own invariant teaches callers to panic on one. The
+  error is the `InvalidRequest` the pixel-phase entry points already produce for the same
+  mistake. A borrow-guard typestate was considered and rejected: every misuse — reading
+  before the first advance, reading after the walk ends, a stale header across
+  `select_channel`, retrying a failed decode, rewinding a sequential source — already returns
+  a precise `InvalidRequest` rather than misbehaving, and `next_image()` returning
+  `Ok(false)` cannot hand back a differently-typed reader without wrecking the loop.
+- `destination_len()` and `normalizer()` are the two numbers a tier-3 caller needs and would
+  otherwise reconstruct. Both read the reader's **current** header rather than taking one, so
+  both fold `select_channel` and `with_bounds` in; a caller-supplied header could be a stale
+  one, and a stale one sizes the wrong buffer or normalizes against the wrong range. The
+  pixel-phase rule is the same one `channels()` states: configure, then ask.
+- `Chunk::normalize_into(&normalizer, dst)` is what tier 2 calls per chunk. It is what makes
+  "normalize a chunk yourself with the same public primitive" a call rather than a
+  reimplementation of the nine-arm sample dispatch, and it is what the *Streaming equals
+  whole-buffer* criterion grades — the test assembles through this and compares against
+  `read_image_into`, so the two paths cannot agree by both being wrong in a copy.
+- `read_samples()` is to `read_samples_into` what `read_image()` is to `read_image_into`: it
+  sizes and types the buffer from the header itself, so the two ways a hand-built destination
+  is rejected cannot arise.
+- The nine modules are private and the root re-exports them, so every public item has exactly
+  one stable path. Publishing both `astroframe::Error` and `astroframe::error::Error` would
+  document each type twice and semver-lock nine module paths a caller never writes.
+- `Source` is a bare marker. Its operations are the decoders' interface to the bytes, and the
+  trait is sealed and its implementations unconstructable from outside, so rendering them as
+  public methods would advertise an extension point the trait's own first line denies.
 
 ### Streaming
 
@@ -1113,8 +1151,12 @@ classification, not a type hierarchy:
 Every variant except `Io` carries a human-readable reason string naming what was expected
 and what was found, and where in the file when that is known. For a consumer whose
 documented move on `Unsupported` is "skip", the log line *is* the error's value.
-`Error::is_io()` expresses the split in one call. Truncation is classified `Malformed`,
-not `Io` — a short file is bad data, not a failing disk.
+The table has **three** moves, not two, so it takes two predicates to express: `is_io()` is
+the abort edge and `is_invalid_request()` is the caller-bug edge, and everything left over is
+the skip. A batch loop written on `is_io()` alone swallows the one class meaning the calling
+program is wrong. `decline_class()` reports the middle row as the same `DeclineClass`
+`decline_reason()` carries, so one skip path serves both surfaces. Truncation is classified
+`Malformed`, not `Io` — a short file is bad data, not a failing disk.
 
 `InvalidRequest` exists deliberately: a wrong-sized destination slice, `select_channel(k)`
 beyond the channel count, or `with_bounds` after the pixel phase has begun are caller

@@ -1009,10 +1009,10 @@ pub(super) mod tests {
         let split = one(&tiny(
             r#"location="attachment:1024:10" compression="lz4:16" subblocks="5,8:5,8""#,
         ));
-        assert_eq!(
+        assert!(matches!(
             split.header.granularity(),
-            Granularity::Block { subblocks: 2 }
-        );
+            Granularity::Block { subblocks: 2, .. }
+        ));
 
         // One bare LZ4 block covering the image is promoted to `WholeImage`.
         let whole = one(&tiny(
@@ -1489,6 +1489,8 @@ pub(super) mod tests {
         ));
         assert_eq!(class(&o), None);
         assert_eq!(o.header.width(), Some(4));
-        assert_eq!(*o.header.bounds(), Bounds::Declared(0.0, 255.0));
+        assert!(
+            matches!(o.header.bounds(), Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 255.0)
+        );
     }
 }

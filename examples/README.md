@@ -16,7 +16,7 @@ slowly enough to be misleading about this crate's speed.
 | `02_read_image` | Tier 2: a whole image as normalized `f32`, reusing one buffer across frames. Handles the frame that has no representable range rather than dying on it. |
 | `03_native_samples` | The file's own integers, no normalization. This is the path that reads *every* file, including the ones tier 2 refuses. |
 | `04_metadata` | Keywords and properties, and the exact-match lookup that does not case-fold. |
-| `05_streaming` | Tier 3: chunked delivery, and `Reader::sequential` over a pipe. Reads `granularity()` first to decide whether streaming buys anything. |
+| `05_streaming` | Tier 3: chunked delivery, `Reader::normalizer` plus `Chunk::normalize_into` to assemble normalized `f32` from chunks, and `Reader::sequential` over a pipe. Reads `granularity()` first to decide whether streaming buys anything, and on a file checks the assembled buffer against `read_image_into` bit for bit. |
 | `06_untrusted` | `Limits` and the error classes — the shape to use for input you did not produce. |
 | `07_channels_and_bounds` | `select_channel`, and `with_bounds` as the escape hatch for a frame whose range the file does not state. |
 
@@ -29,8 +29,10 @@ slowly enough to be misleading about this crate's speed.
 - **A decline is not an error.** A position this version will not read reports a class and a
   sentence, and the rest of the file still walks. Treating it as a failure throws away the
   images that do decode. Every example checks `decline_reason()` before the geometry.
-- **The `Option`s are real.** Past `decline_reason()` the geometry accessors are present; before
-  it they may not be. None of them is an `unwrap` waiting to happen.
+- **The `Option`s are real.** Past `decline_reason()` the geometry is present; before it it may
+  not be. None of them is an `unwrap` waiting to happen — `current_header()` is a `Result` for
+  the one case a walk cannot reach, and `geometry()` is one `Option` because the three axes
+  move as a unit.
 - **Ask before you decode.** `granularity()` says how much of the input must be held before any
   sample comes out, and `bounds()` says whether normalized output exists at all — both before a
   pixel is read.

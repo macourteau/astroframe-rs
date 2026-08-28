@@ -1,9 +1,27 @@
-//! One error enum, not per-format errors behind a trait.
-//!
-//! The consumer's real need is a two-way split — *skip this frame* versus *abort the run* —
-//! and that is a classification rather than a type hierarchy.
+//! One error enum, not per-format errors behind a trait. The user-facing prose lives on
+//! [`Error`] itself, which is where a caller meets it.
+
+use crate::header::{DeclineClass, DeclineReason};
 
 /// What went wrong.
+///
+/// One enum rather than per-format errors behind a trait: what a consumer needs from a
+/// failure is a **classification**, not a type hierarchy, and there are three moves it can
+/// make.
+///
+/// | The error says | The caller's move |
+/// | --- | --- |
+/// | [`Error::Io`] | **Abort the run** — the next frame will probably fail too |
+/// | [`Error::Malformed`], [`Error::Unsupported`], [`Error::ChecksumMismatch`], [`Error::LimitExceeded`] | **Skip this frame** and keep walking |
+/// | [`Error::InvalidRequest`] | **Fix the call** — this one is the caller's own bug |
+///
+/// [`Error::is_io`] and [`Error::is_invalid_request`] are the two edges of that table, and a
+/// batch loop wants **both**: `if e.is_io() { abort } else { skip }` alone swallows the
+/// variant that means the calling program is wrong, and a wrong-sized destination or an
+/// out-of-range `select_channel` then reads as "every frame was skipped", with no signal.
+/// [`Error::decline_class`] gives the middle row as the same [`DeclineClass`]
+/// [`Header::decline_reason`](crate::Header::decline_reason) reports, so a consumer can run
+/// one skip path over both.
 ///
 /// Every variant except [`Error::Io`] carries a human-readable reason naming what was
 /// expected and what was found, and where in the file when that is known. For a consumer
@@ -52,9 +70,41 @@ pub enum Error {
 }
 
 impl Error {
-    /// The skip-versus-abort split, in one call.
+    /// The abort edge of the table on [`Error`]: the source itself failed.
+    ///
+    /// Not the whole skip-versus-abort split on its own — [`Error::is_invalid_request`] is
+    /// the other edge, and everything left over is the skip.
+    #[must_use]
     pub fn is_io(&self) -> bool {
         matches!(self, Error::Io(_))
+    }
+
+    /// The caller-bug edge of the table on [`Error`]: this program asked for something
+    /// impossible.
+    ///
+    /// A batch loop that skips whatever is not [`Error::is_io`] absorbs this one silently,
+    /// which is how a wrong-sized destination becomes "every frame was skipped".
+    #[must_use]
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(self, Error::InvalidRequest(_))
+    }
+
+    /// The skippable classification, or `None` for the two variants that are not skippable —
+    /// [`Error::Io`], which aborts, and [`Error::InvalidRequest`], which is the caller's bug.
+    ///
+    /// This is the same taxonomy [`DeclineReason::class`] reports, so a consumer following
+    /// the documented flow — check
+    /// [`decline_reason()`](crate::Header::decline_reason), else decode — runs **one** "this
+    /// position is skippable, and here is why" path over both surfaces rather than two
+    /// parallel matches over enums carrying the identical four classes.
+    pub fn decline_class(&self) -> Option<DeclineClass> {
+        match self {
+            Error::Malformed(_) => Some(DeclineClass::Malformed),
+            Error::Unsupported(_) => Some(DeclineClass::Unsupported),
+            Error::LimitExceeded(_) => Some(DeclineClass::LimitExceeded),
+            Error::ChecksumMismatch(_) => Some(DeclineClass::ChecksumMismatch),
+            Error::Io(_) | Error::InvalidRequest(_) => None,
+        }
     }
 
     pub(crate) fn malformed(reason: impl Into<String>) -> Self {
@@ -80,6 +130,24 @@ impl Error {
     #[cfg(all(feature = "checksum", feature = "xisf"))]
     pub(crate) fn checksum(reason: impl Into<String>) -> Self {
         Error::ChecksumMismatch(reason.into())
+    }
+}
+
+/// The error a pixel call on a declined position raises, built from the report.
+///
+/// Exposed rather than kept internal because it is the bridge between the two surfaces: a
+/// consumer that reports declines and errors through one path builds the error itself instead
+/// of writing the four-arm map by hand. The `String` is allocated here, which is once per
+/// conversion — [`DeclineReason`]'s own text is shared, and that asymmetry is the reason the
+/// two types differ at all.
+impl From<&DeclineReason> for Error {
+    fn from(decline: &DeclineReason) -> Error {
+        match decline.class() {
+            DeclineClass::Malformed => Error::Malformed(decline.reason().to_owned()),
+            DeclineClass::Unsupported => Error::Unsupported(decline.reason().to_owned()),
+            DeclineClass::LimitExceeded => Error::LimitExceeded(decline.reason().to_owned()),
+            DeclineClass::ChecksumMismatch => Error::ChecksumMismatch(decline.reason().to_owned()),
+        }
     }
 }
 

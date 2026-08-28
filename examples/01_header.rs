@@ -7,7 +7,7 @@
 //! cargo run --example 01_header -- frame.fits
 //! ```
 
-use astroframe::{Bounds, Reader};
+use astroframe::{Bounds, Reader, RowOrder};
 
 fn main() -> astroframe::Result<()> {
     let Some(path) = std::env::args().nth(1) else {
@@ -21,7 +21,10 @@ fn main() -> astroframe::Result<()> {
     // <Image> elements; `next_image` walks both and returns false at the end.
     let mut position = 0;
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        // Past a successful advance a header always exists, so this is a `Result` rather than
+        // an `Option`: the error says "no image is selected", which is a mistake this loop
+        // cannot make.
+        let header = reader.current_header()?;
         position += 1;
         println!("--- position {position} ---");
 
@@ -29,13 +32,15 @@ fn main() -> astroframe::Result<()> {
         // than by erroring. The rest of the file still walks. Check this before anything else:
         // the geometry accessors below may be `None` here.
         if let Some(decline) = header.decline_reason() {
-            println!("  declined ({:?}): {}", decline.class(), decline.reason());
+            println!("  declined   {decline}");
             continue;
         }
 
-        match (header.width(), header.height(), header.channels()) {
-            (Some(w), Some(h), Some(c)) => println!("  geometry   {w} x {h} x {c}"),
-            _ => println!("  geometry   incomplete"),
+        // The three axes move as a unit — all present or all absent — so they are read as
+        // one value rather than as three `Option`s a caller has to reassemble.
+        match header.geometry() {
+            Some(g) => println!("  geometry   {} x {} x {}", g.width, g.height, g.channels),
+            None => println!("  geometry   incomplete"),
         }
         if let Some(format) = header.sample_format() {
             println!("  samples    {format:?} ({} bytes each)", format.bytes());
@@ -43,10 +48,15 @@ fn main() -> astroframe::Result<()> {
 
         // The range normalized output is computed against, and where it came from. This is
         // reported rather than guessed at, which is what lets a caller tell "the file said so"
-        // from "the format's default applied" from "there is no usable range here".
+        // from "the format's default applied" from "there is no usable range here". Each
+        // usable variant carries the validated `Range` the decode will actually use.
         match header.bounds() {
-            Bounds::FormatDefault(lo, hi) => println!("  bounds     {lo}..{hi} (format default)"),
-            Bounds::Declared(lo, hi) => println!("  bounds     {lo}..{hi} (declared by the file)"),
+            Bounds::FormatDefault(r) => {
+                println!("  bounds     {}..{} (format default)", r.lo(), r.hi());
+            }
+            Bounds::Declared(r) => {
+                println!("  bounds     {}..{} (declared by the file)", r.lo(), r.hi());
+            }
             Bounds::CallerSupplied { .. } => println!("  bounds     supplied by this caller"),
             Bounds::Unavailable(why) => {
                 // Not a rejection: native samples still decode (see 03_native_samples).
@@ -61,8 +71,12 @@ fn main() -> astroframe::Result<()> {
         // reading *before* deciding to stream — see 05_streaming.
         println!("  streaming  {:?}", header.granularity());
 
-        if let Some(order) = header.row_order() {
-            println!("  row order  {order:?}");
+        // Printed through `Display`, which is the file's own spelling: `BOTTOM-UP`, not the
+        // Rust name. That is what a consumer re-emitting the fact writes. `Unspecified` is
+        // the absent keyword and has no spelling, so there is nothing to report.
+        match header.row_order() {
+            None | Some(RowOrder::Unspecified) => {}
+            Some(order) => println!("  row order  {order}"),
         }
         if let Some(cfa) = header.cfa() {
             println!(

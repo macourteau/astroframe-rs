@@ -192,7 +192,7 @@ fn inherit_in_a_primary_header_is_data_not_an_instruction() {
     );
     assert!(matches!(
         header.bounds(),
-        Bounds::FormatDefault(0.0, 65535.0)
+        Bounds::FormatDefault(range) if range.lo() == 0.0 && range.hi() == 65535.0
     ));
 }
 

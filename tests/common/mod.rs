@@ -15,7 +15,7 @@
 
 pub mod xisf;
 
-use astroframe::Error;
+use astroframe::{Error, Granularity};
 
 // ------------------------------------------------------------------ grading
 
@@ -50,6 +50,31 @@ pub fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
             w.to_bits()
         );
     }
+}
+
+/// The granularity a case must report, in a vocabulary a suite can **write**.
+///
+/// `Granularity::Block` is `#[non_exhaustive]` on the variant, so nothing outside the crate
+/// constructs one — which is the attribute doing its job, a subblock count being a fact the
+/// crate may later report more of. A suite states its expectation in its own type and
+/// [`assert_granularity`] matches the reported value against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Streams {
+    Rows,
+    Block(u32),
+    WholeImage,
+}
+
+/// Grade a reported [`Granularity`] against a [`Streams`] expectation.
+#[track_caller]
+pub fn assert_granularity(got: Granularity, want: Streams, what: &str) {
+    let matched = match (got, want) {
+        (Granularity::Rows, Streams::Rows) => true,
+        (Granularity::Block { subblocks, .. }, Streams::Block(n)) => subblocks == n,
+        (Granularity::WholeImage, Streams::WholeImage) => true,
+        _ => false,
+    };
+    assert!(matched, "{what}: reported {got:?}, expected {want:?}");
 }
 
 /// A FITS header unit is a whole number of these.

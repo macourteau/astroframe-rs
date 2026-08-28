@@ -193,7 +193,42 @@ pub enum SampleSlice<'a> {
     F64(&'a [f64]),
 }
 
-impl SampleSlice<'_> {
+impl<'a> SampleSlice<'a> {
+    /// The run as one sample width, or `None` when it holds another.
+    ///
+    /// The nine-arm match written once, for a consumer that has already read
+    /// [`SampleSlice::format`] and wants the slice typed.
+    ///
+    /// ```
+    /// use astroframe::{SampleFormat, SampleSlice, Samples};
+    ///
+    /// let owned = Samples::zeroed(SampleFormat::U16, 3);
+    /// assert_eq!(owned.as_slice().try_as::<u16>().map(<[u16]>::len), Some(3));
+    /// assert_eq!(owned.as_slice().try_as::<f32>(), None);
+    /// ```
+    pub fn try_as<T: crate::normalize::Sample>(self) -> Option<&'a [T]> {
+        <T as crate::normalize::sealed::Sealed>::from_slice(self)
+    }
+
+    /// Every sample widened to `f64`, whatever width the run holds.
+    ///
+    /// The one operation a consumer summarizing native samples always ends up writing by
+    /// hand, and it is [`Sample::widen`](crate::Sample::widen) — the same widening step 1 of
+    /// the normalization performs — applied element by element, so no rounding enters that
+    /// was not already in the contract. For `U64` and `I64` it is lossy above 2⁵³, exactly as
+    /// `widen` is.
+    ///
+    /// ```
+    /// use astroframe::{SampleFormat, Samples};
+    ///
+    /// let owned = Samples::U16(vec![0, 32768, 65535]);
+    /// let widened: Vec<f64> = owned.as_slice().iter_f64().collect();
+    /// assert_eq!(widened, [0.0, 32768.0, 65535.0]);
+    /// ```
+    pub fn iter_f64(self) -> impl Iterator<Item = f64> + 'a {
+        WidenIter { slice: self, at: 0 }
+    }
+
     /// Which variant this is.
     pub fn format(&self) -> SampleFormat {
         match self {
@@ -219,6 +254,38 @@ impl SampleSlice<'_> {
         self.len() == 0
     }
 }
+
+/// What [`SampleSlice::iter_f64`] returns, kept private so the crate is free to change it.
+///
+/// A cursor over the borrowed run rather than nine chained `map` iterators behind a
+/// `Box<dyn Iterator>`: the boxed spelling is shorter and costs one allocation per call, which
+/// a per-chunk caller pays once per chunk for no gain.
+#[derive(Debug)]
+struct WidenIter<'a> {
+    slice: SampleSlice<'a>,
+    at: usize,
+}
+
+impl Iterator for WidenIter<'_> {
+    type Item = f64;
+
+    fn next(&mut self) -> Option<f64> {
+        use crate::normalize::Sample;
+
+        let at = self.at;
+        let widened =
+            samples_dispatch!(SampleSlice, self.slice, v => v.get(at).map(|s| Sample::widen(*s)))?;
+        self.at = at + 1;
+        Some(widened)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.slice.len() - self.at;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for WidenIter<'_> {}
 
 /// One row's samples, sliced to the caller's declared chunk length.
 ///

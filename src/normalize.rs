@@ -50,13 +50,27 @@ pub trait Sample: Copy + sealed::Sealed {
     fn widen(self) -> f64;
 }
 
-mod sealed {
-    pub trait Sealed {}
+pub(crate) mod sealed {
+    pub trait Sealed: Sized {
+        /// The borrowed run of this width a [`SampleSlice`](crate::SampleSlice) holds, or
+        /// `None` when it holds another. Backs
+        /// [`SampleSlice::try_as`](crate::SampleSlice::try_as), and lives on the sealed trait
+        /// so the projection cannot be implemented for a type the formats cannot store.
+        fn from_slice(slice: crate::samples::SampleSlice<'_>) -> Option<&[Self]>;
+    }
 }
 
 macro_rules! impl_sample {
-    ($($t:ty),* $(,)?) => {$(
-        impl sealed::Sealed for $t {}
+    ($($t:ty => $variant:ident),* $(,)?) => {$(
+        impl sealed::Sealed for $t {
+            #[inline]
+            fn from_slice(slice: crate::samples::SampleSlice<'_>) -> Option<&[Self]> {
+                match slice {
+                    crate::samples::SampleSlice::$variant(s) => Some(s),
+                    _ => None,
+                }
+            }
+        }
         impl Sample for $t {
             #[inline]
             fn widen(self) -> f64 {
@@ -66,7 +80,17 @@ macro_rules! impl_sample {
     )*};
 }
 
-impl_sample!(u8, u16, u32, u64, i16, i32, i64, f32, f64);
+impl_sample!(
+    u8 => U8,
+    u16 => U16,
+    u32 => U32,
+    u64 => U64,
+    i16 => I16,
+    i32 => I32,
+    i64 => I64,
+    f32 => F32,
+    f64 => F64,
+);
 
 /// The scaling a container applies before the range map.
 ///
@@ -191,12 +215,41 @@ impl Normalizer {
     }
 
     /// The range in force.
+    ///
+    /// A tier-3 caller holding the primitive [`Reader::normalizer`](crate::Reader::normalizer)
+    /// built for it reads the endpoints back here rather than re-deriving them from
+    /// [`Header::bounds`](crate::Header::bounds) — which is the point, since the reader folds
+    /// `with_bounds` in and the header a caller happens to be holding may predate that.
+    ///
+    /// ```
+    /// use astroframe::{Normalizer, Range};
+    ///
+    /// let n = Normalizer::new(None, Range::unsigned_default(16).expect("a 16-bit range"));
+    /// assert_eq!(n.range().lo(), 0.0);
+    /// assert_eq!(n.range().hi(), 65535.0);
+    /// ```
     #[inline]
     pub fn range(&self) -> Range {
         self.range
     }
 
     /// The scaling in force.
+    ///
+    /// `None` for XISF, which defines no such concept, and always `Some` for FITS — so a
+    /// caller reporting what the normalization actually did reads it from here rather than
+    /// inferring it from the container.
+    ///
+    /// ```
+    /// use astroframe::{Normalizer, Range, Scaling};
+    ///
+    /// let range = Range::unsigned_default(16).expect("a 16-bit range");
+    /// let fits = Normalizer::new(
+    ///     Some(Scaling::Fits { bscale: 1.0, bzero: 32768.0 }),
+    ///     range,
+    /// );
+    /// assert!(matches!(fits.scaling(), Some(Scaling::Fits { bzero, .. }) if bzero == 32768.0));
+    /// assert_eq!(Normalizer::new(None, range).scaling(), None);
+    /// ```
     #[inline]
     pub fn scaling(&self) -> Option<Scaling> {
         self.scaling
