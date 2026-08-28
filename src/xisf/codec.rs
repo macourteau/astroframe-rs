@@ -287,7 +287,8 @@ pub(crate) enum Stream {
     Plain,
     /// zlib-wrapped, decompressing incrementally.
     Zlib(Box<ZlibState>),
-    /// Framed zstd, likewise incremental, with the declared window capped at construction.
+    /// Framed zstd, likewise incremental, with the declared window capped before the frame
+    /// header is read.
     Zstd(Box<ZstdState>),
     /// Bare LZ4, one subblock held whole.
     Lz4(Box<Lz4State>),
@@ -576,10 +577,10 @@ impl ZlibState {
             // forever. Eight zlib-compressed bytes and ten bytes of trailing filler are enough
             // to write it, on the commonest streamed codec, under default limits.
             //
-            // The no-progress check is kept as well, and no longer qualified by `dry`: an
-            // iteration that moved neither counter has nowhere left to go whether or not input
-            // remains, since the loop condition guarantees there was output space to fill.
-            // Returning short is what lets `Stream::fill` raise the truncation this is.
+            // The no-progress check stands beside it, unqualified by `dry`: an iteration that
+            // moved neither counter has nowhere left to go whether or not input remains, since
+            // the loop condition guarantees there was output space to fill. Returning short is
+            // what lets `Stream::fill` raise the truncation this is.
             if matches!(status, flate2::Status::StreamEnd) || (produced == 0 && consumed == 0) {
                 return Ok(filled);
             }
