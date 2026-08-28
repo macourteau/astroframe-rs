@@ -13,7 +13,35 @@
 //! [`fold_cards`].
 
 use crate::error::{Error, Result};
-use crate::metadata::{Keyword, KeywordOrigin, ValueKind};
+use crate::metadata::{Keyword, KeywordOrigin, ValueKind, collapse_whitespace};
+
+/// Where a card-level fault was found: the card's ordinal in the header region, counted from
+/// one, and the keyword name the card carries.
+///
+/// § Errors requires a reason to name what was expected, what was found, and **where** when
+/// the parser knows it — and this parser does know. The fold counts cards in order to enforce
+/// the card cap, so the ordinal is already in hand, and a consumer whose documented move is
+/// skip-and-log has nothing to grep an 8 MiB header for when the sentence ends at "outside the
+/// FITS header character set".
+///
+/// The name is carried as bytes and decoded in [`Display`](std::fmt::Display), so a card that
+/// parses cleanly pays nothing for the context a card that does not will name.
+#[derive(Clone, Copy)]
+struct At<'a> {
+    ordinal: u64,
+    name: &'a [u8],
+}
+
+impl std::fmt::Display for At<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "card {} ({})",
+            self.ordinal,
+            String::from_utf8_lossy(self.name)
+        )
+    }
+}
 
 /// One card, in bytes.
 const CARD: usize = 80;
@@ -75,7 +103,14 @@ pub(crate) fn fold_cards(
             };
             match continued {
                 Some((text, _)) => {
-                    check_ascii(value_part, "value")?;
+                    check_ascii(
+                        value_part,
+                        "value",
+                        At {
+                            ordinal: seen,
+                            name: trimmed_name,
+                        },
+                    )?;
                     let comment = comment_text(comment_part);
                     let index = chain
                         .as_ref()
@@ -113,7 +148,7 @@ pub(crate) fn fold_cards(
                     // Edge case 3: an orphaned record is commentary text. It is also where
                     // a non-conforming `CONTINUE` lands, which is why the value it failed
                     // to continue keeps its `&` — nothing above touched it.
-                    out.push(commentary("CONTINUE".to_owned(), body, origin));
+                    out.push(commentary("CONTINUE", body, origin));
                     if let Some(closed) = chain.take() {
                         close_chain(&mut out, &closed);
                     }
@@ -130,18 +165,31 @@ pub(crate) fn fold_cards(
             close_chain(&mut out, &closed);
         }
 
-        if let Some((name, body)) = hierarch(card)? {
-            let (value, comment, kind) = parse_value(body)?;
-            push(&mut out, &mut chain, name, value, comment, kind, origin);
+        if let Some((name, body)) = hierarch(card, seen)? {
+            // The multi-word name, not the bare `HIERARCH` the name field holds: that is the
+            // name this card is reported and looked up under.
+            let at = At {
+                ordinal: seen,
+                name: name.as_bytes(),
+            };
+            let (value, comment, kind) = parse_value(body, at)?;
+            push(&mut out, &mut chain, &name, value, comment, kind, origin);
             continue;
         }
 
-        check_ascii(name_field, "keyword name")?;
-        let name = String::from_utf8_lossy(trimmed_name).into_owned();
+        let at = At {
+            ordinal: seen,
+            name: trimmed_name,
+        };
+        check_ascii(name_field, "keyword name", at)?;
+        // Bound, not owned. `check_ascii` above has just proved every byte is `0x20..=0x7e`,
+        // so the `Cow` is `Borrowed` and `into_owned` was a guaranteed copy of a name
+        // `Keyword::new` then copies again into its packed buffer.
+        let name = String::from_utf8_lossy(trimmed_name);
 
         if field(card, NAME, NAME + 2) == b"= " {
-            let (value, comment, kind) = parse_value(field(card, NAME + 2, CARD))?;
-            push(&mut out, &mut chain, name, value, comment, kind, origin);
+            let (value, comment, kind) = parse_value(field(card, NAME + 2, CARD), at)?;
+            push(&mut out, &mut chain, &name, value, comment, kind, origin);
         } else {
             let body = field(card, NAME, CARD);
             let text = trim_end_lossy(body);
@@ -230,7 +278,13 @@ pub(crate) fn lex_number(value: &str) -> Option<f64> {
     if i != bytes.len() {
         return None;
     }
-    let parsed: f64 = value.replace(['D', 'd'], "E").parse().ok()?;
+    // The rewrite only where there is something to rewrite: `D` is the rare spelling, and an
+    // ordinary `1.234E+02` — or a plain integer — would otherwise allocate a copy of itself to
+    // hand to a parser that would have taken the original.
+    let parsed: f64 = match value.contains(['D', 'd']) {
+        true => value.replace(['D', 'd'], "E").parse().ok()?,
+        false => value.parse().ok()?,
+    };
     // A grammatical value whose magnitude no `f64` holds is not a value this can report.
     parsed.is_finite().then_some(parsed)
 }
@@ -317,7 +371,7 @@ fn close_chain(out: &mut [Keyword], state: &Chain) {
 fn push(
     out: &mut Vec<Keyword>,
     chain: &mut Option<Chain>,
-    name: String,
+    name: &str,
     value: String,
     comment: Option<String>,
     kind: ValueKind,
@@ -327,13 +381,7 @@ fn push(
     // value ending in `&`.
     let opens = kind == ValueKind::CharacterString && value.ends_with('&');
     let index = out.len();
-    out.push(Keyword::new(
-        &name,
-        &value,
-        comment.as_deref(),
-        origin,
-        kind,
-    ));
+    out.push(Keyword::new(name, &value, comment.as_deref(), origin, kind));
     if opens {
         // The comment moves into the chain rather than being cloned into it: the card's own
         // copy is already packed into the `Keyword` pushed above.
@@ -347,9 +395,9 @@ fn push(
 }
 
 /// A commentary keyword: empty value, card body as the comment.
-fn commentary(name: String, body: &[u8], origin: KeywordOrigin) -> Keyword {
+fn commentary(name: &str, body: &[u8], origin: KeywordOrigin) -> Keyword {
     Keyword::new(
-        &name,
+        name,
         "",
         Some(&trim_end_lossy(body)),
         origin,
@@ -362,7 +410,7 @@ fn commentary(name: String, body: &[u8], origin: KeywordOrigin) -> Keyword {
 /// `HIERARCH` appears nowhere in FITS 4.0; it is an ESO convention that carries the name
 /// in the card body, up to the first `=`. That whole span is a keyword-name field for the
 /// character-set rule, since it ends up as a lookup key.
-fn hierarch(card: &[u8]) -> Result<Option<(String, &[u8])>> {
+fn hierarch(card: &[u8], ordinal: u64) -> Result<Option<(String, &[u8])>> {
     if field(card, 0, NAME) != b"HIERARCH" {
         return Ok(None);
     }
@@ -370,13 +418,25 @@ fn hierarch(card: &[u8]) -> Result<Option<(String, &[u8])>> {
     let Some(offset) = body.iter().position(|&b| b == b'=') else {
         return Ok(None);
     };
-    let name = collapse_whitespace(&String::from_utf8_lossy(field(body, 0, offset)));
-    if name.is_empty() {
-        // `HIERARCH = value` names nothing; it is an ordinary keyword named `HIERARCH`.
+    let lossy = String::from_utf8_lossy(field(body, 0, offset));
+    // The collapse is what allocates, so the two conditions that discard its result are asked
+    // first: a name field holding nothing but blanks, and one holding a byte the character set
+    // forbids. `HIERARCH = value` names nothing; it is an ordinary keyword named `HIERARCH`.
+    if lossy.split_whitespace().next().is_none() {
         return Ok(None);
     }
-    check_ascii(field(card, 0, NAME + offset), "keyword name")?;
-    Ok(Some((name, field(body, offset + 1, body.len()))))
+    check_ascii(
+        field(card, 0, NAME + offset),
+        "keyword name",
+        At {
+            ordinal,
+            name: b"HIERARCH",
+        },
+    )?;
+    Ok(Some((
+        collapse_whitespace(&lossy),
+        field(body, offset + 1, body.len()),
+    )))
 }
 
 /// Parse the text after a value indicator into `(value, comment, kind)`.
@@ -385,13 +445,14 @@ fn hierarch(card: &[u8]) -> Result<Option<(String, &[u8])>> {
 /// quote, which is §4.2.1's own criterion, and [`ValueKind::Other`] for everything else. The
 /// unquoted kinds are not told apart here: §4.2.2 through §4.2.6 are a parse of the text, and
 /// the text is what is reported.
-fn parse_value(body: &[u8]) -> Result<(String, Option<String>, ValueKind)> {
+fn parse_value(body: &[u8], at: At<'_>) -> Result<(String, Option<String>, ValueKind)> {
     let (value_part, comment_part) = split_value_comment(body);
-    check_ascii(value_part, "value")?;
+    check_ascii(value_part, "value", at)?;
     let comment = comment_text(comment_part);
     if value_part.trim_ascii_start().first() == Some(&b'\'') {
-        let value = parse_quoted(value_part)
-            .ok_or_else(|| Error::malformed("unterminated FITS character-string value"))?;
+        let value = parse_quoted(value_part).ok_or_else(|| {
+            Error::malformed(format!("unterminated FITS character-string value in {at}"))
+        })?;
         Ok((value, comment, ValueKind::CharacterString))
     } else {
         Ok((
@@ -465,18 +526,14 @@ fn trim_end_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.trim_ascii_end()).into_owned()
 }
 
-/// Collapse runs of whitespace to single spaces and trim.
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Reject a byte outside the header character set (§4.1) in a field where it cannot be
 /// tolerated — a name that cannot be represented cannot be matched, and a value that
 /// cannot be read as the standard defines it cannot be trusted downstream.
-fn check_ascii(bytes: &[u8], field_name: &str) -> Result<()> {
+fn check_ascii(bytes: &[u8], field_name: &str, at: At<'_>) -> Result<()> {
     match bytes.iter().find(|&&b| !(0x20..=0x7e).contains(&b)) {
         Some(&b) => Err(Error::malformed(format!(
-            "byte 0x{b:02x} outside the FITS header character set in a keyword {field_name}"
+            "byte 0x{b:02x} outside the FITS header character set in a keyword {field_name} in \
+             {at}"
         ))),
         None => Ok(()),
     }

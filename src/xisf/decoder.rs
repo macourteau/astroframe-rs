@@ -413,7 +413,9 @@ impl Decoder {
                         .and_then(|row_at| position.checked_add(row_at))
                         .ok_or_else(|| {
                             Error::limit(format!(
-                                "row offset: the block at position {position} plus row                                  {input_row} at {stride} bytes a row ends past the 64-bit                                  arithmetic every offset here runs in"
+                                "row offset: the block at position {position} plus row \
+                                 {input_row} at {stride} bytes a row ends past the 64-bit \
+                                 arithmetic every offset here runs in"
                             ))
                         })?;
                     if src.position() != offset {

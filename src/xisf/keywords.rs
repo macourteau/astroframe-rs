@@ -6,9 +6,11 @@
 //! and expose nothing an attribute triple can be handed to. Nothing here reads an `<Image>`
 //! attribute.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::limits::Limits;
-use crate::metadata::{Keyword, KeywordOrigin, ValueKind};
+use crate::metadata::{Keyword, KeywordOrigin, ValueKind, collapse_whitespace};
 use crate::xisf::cache::{Cache, memoized};
 use crate::xisf::xml::Doc;
 
@@ -142,13 +144,23 @@ fn close_chain(out: &mut [Keyword], state: &Chain<'_>, raw: &[RawKeyword<'_>], c
         return;
     };
     let records = &raw[state.continuations.clone()];
-    let mut nodes = Vec::with_capacity(records.len() + 1);
-    nodes.push(state.opener.node);
-    nodes.extend(records.iter().map(|record| record.node));
+    // The gate first, then the key. `memoized` discards the key unread when the gate is shut,
+    // so building it unconditionally paid the whole cost the gate exists to remove — one
+    // `Vec<usize>` per chain on exactly the element-heavy shapes [`Cache`] measures.
+    let referenced = state.opener.origin == KeywordOrigin::Reference;
+    let nodes = match referenced {
+        true => {
+            let mut nodes = Vec::with_capacity(records.len() + 1);
+            nodes.push(state.opener.node);
+            nodes.extend(records.iter().map(|record| record.node));
+            nodes
+        }
+        false => Vec::new(),
+    };
     let assembled = memoized(
         &mut cache.chains,
         (state.opener.origin, nodes),
-        state.opener.origin == KeywordOrigin::Reference,
+        referenced,
         || {
             let mut value = String::with_capacity(state.len);
             value.push_str(opener.value());
@@ -315,7 +327,7 @@ pub(super) fn fold_records<'a>(
             // here exactly as it does to a card, and so does the value kind it settles.
             let (value, kind) = match unquote(value_text) {
                 Some(text) => (text, ValueKind::CharacterString),
-                None => (value_text.trim_ascii().to_owned(), ValueKind::Other),
+                None => (Cow::Borrowed(value_text.trim_ascii()), ValueKind::Other),
             };
             Keyword::new(&name, &value, Some(record.comment), record.origin, kind)
         });
@@ -356,13 +368,18 @@ pub(super) fn fold_records<'a>(
 /// card body, so a writer serializing one into §11.6.1's three attributes may put the whole
 /// name in `name` or the whole card body in `value`. Both resolve to the full multi-word name,
 /// never the bare `HIERARCH`.
-fn hierarch<'a>(name: &'a str, value: &'a str) -> (String, &'a str) {
+///
+/// The name is a [`Cow`] because the ordinary record — every record that is not a `HIERARCH`
+/// one — carries its name already collapsed, so the two `HIERARCH` spellings are the only ones
+/// that build anything. § Fuzzing's bound counts every allocation and not the peak, so a copy
+/// that dies inside [`fold_records`]'s `Keyword::new` call costs exactly what a kept one does.
+fn hierarch<'a>(name: &'a str, value: &'a str) -> (Cow<'a, str>, &'a str) {
     if let Some(rest) = name.strip_prefix("HIERARCH")
         && rest.starts_with(|c: char| c.is_ascii_whitespace())
     {
         let collapsed = collapse_whitespace(rest);
         if !collapsed.is_empty() {
-            return (collapsed, value);
+            return (Cow::Owned(collapsed), value);
         }
     }
     if name == "HIERARCH"
@@ -373,10 +390,10 @@ fn hierarch<'a>(name: &'a str, value: &'a str) -> (String, &'a str) {
     {
         let collapsed = collapse_whitespace(multi_word);
         if !collapsed.is_empty() {
-            return (collapsed, rest);
+            return (Cow::Owned(collapsed), rest);
         }
     }
-    (name.to_owned(), value)
+    (Cow::Borrowed(name), value)
 }
 
 /// A FITS character-string value's content (§4.2.1) **as the source spells it**: the text
@@ -415,29 +432,41 @@ fn unquoted_shape(content: &str) -> (usize, usize) {
 
 /// Unquote a FITS character-string value (§4.2.1). `None` if the text does not open with a
 /// quote or never closes one.
-fn unquote(text: &str) -> Option<String> {
-    let mut rest = quoted_content(text)?.trim_ascii_end();
-    let mut content = String::with_capacity(rest.len());
-    while let Some(pair) = rest.find("''") {
+///
+/// A doubled quote is the only thing that makes the content differ from the span the source
+/// already holds, and the overwhelming majority of values carry none — so the return is a
+/// [`Cow`] that borrows the arena on that path and builds only when a pair is actually found.
+fn unquote(text: &str) -> Option<Cow<'_, str>> {
+    let trimmed = quoted_content(text)?.trim_ascii_end();
+    let Some(first) = trimmed.find("''") else {
+        return Some(Cow::Borrowed(trimmed));
+    };
+    let mut rest = trimmed;
+    let mut pair = first;
+    let mut content = String::with_capacity(trimmed.len());
+    loop {
         content.push_str(&rest[..pair + 1]);
         rest = &rest[pair + 2..];
+        match rest.find("''") {
+            Some(next) => pair = next,
+            None => break,
+        }
     }
     content.push_str(rest);
-    Some(content)
+    Some(Cow::Owned(content))
 }
 
 /// Rejoin a record's value and comment the way a card body writes them.
-fn join_body(value: &str, comment: &str) -> String {
+///
+/// Only the both-present spelling builds anything: either half alone is the body verbatim, and
+/// this runs once per orphaned `CONTINUE` record.
+fn join_body<'a>(value: &'a str, comment: &'a str) -> Cow<'a, str> {
     let value = value.trim_ascii_end();
     match (value.is_empty(), comment.is_empty()) {
-        (true, _) => comment.to_owned(),
-        (false, true) => value.to_owned(),
-        (false, false) => format!("{value} / {comment}"),
+        (true, _) => Cow::Borrowed(comment),
+        (false, true) => Cow::Borrowed(value),
+        (false, false) => Cow::Owned(format!("{value} / {comment}")),
     }
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

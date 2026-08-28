@@ -471,7 +471,6 @@ pub(crate) fn build_header(
     xtension: Option<&str>,
     sizing: &Sizing,
     primary_reported: &Arc<[Keyword]>,
-    primary_own: &[Keyword],
     primary_row_order: &RowOrder,
 ) -> Header {
     let is_primary = xtension.is_none();
@@ -512,7 +511,10 @@ pub(crate) fn build_header(
         if structural_value(keywords, "INHERIT").and_then(lex_logical) != Some(true) {
             return None;
         }
-        structural_value(primary_own, name)
+        // The reported list, not a second copy of it: `reorigin` rewrites a card's origin
+        // and nothing else, and this lookup reads a card's name, its value and its value
+        // kind — none of which the re-tagging touches.
+        structural_value(primary_reported, name)
     };
 
     let geometry = read_geometry(keywords, prefix);
