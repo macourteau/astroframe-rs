@@ -902,9 +902,10 @@ impl<S: Source> Reader<S> {
             // be this crate's chunking disagreeing with itself, and `Error::Malformed` would
             // misreport that as a bad file — exactly the report a caller's documented "skip
             // this frame" response then quietly absorbs, hiding the regression rather than
-            // surfacing it. Panicking is what the fits and xisf `slice_samples` helpers already
-            // do for the identical class of failure (a decoder-internal invariant, not
-            // something any file's bytes can reach).
+            // surfacing it. Panicking is what the shared `slice_samples` helper in
+            // `src/samples.rs` — the one both decoders' `scratch` calls — already does for the
+            // identical class of failure (a decoder-internal invariant, not something any
+            // file's bytes can reach).
             let out = dst.get_mut(range.clone()).unwrap_or_else(|| {
                 panic!(
                     "internal invariant violated: chunk covers destination range {range:?}, \
@@ -1161,9 +1162,8 @@ impl<S: Source> Reader<S> {
         // So this is one cheap check that removes a whole class early, not a proof that covers
         // those sites.
         //
-        // The two are bounded differently, and this comment previously said they were bounded
-        // the same way — "by the bytes the source has actually produced ... each of them is
-        // written checked in its own right". That was true of one of them:
+        // The two are bounded differently, and the tempting claim that both are "written
+        // checked in their own right" holds for only one of them:
         //
         // * FITS's `data_start` is a position the source **reached**, so it is bounded by the
         //   reading. And `file_row * row_bytes` is strictly less than the frame's byte extent,
@@ -1171,8 +1171,8 @@ impl<S: Source> Reader<S> {
         //   for the sum to overflow into.
         //   (`fits_caps::a_row_offset_past_u64_is_refused_rather_than_computed` asserts it.)
         // * XISF's `position` is **declared**, parsed straight out of a `location` attribute,
-        //   and no reading bounds it on a source whose length the reader cannot see. That site
-        //   was a bare `+` and it overflowed; it is `checked_mul`/`checked_add` now.
+        //   and no reading bounds it on a source whose length the reader cannot see. Written as
+        //   a bare `+` that site overflowed, so it is `checked_mul`/`checked_add`.
         //   (`adversarial::a_row_offset_past_u64_is_refused_rather_than_computed`.)
         //
         // The rule the two divide on: a **declared** offset needs its own arithmetic checked,
@@ -1274,8 +1274,8 @@ mod tests {
     /// A chunk's destination range disagreeing with the buffer it was already
     /// checked against is this crate's own chunking arithmetic contradicting itself, not
     /// anything a file can cause — so it panics instead of returning `Error::Malformed`,
-    /// matching the `slice_samples` helpers in `src/fits/decoder.rs` and
-    /// `src/xisf/decoder.rs`, which face the identical class of failure.
+    /// matching `slice_samples` in `src/samples.rs`, which both decoders reach through
+    /// `scratch` and which faces the identical class of failure.
     #[test]
     #[should_panic(expected = "internal invariant violated")]
     fn copy_samples_panics_when_a_chunks_range_exceeds_the_destination() {
@@ -1316,7 +1316,6 @@ mod tests {
             Reader::sequential_with_limits(std::io::Cursor::new(bytes), limits).unwrap();
         assert!(reader.next_image().unwrap(), "the fixture's first image");
 
-        // Skip past four billion advances instead of performing them.
         reader.advances = u64::from(u32::MAX);
 
         let err = reader
