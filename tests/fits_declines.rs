@@ -160,9 +160,9 @@ fn a_quoted_structural_value_is_not_the_structural_keywords_value() {
         header.decline_reason()
     );
     // Reported, and reported as the string it is.
-    assert_eq!(header.get("BITPIX").map(|k| k.value()), Some("16"));
+    assert_eq!(header.keyword("BITPIX").map(|k| k.value()), Some("16"));
     assert_eq!(
-        header.get("BITPIX").map(|k| k.value_kind()),
+        header.keyword("BITPIX").map(|k| k.value_kind()),
         Some(astroframe::ValueKind::CharacterString)
     );
     // The geometry three follow the row `BITPIX` already has: full geometry, no format.
@@ -850,7 +850,7 @@ fn non_ascii_in_a_comment_card_parses_and_geometry_survives() {
     // The text is decoded lossily rather than dropped, so the card is still reported.
     assert!(
         header
-            .get("COMMENT")
+            .keyword("COMMENT")
             .is_some_and(|k| !k.comment().unwrap_or_default().is_empty()),
         "the commentary text is reported"
     );
@@ -966,16 +966,16 @@ fn select_channel_where_the_channel_count_is_none_is_invalid_request() {
     assert_eq!(kind(&err), "InvalidRequest", "{err}");
 }
 
-/// Criterion *Caller misuse is an error, not a panic*: `with_bounds` after the pixel phase has
+/// Criterion *Caller misuse is an error, not a panic*: `set_bounds` after the pixel phase has
 /// begun is `InvalidRequest`.
 #[test]
-fn with_bounds_after_the_pixel_phase_is_invalid_request() {
+fn set_bounds_after_the_pixel_phase_is_invalid_request() {
     let mut reader = sequential(file(&[unsigned_2x2()])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
     let mut dst = [0.0f32; 4];
     reader.read_image_into(&mut dst).expect("the frame decodes");
     let err = reader
-        .with_bounds(0.0, 4095.0)
+        .set_bounds(0.0, 4095.0)
         .expect_err("configuration is fixed from the pixel phase on");
     assert_eq!(kind(&err), "InvalidRequest", "{err}");
 
@@ -1016,15 +1016,15 @@ fn read_samples_into_with_a_mismatched_variant_is_invalid_request() {
 }
 
 /// Criterion *Caller misuse is an error, not a panic*, graded the other way: a second
-/// `with_bounds` and a second `select_channel` *before* the pixel phase each succeed, and the
+/// `set_bounds` and a second `select_channel` *before* the pixel phase each succeed, and the
 /// frame decodes against the **later** value.
 #[test]
-fn a_second_with_bounds_and_a_second_select_channel_are_last_wins() {
+fn a_second_set_bounds_and_a_second_select_channel_are_last_wins() {
     let mut reader = sequential(file(&[unsigned_2x2()])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    reader.with_bounds(0.0, 4095.0).expect("the first range");
+    reader.set_bounds(0.0, 4095.0).expect("the first range");
     reader
-        .with_bounds(0.0, 131_070.0)
+        .set_bounds(0.0, 131_070.0)
         .expect("a second call is not an error");
     let mut dst = [0.0f32; 4];
     reader.read_image_into(&mut dst).expect("the frame decodes");
@@ -1032,7 +1032,7 @@ fn a_second_with_bounds_and_a_second_select_channel_are_last_wins() {
         .iter()
         .map(|&raw| expected_sample(raw, 32768.0, 0.0, 131_070.0))
         .collect();
-    assert_same_bits(&dst, &want, "the last with_bounds wins");
+    assert_same_bits(&dst, &want, "the last set_bounds wins");
 
     let mut reader = sequential(file(&[unsigned_2x2x3()])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
@@ -1054,17 +1054,17 @@ fn a_second_with_bounds_and_a_second_select_channel_are_last_wins() {
     assert_same_bits(&dst, &want, "the last select_channel wins");
 }
 
-/// Criterion *Caller misuse is an error, not a panic*: a second `with_bounds` carrying an
+/// Criterion *Caller misuse is an error, not a panic*: a second `set_bounds` carrying an
 /// **invalid** range is `InvalidRequest` and **leaves the first range in force** — each call is
 /// validated on its own, so a rejected one clears nothing.
 #[test]
-fn an_invalid_second_with_bounds_leaves_the_first_range_in_force() {
+fn an_invalid_second_set_bounds_leaves_the_first_range_in_force() {
     let mut reader = sequential(file(&[unsigned_2x2()])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    reader.with_bounds(0.0, 131_070.0).expect("the first range");
+    reader.set_bounds(0.0, 131_070.0).expect("the first range");
     // `lo == hi` fails the one range-validity rule: the reciprocal of the width is not finite.
     let err = reader
-        .with_bounds(7.0, 7.0)
+        .set_bounds(7.0, 7.0)
         .expect_err("an invalid second range");
     assert_eq!(kind(&err), "InvalidRequest", "{err}");
 

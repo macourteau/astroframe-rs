@@ -222,7 +222,7 @@ mod keyword_layout {
 ///
 /// It splits far more simply than the property merge does: the two pieces never interleave, so
 /// there is no split index, only `own` then `inherited`. That order is the reported one and it
-/// is load-bearing — [`crate::Header::get`] returns the first match in stored order, which is
+/// is load-bearing — [`crate::Header::keyword`] returns the first match in stored order, which is
 /// what makes an extension's own `EXPTIME` win over the primary's.
 ///
 /// An XISF image and a FITS primary both leave `inherited` empty: an XISF image's keywords are
@@ -500,6 +500,7 @@ impl PropertyType {
     ///
     /// Both a primary specification name and its alternate spelling resolve to the same
     /// variant; anything else is preserved verbatim in [`PropertyType::Other`].
+    #[must_use]
     pub fn classify(name: &str) -> PropertyType {
         use PropertyType as P;
         match name {
@@ -922,6 +923,51 @@ pub enum ResolutionUnit {
     /// [`Orientation::Other`]: crate::Orientation::Other
     /// [`ImageType::Other`]: crate::ImageType::Other
     Other(std::sync::Arc<str>),
+}
+
+impl ResolutionUnit {
+    /// Classify a `unit` attribute's value.
+    ///
+    /// The attribute's **absence** is [`ResolutionUnit::Inch`] and is the caller's to supply,
+    /// there being no text to classify: §11.11.2 states what absence means, so a decoder
+    /// reporting the default is reporting the specification rather than inventing a value.
+    ///
+    /// ```
+    /// use astroframe::ResolutionUnit;
+    ///
+    /// assert_eq!(ResolutionUnit::classify("cm"), ResolutionUnit::Centimetre);
+    /// ```
+    #[must_use]
+    pub fn classify(value: &str) -> ResolutionUnit {
+        match value {
+            "inch" => ResolutionUnit::Inch,
+            "cm" => ResolutionUnit::Centimetre,
+            other => ResolutionUnit::Other(std::sync::Arc::from(other)),
+        }
+    }
+
+    /// The §11.11.2 spelling a file writes. [`ResolutionUnit::Other`] reports its payload
+    /// verbatim.
+    ///
+    /// A bare `&str` rather than the `Option` [`RowOrder::as_str`] returns: every value here
+    /// has a spelling, [`ResolutionUnit::Inch`] included. That variant does double duty as
+    /// the absent-attribute answer, but §11.11.2 defines absence to *mean* pixels per inch,
+    /// so `inch` is what the file said — unlike an absent `ROWORDER`, which says nothing.
+    ///
+    /// [`RowOrder::as_str`]: crate::RowOrder::as_str
+    pub fn as_str(&self) -> &str {
+        match self {
+            ResolutionUnit::Inch => "inch",
+            ResolutionUnit::Centimetre => "cm",
+            ResolutionUnit::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for ResolutionUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// An XISF `Resolution` (§11.11), reported and never applied.

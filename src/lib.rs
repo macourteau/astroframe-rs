@@ -128,8 +128,8 @@ pub(crate) mod xisf;
 
 pub use error::{Error, Result};
 pub use header::{
-    Bounds, BoundsUnavailable, ColorSpace, DeclineClass, DeclineReason, Geometry, Granularity,
-    Header, ImageType, Orientation, PixelStorage, RowOrder,
+    Bounds, BoundsUnavailable, ColorSpace, DeclineClass, DeclineReason, Format, Geometry,
+    Granularity, Header, ImageType, Orientation, PixelStorage, RowOrder,
 };
 pub use image::Image;
 pub use limits::Limits;
@@ -138,7 +138,7 @@ pub use metadata::{
     Properties, Property, PropertyIter, PropertyScope, PropertyType, PropertyValue, Resolution,
     ResolutionUnit, ValueKind,
 };
-pub use normalize::{Normalizer, Range, Sample, Scaling};
+pub use normalize::{Normalizer, Sample, SampleRange, Scaling};
 pub use reader::{Chunk, Chunks, Reader};
-pub use samples::{SampleFormat, SampleSlice, Samples};
+pub use samples::{IterF64, SampleFormat, SampleSlice, Samples};
 pub use source::{Seekable, Sequential, Source};

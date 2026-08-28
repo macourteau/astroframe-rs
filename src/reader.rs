@@ -1,14 +1,14 @@
 //! The three-tier API. The user-facing prose lives on [`Reader`] itself, which is where a
 //! caller meets it.
 
-use std::ops::{ControlFlow, Range as OpsRange};
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::header::{Bounds, BoundsUnavailable, Header};
+use crate::header::{Bounds, BoundsUnavailable, Format, Header};
 use crate::image::Image;
 use crate::limits::{Limits, narrow};
-use crate::normalize::{Normalizer, Range};
+use crate::normalize::{Normalizer, SampleRange};
 use crate::samples::{SampleSlice, Samples};
 use crate::source::{Seekable, Sequential, Source};
 
@@ -23,7 +23,7 @@ use crate::source::{Seekable, Sequential, Source};
 #[derive(Debug)]
 pub struct Chunk<'a> {
     channel: u32,
-    range: OpsRange<usize>,
+    range: Range<usize>,
     samples: SampleSlice<'a>,
 }
 
@@ -43,7 +43,7 @@ impl<'a> Chunk<'a> {
     /// recalculation. The distinction only bites under `select_channel`, where file and
     /// destination coordinates diverge: the range is always the destination's, the channel
     /// index always the file's.
-    pub fn range(&self) -> OpsRange<usize> {
+    pub fn range(&self) -> Range<usize> {
         self.range.clone()
     }
 
@@ -89,7 +89,7 @@ impl<'a> Chunk<'a> {
 /// surfaces from [`Chunks::next_chunk`].
 #[derive(Debug)]
 #[must_use = "constructing a cursor commits the reader to the pixel phase, so dropping one \
-              unused forbids with_bounds and select_channel while delivering nothing"]
+              unused forbids set_bounds and select_channel while delivering nothing"]
 pub struct Chunks<'a, S: Source> {
     reader: &'a mut Reader<S>,
 }
@@ -100,6 +100,16 @@ impl<S: Source> Chunks<'_, S> {
     /// A chunk borrows the reader's scratch buffer, so this is a
     /// `while let Some(chunk) = chunks.next_chunk()?` loop rather than an `Iterator` — the
     /// idiomatic Rust answer for lending iteration.
+    ///
+    /// # Errors
+    ///
+    /// Every error the pixel phase raises surfaces here, the cursor's own construction being
+    /// infallible: [`Error::Io`] from the source, [`Error::Malformed`],
+    /// [`Error::Unsupported`], [`Error::ChecksumMismatch`] or [`Error::LimitExceeded`] from
+    /// the position, and the [`Error::InvalidRequest`] that says the image's decode already
+    /// failed — a pixel-phase error poisons the image, and pulling again after being told so
+    /// is the caller's mistake. Advance to the next image, or start a fresh cursor to retry
+    /// this one, which [`Reader::is_seekable`] says whether the source allows.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>> {
         match self.reader.advance_chunk()? {
             None => Ok(None),
@@ -226,12 +236,12 @@ pub struct Reader<S: Source> {
     limits: Limits,
     inner: Inner,
     phase: Phase,
-    /// Set by `with_bounds`; per-image, cleared by `next_image`.
+    /// Set by `set_bounds`; per-image, cleared by `next_image`.
     ///
-    /// The validated [`Range`], not the pair the caller wrote: `with_bounds` has already
+    /// The validated [`SampleRange`], not the pair the caller wrote: `set_bounds` has already
     /// applied the validity rule, and keeping the pair would mean re-deriving `k` at
     /// normalize time from numbers that have already passed.
-    bounds_override: Option<Range>,
+    bounds_override: Option<SampleRange>,
     /// Set by `select_channel`; per-image, cleared by `next_image`.
     selected_channel: Option<u32>,
     /// `next_image()` advances, against `Limits::images_per_source`.
@@ -274,11 +284,22 @@ impl<S: Source + std::fmt::Debug> std::fmt::Debug for Reader<S> {
 
 impl Reader<Seekable<std::io::BufReader<std::fs::File>>> {
     /// Open a file. Seekable, so block order does not matter and the source length is known.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be opened, and whatever the first header unit's parse
+    /// raises: [`Error::Malformed`] for bytes matching neither format's signature,
+    /// [`Error::Unsupported`] for a format this build has disabled, [`Error::LimitExceeded`]
+    /// for a header past one of [`Limits`]' caps.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_limits(path, Limits::default())
     }
 
     /// [`Reader::open`] with the caller's caps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::open`], against `limits` rather than the defaults.
     pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         Reader::seekable_with_limits(std::io::BufReader::new(file), limits)
@@ -296,11 +317,22 @@ impl<R: std::io::Read> Reader<Sequential<R>> {
     /// [`std::io::BufReader`]; this takes the reader verbatim, and the decoder issues many
     /// small reads — one per 2880-byte FITS header block, one per pixel row — each of which
     /// is a syscall on a bare pipe or socket.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the first header unit's parse raises — [`Error::Io`] from the source itself,
+    /// [`Error::Malformed`] for bytes matching neither format's signature,
+    /// [`Error::Unsupported`] for a format this build has disabled, [`Error::LimitExceeded`]
+    /// for a header past one of [`Limits`]' caps.
     pub fn sequential(source: R) -> Result<Self> {
         Self::sequential_with_limits(source, Limits::default())
     }
 
     /// [`Reader::sequential`] with the caller's caps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::sequential`], against `limits` rather than the defaults.
     pub fn sequential_with_limits(source: R, limits: Limits) -> Result<Self> {
         Reader::build(Sequential::new(source), limits)
     }
@@ -316,11 +348,21 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
     /// **Buffer a source that is not already in memory.** Only [`Reader::open`] wraps what it
     /// is given in a [`std::io::BufReader`]; a bare [`std::fs::File`] handed here pays one
     /// syscall per 2880-byte FITS header block and one per pixel row. A `Cursor` needs none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::sequential`], plus the [`Error::Io`] a source that cannot report its own
+    /// length raises — the constructor measures it, which is what the geometry cross-check
+    /// uses.
     pub fn seekable(source: R) -> Result<Self> {
         Self::seekable_with_limits(source, Limits::default())
     }
 
     /// [`Reader::seekable`] with the caller's caps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::seekable`], against `limits` rather than the defaults.
     pub fn seekable_with_limits(source: R, limits: Limits) -> Result<Self> {
         Reader::build(Seekable::new(source)?, limits)
     }
@@ -415,6 +457,59 @@ impl<S: Source> Reader<S> {
         &self.limits
     }
 
+    /// Which container this reader is decoding.
+    ///
+    /// Answered from construction, before the first [`Reader::next_image`] — the constructor
+    /// sniffed the leading bytes, so there is no position to advance to first, and a caller
+    /// choosing caps or a code path per format asks here rather than decoding one image to
+    /// find out. [`Header::format`] reports the same fact per position, which is the shape a
+    /// caller holding only a `Header` needs.
+    ///
+    /// ```no_run
+    /// use astroframe::{Format, Reader};
+    ///
+    /// # fn main() -> astroframe::Result<()> {
+    /// let reader = Reader::open("frame.fits")?;
+    /// assert_eq!(reader.format(), Format::Fits);
+    /// # Ok(()) }
+    /// ```
+    pub fn format(&self) -> Format {
+        match &self.inner {
+            #[cfg(feature = "fits")]
+            Inner::Fits(_) => Format::Fits,
+            #[cfg(feature = "xisf")]
+            Inner::Xisf(_) => Format::Xisf,
+            #[cfg(not(any(feature = "fits", feature = "xisf")))]
+            Inner::NoFormat => {
+                unreachable!("no format is compiled in, so no Reader was ever constructed")
+            }
+        }
+    }
+
+    /// Whether this reader's source can move its cursor backwards.
+    ///
+    /// [`Source`] is a bare marker and stays one — its operations are the decoders' interface
+    /// to the bytes, not a caller's. But seekability is a fact the *caller's* moves depend on,
+    /// and the documented moves say so: re-decoding an image by starting a fresh
+    /// [`Reader::chunks`] cursor works on a seekable source and is [`Error::Unsupported`] on a
+    /// sequential one, as is an XISF block lying behind the cursor. Generic code written to
+    /// the documented bound `fn run<S: Source>(reader: &mut Reader<S>)` has no other way to
+    /// ask, and would otherwise have to be told by whoever constructed the reader.
+    ///
+    /// ```no_run
+    /// # fn f(reader: &mut astroframe::Reader<impl astroframe::Source>) -> astroframe::Result<()> {
+    /// let mut buffer = vec![0.0f32; reader.destination_len()?];
+    /// reader.read_image_into(&mut buffer)?;
+    /// if reader.is_seekable() {
+    ///     // Decoding the same image a second time needs the cursor to go back.
+    ///     reader.read_image_into(&mut buffer)?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn is_seekable(&self) -> bool {
+        self.source.is_seekable()
+    }
+
     // ------------------------------------------------------------ header phase
 
     /// The current image's header, or `None` until the first successful
@@ -468,14 +563,21 @@ impl<S: Source> Reader<S> {
     /// The same value [`Reader::header`] reports, in the shape the documented loop wants:
     /// inside `while reader.next_image()? { … }` a header always exists, and the `Option`
     /// there is a fact about the reader before the first advance rather than about the
-    /// position. Calling this before the first [`Reader::next_image`], or after the one that
-    /// reported end of source, is the caller's mistake and is reported as one.
+    /// position.
     ///
     /// It reports a **declined** position like any other — the decline is on
     /// [`Header::decline_reason`], which is where a walk checks it. Only a pixel call turns
     /// that into an error.
     ///
     /// **Fetch it after configuring the reader**, exactly as [`Reader::header`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`], and only that: calling before the first
+    /// [`Reader::next_image`], or after the one that reported end of source, is the caller's
+    /// mistake and is reported as one.
+    ///
+    /// # Examples
     ///
     /// ```no_run
     /// # fn f(reader: &mut astroframe::Reader<impl astroframe::Source>) -> astroframe::Result<()> {
@@ -508,12 +610,20 @@ impl<S: Source> Reader<S> {
     /// The images-per-source cap counts **advances**, not HDUs, so a FITS file with three
     /// hundred tables between two images is nowhere near it.
     ///
-    /// Reader state is per-image: `with_bounds` and `select_channel` are cleared here. The
+    /// Reader state is per-image: `set_bounds` and `select_channel` are cleared here. The
     /// alternative silently carries a `Float32` image's bounds onto the `UInt16` image after
     /// it, which a multi-image XISF file makes reachable.
     ///
     /// Always legal after an early stop: whatever remains of an abandoned image's data is
     /// skipped first.
+    ///
+    /// # Errors
+    ///
+    /// End of source is `Ok(false)` rather than an error. [`Error::LimitExceeded`] when the
+    /// source holds more image occurrences than [`Limits::images_per_source`] allows, and
+    /// [`Error::Io`], [`Error::Malformed`] or [`Error::Unsupported`] from reading the next
+    /// header unit — including the skip past an abandoned image's remaining data, which a
+    /// sequential source performs by reading.
     pub fn next_image(&mut self) -> Result<bool> {
         if self.pixels_started {
             let src = &mut self.source;
@@ -553,23 +663,34 @@ impl<S: Source> Reader<S> {
 
     /// Override the representable range the normalized output maps against.
     ///
+    /// A setter, and named as one: [`Reader::select_channel`] is its sibling, both being
+    /// imperative configuration calls that take `&mut self` and can fail. The `with_` prefix
+    /// belongs to [`Limits`]' builder methods, which consume and return `Self` so a caller can
+    /// chain them; one prefix carrying two contracts is what makes
+    /// `reader.set_bounds(..).select_channel(..)` look chainable when it is not.
+    ///
     /// **Its operands are physical values** — post-`BSCALE`/`BZERO`, the units the range map
     /// works in. So on a `BITPIX = 16`, `BZERO = 32768` frame the pair that reproduces the
     /// default range is `(0, 65535)`, and `(-32768, 32767)` yields a different image rather
     /// than the same one written another way.
     ///
     /// Refuses the same values a file-declared `bounds` is refused for — the range validity
-    /// rule in [`Range::new`] — but as [`Error::InvalidRequest`] rather than
+    /// rule in [`SampleRange::new`] — but as [`Error::InvalidRequest`] rather than
     /// [`Error::Malformed`], the caller being the one at fault.
     ///
     /// May be called again before the pixel phase begins, and the **last call wins**; a
     /// second call is not an error. Each call is validated on its own, so a rejected second
     /// call leaves the first in force rather than clearing the range.
-    pub fn with_bounds(&mut self, lo: f64, hi: f64) -> Result<()> {
-        self.require_header_phase("with_bounds")?;
-        let Some(range) = Range::new(lo, hi) else {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`], and only that — for a pair failing the range validity rule,
+    /// and for a call after the pixel phase has begun, from which configuration is fixed.
+    pub fn set_bounds(&mut self, lo: f64, hi: f64) -> Result<()> {
+        self.require_header_phase("set_bounds")?;
+        let Some(range) = SampleRange::new(lo, hi) else {
             return Err(Error::invalid_request(format!(
-                "with_bounds({lo}, {hi}): 1.0f32 / ((hi - lo) as f32) must be finite, positive \
+                "set_bounds({lo}, {hi}): 1.0f32 / ((hi - lo) as f32) must be finite, positive \
                  and normal"
             )));
         };
@@ -586,8 +707,11 @@ impl<S: Source> Reader<S> {
     /// May be called again before the pixel phase begins, and the last call wins; it narrows
     /// from the *file's* channels each time, not from the previous narrowing.
     ///
-    /// At a position whose channel count is `None` this is [`Error::InvalidRequest`] for
-    /// every `k`, there being no channel count for `k` to be within.
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`], and only that — for a `k` at or beyond the file's channel
+    /// count, for a position whose channel count is `None`, there being no count for `k` to be
+    /// within, and for a call after the pixel phase has begun.
     pub fn select_channel(&mut self, k: u32) -> Result<()> {
         self.require_header_phase("select_channel")?;
         let channels = dispatch!(&self.inner, d => d.header(), Option<&Header>)
@@ -627,7 +751,7 @@ impl<S: Source> Reader<S> {
     /// Dropping the cursor ends delivery without error, leaving the reader positioned
     /// mid-image; [`Reader::next_image`] is still legal and skips whatever remains.
     #[must_use = "constructing a cursor commits the reader to the pixel phase, so dropping one \
-                  unused forbids with_bounds and select_channel while delivering nothing"]
+                  unused forbids set_bounds and select_channel while delivering nothing"]
     pub fn chunks(&mut self) -> Chunks<'_, S> {
         self.phase = Phase::Pixel;
         // A new cursor is a new stream over the current image, so the next `next_chunk` runs
@@ -644,6 +768,11 @@ impl<S: Source> Reader<S> {
     /// The callback returns [`ControlFlow`], so a caller can stop early without inventing an
     /// error. A callback needing to fail with its own error keeps it in captured state and
     /// returns `Break`; the break carries no payload for exactly that reason.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Chunks::next_chunk`] raises, this being that loop written out. A callback
+    /// returning `Break` is not an error.
     pub fn for_each_chunk<F>(&mut self, mut f: F) -> Result<()>
     where
         F: FnMut(&Chunk<'_>) -> ControlFlow<()>,
@@ -667,6 +796,14 @@ impl<S: Source> Reader<S> {
     /// mixture of decoded and stale data. It is the caller's buffer, so the library neither
     /// zeroes it nor restores it; a caller reusing one across frames must treat a failed
     /// decode as having invalidated it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] for a destination whose variant or length does not match, and
+    /// for a position reporting no sample format or no geometry. The class a **declined**
+    /// position reports, which is where [`Header::decline_reason`] becomes an error.
+    /// [`Error::LimitExceeded`] for the total-samples and decoded-output-byte caps. Then
+    /// whatever [`Chunks::next_chunk`] raises for the rest of the decode.
     pub fn read_samples_into(&mut self, dst: &mut Samples) -> Result<()> {
         let header = self.current_header_for_pixels()?;
         let format = header.sample_format().ok_or_else(|| {
@@ -703,6 +840,12 @@ impl<S: Source> Reader<S> {
     /// sample format is [`Error::InvalidRequest`], there being no variant to allocate.
     ///
     /// On failure this yields an error and **no** `Samples`, never a half-filled buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::read_samples_into`], less the two the sizing removes: a wrong length and a
+    /// wrong variant cannot arise. A position reporting no sample format is
+    /// [`Error::InvalidRequest`], there being no variant to allocate.
     pub fn read_samples(&mut self) -> Result<Samples> {
         let header = self.current_header_for_pixels()?;
         let format = header.sample_format().ok_or_else(|| {
@@ -723,12 +866,21 @@ impl<S: Source> Reader<S> {
     /// Refused when no representable range is in force — [`Error::Unsupported`] for a source
     /// whose format defines no default (a FITS float frame, or FITS integer scaling outside
     /// the unsigned convention), [`Error::Malformed`] for an image whose declared `bounds` is
-    /// missing or invalid. [`Reader::with_bounds`] is the escape hatch for both. Native
+    /// missing or invalid. [`Reader::set_bounds`] is the escape hatch for both. Native
     /// samples still decode in either case: a frame that cannot be *normalized* is not
     /// thereby a frame that cannot be *read*.
     ///
     /// On a part-way failure the buffer is left in an unspecified state, as
     /// [`Reader::read_samples_into`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRequest`] for a destination of the wrong length and for a position
+    /// reporting no geometry. The class a **declined** position reports.
+    /// [`Error::LimitExceeded`] for the total-samples and decoded-output-byte caps.
+    /// [`Error::Unsupported`] or [`Error::Malformed`] where no representable range is in
+    /// force, as above. Then whatever [`Chunks::next_chunk`] raises for the rest of the
+    /// decode.
     pub fn read_image_into(&mut self, dst: &mut [f32]) -> Result<()> {
         let header = self.current_header_for_pixels()?;
         let expected = self.destination_len_of(&header)?;
@@ -767,6 +919,10 @@ impl<S: Source> Reader<S> {
     /// The allocating convenience wrapper over [`Reader::read_image_into`].
     ///
     /// On failure this yields an error and **no** `Image`, never a half-filled one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::read_image_into`], less the wrong-length destination the sizing removes.
     pub fn read_image(&mut self) -> Result<Image> {
         let header = self.current_header_for_pixels()?;
         let expected = self.destination_len_of(&header)?;
@@ -793,10 +949,14 @@ impl<S: Source> Reader<S> {
     /// reason this exists: a length computed from a pre-`select_channel` header is rejected,
     /// correctly, and the caller then has to know the rule.
     ///
-    /// Carries the pixel phase's first checks with it — a declined position raises its own
-    /// class, and the total-samples cap applies — because a length is only meaningful for a
-    /// position that will decode. A position reporting no geometry is
-    /// [`Error::InvalidRequest`], there being no buffer size to give.
+    /// # Errors
+    ///
+    /// It carries the pixel phase's first checks with it, because a length is only meaningful
+    /// for a position that will decode: a **declined** position raises its own class, the
+    /// total-samples cap applies, and a position reporting no geometry is
+    /// [`Error::InvalidRequest`], there being no buffer size to give. Before the first
+    /// [`Reader::next_image`] it is the [`Error::InvalidRequest`] [`Reader::current_header`]
+    /// gives.
     pub fn destination_len(&self) -> Result<usize> {
         self.destination_len_of(&self.current_header_for_pixels()?)
     }
@@ -814,17 +974,23 @@ impl<S: Source> Reader<S> {
     /// public API.
     ///
     /// It takes **no header**: it reads the reader's current one, which is what folds
-    /// [`Reader::with_bounds`] in. A caller-supplied header could be a stale one, and a stale
+    /// [`Reader::set_bounds`] in. A caller-supplied header could be a stale one, and a stale
     /// one normalizes against the wrong range — precisely the bit-moving slip this exists to
     /// prevent. The pixel-phase rule applies for the same reason it applies to
-    /// [`Header::channels`]: call [`Reader::select_channel`] and [`Reader::with_bounds`]
+    /// [`Header::channels`]: call [`Reader::select_channel`] and [`Reader::set_bounds`]
     /// **before** asking for this, since the primitive describes what the reader will
     /// produce.
     ///
+    /// # Errors
+    ///
     /// Refused where [`Reader::read_image_into`] is refused and with the same classes:
     /// [`Error::Unsupported`] for a source whose format defines no default range,
-    /// [`Error::Malformed`] for an image whose declared `bounds` is missing or invalid.
-    /// [`Reader::with_bounds`] is the escape hatch for both.
+    /// [`Error::Malformed`] for an image whose declared `bounds` is missing or invalid, and
+    /// [`Reader::set_bounds`] is the escape hatch for both. It carries the pixel phase's first
+    /// checks too, exactly as [`Reader::destination_len`] does — a declined position raises its
+    /// own class, and the total-samples cap applies.
+    ///
+    /// # Examples
     ///
     /// ```no_run
     /// # fn f(reader: &mut astroframe::Reader<impl astroframe::Source>) -> astroframe::Result<()> {
@@ -882,7 +1048,7 @@ impl<S: Source> Reader<S> {
     /// Build the normalization primitive from a header this reader produced, or say why there
     /// is none.
     ///
-    /// No re-validation: [`Bounds`] carries the [`Range`] its producer already checked, so the
+    /// No re-validation: [`Bounds`] carries the [`SampleRange`] its producer already checked, so the
     /// three usable variants hand one over rather than a pair to rebuild. There is no
     /// unreachable failure branch left to invent a class for.
     fn normalizer_for(&self, header: &Header) -> Result<Normalizer> {
@@ -892,13 +1058,13 @@ impl<S: Source> Reader<S> {
             Bounds::Unavailable(BoundsUnavailable::NoFormatDefault) => {
                 return Err(Error::unsupported(
                     "this source defines no representable range for normalized output; decode \
-                     native samples, or supply one with with_bounds",
+                     native samples, or supply one with set_bounds",
                 ));
             }
             Bounds::Unavailable(BoundsUnavailable::InvalidDeclared) => {
                 return Err(Error::malformed(
                     "the declared bounds are missing or fail the range validity rule; native \
-                     samples still decode, and with_bounds overrides",
+                     samples still decode, and set_bounds overrides",
                 ));
             }
         };
@@ -1162,7 +1328,7 @@ mod tests {
         );
     }
 
-    /// `with_bounds` overriding a file-declared `bounds` must report the file's own
+    /// `set_bounds` overriding a file-declared `bounds` must report the file's own
     /// text verbatim, not a numeric pair re-rendered through a formatter — `1.500e+03` becomes
     /// `1500` that way, which is precisely the "re-rendering a number through a formatter can
     /// lose digits" failure § Decisions the implementer must not silently change bans for keyword values.
@@ -1192,7 +1358,7 @@ mod tests {
             "fixture sanity check: the file's declared bounds must parse before the override \
              matters"
         );
-        reader.with_bounds(0.0, 100.0).unwrap();
+        reader.set_bounds(0.0, 100.0).unwrap();
 
         match reader.header().unwrap().bounds() {
             Bounds::CallerSupplied {

@@ -45,7 +45,7 @@ fn main() -> astroframe::Result<()> {
         // and normalized output is refused rather than invented. That is `Unsupported`, and it
         // is a property of the file rather than a failure, so handle it instead of dying on a
         // frame the next tier down reads perfectly well. `03_native_samples` is that tier;
-        // `07_channels_and_bounds` shows `with_bounds`, the escape hatch.
+        // `07_channels_and_bounds` shows `set_bounds`, the escape hatch.
         // `match`, not `if let`. An `if let Err(Unsupported)` here reads fine and is wrong:
         // every other class — `Malformed`, `Io`, `LimitExceeded`, `ChecksumMismatch` — falls
         // through it, and the summary below then prints statistics for a buffer the decode

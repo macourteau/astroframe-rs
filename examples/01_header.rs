@@ -49,7 +49,7 @@ fn main() -> astroframe::Result<()> {
         // The range normalized output is computed against, and where it came from. This is
         // reported rather than guessed at, which is what lets a caller tell "the file said so"
         // from "the format's default applied" from "there is no usable range here". Each
-        // usable variant carries the validated `Range` the decode will actually use.
+        // usable variant carries the validated `SampleRange` the decode will actually use.
         match header.bounds() {
             Bounds::FormatDefault(r) => {
                 println!("  bounds     {}..{} (format default)", r.lo(), r.hi());

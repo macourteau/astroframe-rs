@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use crate::fits::cards::{BLOCK, lex_integer, lex_logical, lex_number};
 use crate::header::{
-    Bounds, BoundsUnavailable, DeclineClass, DeclineReason, Geometry, Granularity, Header,
+    Bounds, BoundsUnavailable, DeclineClass, DeclineReason, Format, Geometry, Granularity, Header,
     PixelStorage, RowOrder,
 };
 use crate::metadata::{Keyword, KeywordSet, PropertySet, ValueKind};
-use crate::normalize::{Range, Scaling};
+use crate::normalize::{SampleRange, Scaling};
 use crate::samples::SampleFormat;
 
 /// The value text of the card named `name`, verbatim.
@@ -541,6 +541,7 @@ pub(crate) fn build_header(
     let bounds = fits_bounds(sample_format, bscale, bzero, decline_reason.is_some());
 
     Header {
+        format: Format::Fits,
         geometry,
         sample_format,
         bounds,
@@ -610,7 +611,7 @@ fn fits_bounds(format: Option<SampleFormat>, bscale: f64, bzero: f64, declined: 
     // The `[0, 2ⁿ − 1]` range for the width the physical values occupy, built through the one
     // constructor that computes it — the same call the XISF default takes, so the two formats
     // cannot state the same range in two spellings.
-    match Range::unsigned_default(format.bytes() * 8) {
+    match SampleRange::unsigned_default(format.bytes() * 8) {
         Some(range) => Bounds::FormatDefault(range),
         None => Bounds::Unavailable(BoundsUnavailable::NoFormatDefault),
     }

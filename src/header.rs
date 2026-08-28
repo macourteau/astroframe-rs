@@ -8,7 +8,7 @@ use crate::metadata::{
     Cfa, DisplayFunction, Keyword, KeywordSet, Keywords, Properties, Property, PropertySet,
     Resolution,
 };
-use crate::normalize::{Range, Scaling};
+use crate::normalize::{SampleRange, Scaling};
 use crate::samples::SampleFormat;
 
 /// FITS `ROWORDER`, reported and applied to nothing.
@@ -54,27 +54,42 @@ impl RowOrder {
         }
     }
 
-    /// The spelling a file writes, which is what a consumer re-emitting the fact needs.
+    /// The spelling a file writes, which is what a consumer re-emitting the fact needs, and
+    /// `None` for [`RowOrder::Unspecified`], which has no spelling because no card carried it.
     ///
     /// The two recognized values report the convention's own upper-case spelling rather than
     /// whatever case the file used; [`RowOrder::Other`] reports its payload verbatim.
     ///
-    /// [`RowOrder::Unspecified`] reports the **empty string**, and that is the honest answer
-    /// rather than a placeholder: the state means the file carried no `ROWORDER` card, so a
-    /// consumer re-emitting it writes no card.
-    pub fn as_str(&self) -> &str {
+    /// **`Option<&str>` here, a bare `&str` on [`Orientation`], [`ImageType`] and
+    /// [`ColorSpace`] — because the facts differ, not from inconsistency.** Every value of
+    /// those three has a wire spelling, so there is nothing for an `Option` to report. This
+    /// enum has one value that is the *absence* of a card, and a bare `&str` would have to
+    /// answer it with `""` — which is a spelling a file can write: `classify` trims, so a
+    /// `ROWORDER` card holding only spaces is `Other("")`. Two different files would then be
+    /// indistinguishable through the re-emission surface of a crate whose premise is
+    /// reporting what the file says.
+    ///
+    /// ```
+    /// use astroframe::RowOrder;
+    ///
+    /// assert_eq!(RowOrder::Unspecified.as_str(), None);
+    /// assert_eq!(RowOrder::classify("   ").as_str(), Some(""));
+    /// ```
+    pub fn as_str(&self) -> Option<&str> {
         match self {
-            RowOrder::TopDown => "TOP-DOWN",
-            RowOrder::BottomUp => "BOTTOM-UP",
-            RowOrder::Unspecified => "",
-            RowOrder::Other(text) => text,
+            RowOrder::TopDown => Some("TOP-DOWN"),
+            RowOrder::BottomUp => Some("BOTTOM-UP"),
+            RowOrder::Unspecified => None,
+            RowOrder::Other(text) => Some(text),
         }
     }
 }
 
+/// [`RowOrder::Unspecified`] renders as the empty string, the two states
+/// [`RowOrder::as_str`] separates being one line of output either way.
 impl std::fmt::Display for RowOrder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.as_str().unwrap_or(""))
     }
 }
 
@@ -214,6 +229,28 @@ pub enum PixelStorage {
     Normal,
 }
 
+impl PixelStorage {
+    /// The §11.5.2 Table 13 spelling a file writes.
+    ///
+    /// A bare `&str` rather than the `Option` [`RowOrder::as_str`] returns: both values are
+    /// spellings the table defines, so there is no state here that means "the file wrote
+    /// nothing". A FITS frame reports [`PixelStorage::Planar`], which is the layout FITS 4.0
+    /// defines rather than an attribute it carries, and the spelling names that layout in the
+    /// one vocabulary this crate has for it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PixelStorage::Planar => "Planar",
+            PixelStorage::Normal => "Normal",
+        }
+    }
+}
+
+impl std::fmt::Display for PixelStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// XISF `imageType` (§11.5.1 Table 12), reported.
 ///
 /// Decoding does not depend on it, so an unrecognized value degrades to
@@ -298,6 +335,53 @@ impl std::fmt::Display for ImageType {
     }
 }
 
+/// Which container a source is.
+///
+/// Reported for the reason everything else here is reported: which format a file is, is a
+/// **fact about the file**, and § The organizing principle makes reporting a fact this crate
+/// has already established the rule. The reader established it at construction, by sniffing
+/// the leading bytes; without an accessor a caller reconstructs it from a format-specific
+/// accessor's `Option` — `scaling().is_some()` is the usual one — which is an inference from
+/// a fact reported for another purpose.
+///
+/// Neither variant is constructible in a build with both format features disabled, because
+/// no source is decoded there at all. The type is still present, so code matching on it
+/// compiles across the whole feature powerset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Format {
+    /// FITS, identified by the `SIMPLE` card the standard opens a file with.
+    Fits,
+    /// XISF, identified by the `XISF0100` signature of §6.1.
+    Xisf,
+}
+
+impl Format {
+    /// The format's name, as its own specification spells it.
+    ///
+    /// **Not a wire spelling, unlike the sibling `as_str` methods** — a container does not
+    /// carry its name as a value to be re-emitted; it identifies itself by a signature. This
+    /// is the string a log line, a report or a filter wants, and it is stable.
+    ///
+    /// ```
+    /// use astroframe::Format;
+    ///
+    /// assert_eq!(Format::Xisf.as_str(), "XISF");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Format::Fits => "FITS",
+            Format::Xisf => "XISF",
+        }
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Why no usable representable range exists.
 ///
 /// The two raise different classes from `read_image_into`, so a caller holding an
@@ -322,22 +406,22 @@ pub enum Bounds {
     /// No usable range exists, and this carries which.
     ///
     /// Such a frame is **not** rejected: its native samples decode normally through layer 1
-    /// and only the normalized output is refused, with `with_bounds` as the escape hatch.
+    /// and only the normalized output is refused, with `set_bounds` as the escape hatch.
     Unavailable(BoundsUnavailable),
     /// The format's own default applied.
     ///
-    /// Carries the validated [`Range`], so a tier-3 caller normalizing chunks with the public
+    /// Carries the validated [`SampleRange`], so a tier-3 caller normalizing chunks with the public
     /// primitive builds a [`Normalizer`](crate::Normalizer) from it directly — no re-deriving
     /// it from the sample width, and no fallible reconstruction of a range this crate has
-    /// already checked. The endpoints stay reachable as [`Range::lo`] and [`Range::hi`].
-    FormatDefault(Range),
+    /// already checked. The endpoints stay reachable as [`SampleRange::lo`] and [`SampleRange::hi`].
+    FormatDefault(SampleRange),
     /// The file stated this range.
-    Declared(Range),
-    /// `with_bounds` overrode whatever the file said.
+    Declared(SampleRange),
+    /// `set_bounds` overrode whatever the file said.
     #[non_exhaustive]
     CallerSupplied {
         /// The range in force.
-        effective: Range,
+        effective: SampleRange,
         /// What the file stated — its own text verbatim whenever it declared a `bounds` at
         /// all, usable or not, and `None` only when it declared none. So an override never
         /// erases the evidence, and overriding an override erases none either.
@@ -503,6 +587,7 @@ impl Geometry {
 /// consumer moving decoded frames between threads.
 #[derive(Clone, Debug)]
 pub struct Header {
+    pub(crate) format: Format,
     pub(crate) geometry: Option<Geometry>,
     pub(crate) sample_format: Option<SampleFormat>,
     pub(crate) bounds: Bounds,
@@ -531,6 +616,14 @@ pub struct Header {
 }
 
 impl Header {
+    /// Which container this position was read from.
+    ///
+    /// A fact rather than an interpretation, and the one fact every format-specific accessor
+    /// here was previously the only route to.
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
     /// Image width in pixels.
     ///
     /// This and the next two are reported **as a unit** — all `Some` or all `None`, since a
@@ -593,13 +686,12 @@ impl Header {
         &self.bounds
     }
 
-    /// The FITS scaling in force, or `None` for XISF.
+    /// The FITS scaling in force, or `None` for XISF, which defines no such concept.
     ///
     /// FITS **always** reports [`Scaling::Fits`], materializing the `BSCALE = 1`,
-    /// `BZERO = 0` defaults when the keywords are absent, so `None` unambiguously means
-    /// XISF. Under `INHERIT` this reports the pair actually *applied*, so a mixture — an
-    /// extension's own `BSCALE` beside the primary's `BZERO` — is visible rather than
-    /// inferred.
+    /// `BZERO = 0` defaults when the keywords are absent. Under `INHERIT` this reports the
+    /// pair actually *applied*, so a mixture — an extension's own `BSCALE` beside the
+    /// primary's `BZERO` — is visible rather than inferred.
     pub fn scaling(&self) -> Option<Scaling> {
         self.scaling
     }
@@ -620,7 +712,7 @@ impl Header {
     /// `Some` of §11.5.2's `0` default when the attribute is absent, and `None` on a FITS
     /// frame: the default is XISF's, and reporting it for a format that never stated one is
     /// indistinguishable to a caller from a file that did. The FITS `PEDESTAL` analogue stays
-    /// a keyword, being a keyword — `get("PEDESTAL")` is where it is read.
+    /// a keyword, being a keyword — `keyword("PEDESTAL")` is where it is read.
     pub fn offset(&self) -> Option<f64> {
         self.offset
     }
@@ -699,14 +791,19 @@ impl Header {
 
     /// Look a keyword up by **exact** byte match, returning the **first** in stored order.
     ///
-    /// Deliberately not case-folding: `get("SITELAT")` and `get("sitelat")` do not both
-    /// resolve. A case-folding convenience is a consumer's adapter, not this crate's lookup.
+    /// Named for the surface it searches, as [`Header::property`] is: the two text surfaces
+    /// are separate reports, and a lookup spelled `get` would leave a reader to guess which
+    /// of them it reaches.
+    ///
+    /// Deliberately not case-folding: `keyword("SITELAT")` and `keyword("sitelat")` do not
+    /// both resolve. A case-folding convenience is a consumer's adapter, not this crate's
+    /// lookup.
     ///
     /// First-in-stored-order means an extension's own card wins over one inherited from the
     /// primary header — the live case, since both headers' cards are always reported and an
     /// inherited `EXPTIME` or `DATE-OBS` sits behind the extension's. Every occurrence stays
     /// reachable through [`Header::keywords`], which is what `HISTORY` and `COMMENT` need.
-    pub fn get(&self, name: &str) -> Option<&Keyword> {
+    pub fn keyword(&self, name: &str) -> Option<&Keyword> {
         self.keywords.view().iter().find(|k| k.name() == name)
     }
 
@@ -738,7 +835,7 @@ impl Header {
     }
 
     /// Look a property up by **exact** identifier match, returning the **first** in document
-    /// order — the rule [`Header::get`] follows for keywords.
+    /// order — the rule [`Header::keyword`] follows for keywords.
     ///
     /// An identifier is a case-sensitive token in §11.1.1, so this does not case-fold either.
     /// Every occurrence of a repeated identifier stays reachable through
@@ -751,8 +848,9 @@ impl Header {
     ///
     /// `None` for two different reasons, and the distinction matters to a caller: on a FITS
     /// frame because the format defines no such concept, and on an XISF image because absence
-    /// of the element means the image is not mosaiced. Unlike the other two mosaic-and-display
-    /// accessors, `cfa()` has no specification default to report in the second case.
+    /// of the element means the image is not mosaiced. [`Header::format`] is which of the two
+    /// this `None` is. Unlike the other two mosaic-and-display accessors, `cfa()` has no
+    /// specification default to report in the second case.
     ///
     /// That makes `None` on an XISF image a positive claim about the file — a consumer
     /// branching on it decides whether to debayer — so an element this crate cannot read is

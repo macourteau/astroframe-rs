@@ -15,7 +15,9 @@ mod common;
 use std::io::Cursor;
 use std::ops::ControlFlow;
 
-use astroframe::{Bounds, Header, Orientation, PixelStorage, Reader, RowOrder, Samples, Source};
+use astroframe::{
+    Bounds, Format, Header, IterF64, Orientation, PixelStorage, Reader, RowOrder, Samples, Source,
+};
 
 use common::xisf::{self, Unit};
 use common::{Hdu, Streams, assert_granularity, assert_same_bits, file, kind};
@@ -454,7 +456,7 @@ fn report_dont_interpret_is_observable_fits() {
         "the keyword is reported verbatim"
     );
     assert_eq!(
-        header.get("ROWORDER").map(|k| k.value()),
+        header.keyword("ROWORDER").map(|k| k.value()),
         Some("BOTTOM-UP"),
         "and stays reachable as a keyword"
     );
@@ -511,6 +513,76 @@ fn report_dont_interpret_is_observable_xisf() {
     assert_same_bits(&got, &want, "samples arrive in stored order, unrotated");
 }
 
+/// **Which container a source is, is a fact the crate reports rather than one a caller infers.**
+/// Both surfaces answer it: the reader from construction, before any advance, and the header
+/// per position. The alternative is an `Option` reported for another purpose —
+/// `scaling().is_some()` — which is an inference rather than a report.
+#[test]
+fn the_container_format_is_reported_by_the_reader_and_by_the_header() {
+    let fits = fits_unsigned_u16(4, 4, 1, &levels(16));
+    let mut reader = Reader::seekable(Cursor::new(fits)).expect("construct");
+    assert_eq!(
+        reader.format(),
+        Format::Fits,
+        "answered from construction, before the first advance"
+    );
+    let header = first_image(&mut reader);
+    assert_eq!(header.format(), Format::Fits);
+    assert_eq!(reader.format().as_str(), "FITS");
+
+    let xisf = xisf_uncompressed(4, 4, 1, &levels(16));
+    let mut reader = Reader::seekable(Cursor::new(xisf)).expect("construct");
+    assert_eq!(reader.format(), Format::Xisf);
+    let header = first_image(&mut reader);
+    assert_eq!(header.format(), Format::Xisf);
+    assert_eq!(header.format().to_string(), "XISF");
+}
+
+/// **Seekability is a fact generic code can ask the reader for.** The poison-recovery error
+/// tells a caller its move depends on it — retrying an image needs a fresh cursor, which a
+/// seekable source allows and a sequential one refuses — and `Source` is a bare marker with
+/// nothing to ask, so without this a `fn run<S: Source>(..)` would have to be told.
+#[test]
+fn the_reader_reports_whether_its_source_can_seek() {
+    fn answer<S: Source>(reader: &Reader<S>) -> bool {
+        reader.is_seekable()
+    }
+
+    let bytes = fits_unsigned_u16(4, 4, 1, &levels(16));
+    let seekable = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
+    assert!(answer(&seekable));
+
+    let sequential = Reader::sequential(Cursor::new(bytes)).expect("construct");
+    assert!(
+        !answer(&sequential),
+        "a sequential reader refuses to move its cursor backwards, whatever it wraps"
+    );
+}
+
+/// **The `iter_f64` cursor is a named type carrying the trait set its siblings carry.** Its
+/// length is known before the first step and it walks from either end; an
+/// `impl Iterator<Item = f64>` return would hide both, and `KeywordIter` and `PropertyIter`
+/// are named for exactly that reason.
+#[test]
+fn iter_f64_is_a_named_exact_size_double_ended_cursor() {
+    let owned = Samples::U16(vec![0, 32768, 65535]);
+    let mut cursor: IterF64<'_> = owned.as_slice().iter_f64();
+
+    assert_eq!(cursor.len(), 3, "the length is known before the first step");
+    assert_eq!(cursor.next(), Some(0.0));
+    assert_eq!(cursor.next_back(), Some(65535.0));
+    assert_eq!(cursor.len(), 1);
+    let cloned: Vec<f64> = cursor.clone().collect();
+    assert_eq!(cloned, [32768.0], "Clone forks the cursor where it stands");
+    assert_eq!(cursor.next(), Some(32768.0));
+    assert_eq!(cursor.next(), None);
+    assert_eq!(cursor.next(), None, "and it stays exhausted");
+    assert_eq!(cursor.next_back(), None);
+
+    let backwards: Vec<f64> = owned.as_slice().iter_f64().rev().collect();
+    assert_eq!(backwards, [65535.0, 32768.0, 0.0]);
+}
+
 /// Criterion *`PEDESTAL` and XISF `offset` change no pixel* (invariant I3), FITS half.
 #[test]
 fn pedestal_changes_no_pixel() {
@@ -538,7 +610,7 @@ fn pedestal_changes_no_pixel() {
     let mut reader = Reader::seekable(Cursor::new(with_pedestal)).expect("construct");
     let header = first_image(&mut reader);
     assert_eq!(
-        header.get("PEDESTAL").map(|k| k.value()),
+        header.keyword("PEDESTAL").map(|k| k.value()),
         Some("100"),
         "and the keyword is retrievable"
     );
@@ -601,9 +673,9 @@ fn keyword_lookup_does_not_case_fold() {
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     let header = first_image(&mut reader);
 
-    assert_eq!(header.get("SITELAT").map(|k| k.value()), Some("12.34"));
+    assert_eq!(header.keyword("SITELAT").map(|k| k.value()), Some("12.34"));
     assert!(
-        header.get("sitelat").is_none(),
+        header.keyword("sitelat").is_none(),
         "names are matched exactly as the file wrote them"
     );
 
@@ -667,20 +739,20 @@ fn a_keyword_reads_the_same_from_either_container() {
     };
 
     for name in ["DATE-OBS", "EXPTIME"] {
-        let a = fits_header.get(name).expect("the FITS card").value();
-        let b = xisf_header.get(name).expect("the XISF keyword").value();
+        let a = fits_header.keyword(name).expect("the FITS card").value();
+        let b = xisf_header.keyword(name).expect("the XISF keyword").value();
         assert_eq!(a, b, "{name} reads byte-identically from either container");
     }
     assert_eq!(
-        fits_header.get("DATE-OBS").map(|k| k.value()),
+        fits_header.keyword("DATE-OBS").map(|k| k.value()),
         Some("2012-03-15T02:55:15"),
         "the FITS quoting is removed on both surfaces, not carried through on one"
     );
 
     // Commentary text lands in the same field for both formats.
     for name in ["HISTORY", "COMMENT"] {
-        let a = fits_header.get(name).expect("the FITS card");
-        let b = xisf_header.get(name).expect("the XISF keyword");
+        let a = fits_header.keyword(name).expect("the FITS card");
+        let b = xisf_header.keyword(name).expect("the XISF keyword");
         assert_eq!(
             a.value(),
             "",
@@ -746,7 +818,7 @@ fn continue_and_hierarch_fold_on_both_surfaces() {
         let header = first_image(&mut reader);
 
         assert_eq!(
-            header.get("LONGSTR").map(|k| k.value()),
+            header.keyword("LONGSTR").map(|k| k.value()),
             Some("the first part and the last part"),
             "{what}: the chain assembles with no trailing ampersand"
         );
@@ -754,21 +826,21 @@ fn continue_and_hierarch_fold_on_both_surfaces() {
         // reports it identically on both surfaces. XISF dropped the continuation entirely --
         // value and record both -- because only the FITS loop had a trailing close.
         assert_eq!(
-            header.get("TRAILING").map(|k| k.value()),
+            header.keyword("TRAILING").map(|k| k.value()),
             Some("first half second half &"),
             "{what}: a chain open at the end assembles from what it accumulated"
         );
         assert_eq!(
-            header.get("ESO DET EXP").map(|k| k.value()),
+            header.keyword("ESO DET EXP").map(|k| k.value()),
             Some("twelve"),
             "{what}: a HIERARCH card answers to its full multi-word name"
         );
         assert!(
-            header.get("HIERARCH").is_none(),
+            header.keyword("HIERARCH").is_none(),
             "{what}: and not to the bare HIERARCH"
         );
         assert_eq!(
-            header.get("DANGLING").map(|k| k.value()),
+            header.keyword("DANGLING").map(|k| k.value()),
             Some("keeps its ampersand &"),
             "{what}: no conforming CONTINUE follows, so the ampersand is a literal character"
         );
@@ -864,7 +936,7 @@ fn fits_float_frames_decode_natively_and_refuse_normalized_output() {
     assert_same_bits(decoded, &samples, "native f32 samples");
 
     // A second reader for the normalized half: `read_samples_into` above has already begun the
-    // pixel phase, from which `with_bounds` is `InvalidRequest` per *Phases, and what resets*.
+    // pixel phase, from which `set_bounds` is `InvalidRequest` per *Phases, and what resets*.
     let bytes = file(&[Hdu::primary().image_2d(-32, 4, 2).data_f32(&samples)]);
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     first_image(&mut reader);
@@ -879,13 +951,13 @@ fn fits_float_frames_decode_natively_and_refuse_normalized_output() {
     );
 
     // A refused normalized decode reads no pixel byte, so the reader is still configurable —
-    // which is what makes `with_bounds` the escape hatch the design calls it.
-    reader.with_bounds(0.0, 1.0).expect("a valid range");
+    // which is what makes `set_bounds` the escape hatch the design calls it.
+    reader.set_bounds(0.0, 1.0).expect("a valid range");
     let got = whole_buffer(&mut reader, samples.len());
     // k = 1/(1-0) is exactly 1.0, so the range map is an identity multiply and the clamp is
     // the only thing that happens — which is what makes the two saturated samples the point.
     let want: Vec<f32> = vec![0.0, 0.0, 0.5, 1.0, 1.0, 0.25, 0.75, 1.0];
-    assert_same_bits(&got, &want, "with_bounds supplies the missing range");
+    assert_same_bits(&got, &want, "set_bounds supplies the missing range");
     assert!(
         !got[0].is_sign_negative(),
         "a sample below lo saturates to +0.0, never -0.0"
@@ -934,7 +1006,7 @@ fn fits_integer_scaling_outside_the_unsigned_convention_refuses_normalized_outpu
         assert_eq!(dst, native, "{what}: layer 1 is unaffected");
 
         // A second reader for the normalized half: the native decode above has begun the pixel
-        // phase, from which `with_bounds` is `InvalidRequest`.
+        // phase, from which `set_bounds` is `InvalidRequest`.
         let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
         first_image(&mut reader);
         let refused = reader
@@ -942,10 +1014,10 @@ fn fits_integer_scaling_outside_the_unsigned_convention_refuses_normalized_outpu
             .expect_err("no representable range");
         assert_eq!(kind(&refused), "Unsupported", "{what}");
 
-        reader.with_bounds(0.0, 255.0).expect("a valid range");
+        reader.set_bounds(0.0, 255.0).expect("a valid range");
         reader
             .read_image_into(&mut [0.0f32; 8])
-            .expect("with_bounds is the escape hatch");
+            .expect("set_bounds is the escape hatch");
     }
 }
 
@@ -986,7 +1058,7 @@ fn every_source_mode_decodes_the_same_bits() {
 /// The reset has to change the decoded **pixels**, not merely the reported header: carrying an
 /// override onto the next image is exactly the defect the per-image rule prevents.
 #[test]
-fn with_bounds_and_select_channel_reset_across_next_image() {
+fn set_bounds_and_select_channel_reset_across_next_image() {
     let data = levels(24);
     let one = r#"<Image geometry="4:2:3" sampleFormat="UInt16" colorSpace="RGB" {loc}/>"#;
     let bytes = Unit::new()
@@ -998,7 +1070,7 @@ fn with_bounds_and_select_channel_reset_across_next_image() {
 
     first_image(&mut reader);
     reader.select_channel(1).expect("a channel the file has");
-    reader.with_bounds(0.0, 32767.0).expect("a valid range");
+    reader.set_bounds(0.0, 32767.0).expect("a valid range");
     let narrowed = reader.header().expect("configured header");
     assert_eq!(narrowed.channels(), Some(1));
     assert_eq!(narrowed.channel_index(), Some(1));
@@ -1014,7 +1086,7 @@ fn with_bounds_and_select_channel_reset_across_next_image() {
     assert_eq!(header.channel_index(), None, "and so is its report");
     assert!(
         matches!(header.bounds(), Bounds::FormatDefault(r) if r.lo() == 0.0 && r.hi() == 65535.0),
-        "with_bounds was cleared too, so the format default is back in force"
+        "set_bounds was cleared too, so the format default is back in force"
     );
 
     let second = whole_buffer(&mut reader, 24);
@@ -1031,7 +1103,7 @@ fn with_bounds_and_select_channel_reset_across_next_image() {
     }
     assert!(
         differs,
-        "the cleared with_bounds must change decoded pixels, not just the reported range"
+        "the cleared set_bounds must change decoded pixels, not just the reported range"
     );
 }
 

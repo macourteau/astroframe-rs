@@ -18,7 +18,7 @@ slowly enough to be misleading about this crate's speed.
 | `04_metadata` | Keywords and properties, and the exact-match lookup that does not case-fold. |
 | `05_streaming` | Tier 3: chunked delivery, `Reader::normalizer` plus `Chunk::normalize_into` to assemble normalized `f32` from chunks, and `Reader::sequential` over a pipe. Reads `granularity()` first to decide whether streaming buys anything, and on a file checks the assembled buffer against `read_image_into` bit for bit. |
 | `06_untrusted` | `Limits` and the error classes — the shape to use for input you did not produce. |
-| `07_channels_and_bounds` | `select_channel`, and `with_bounds` as the escape hatch for a frame whose range the file does not state. |
+| `07_channels_and_bounds` | `select_channel`, and `set_bounds` as the escape hatch for a frame whose range the file does not state. |
 
 ## What they are trying to teach
 

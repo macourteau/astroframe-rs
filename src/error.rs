@@ -97,6 +97,7 @@ impl Error {
     /// [`decline_reason()`](crate::Header::decline_reason), else decode — runs **one** "this
     /// position is skippable, and here is why" path over both surfaces rather than two
     /// parallel matches over enums carrying the identical four classes.
+    #[must_use]
     pub fn decline_class(&self) -> Option<DeclineClass> {
         match self {
             Error::Malformed(_) => Some(DeclineClass::Malformed),

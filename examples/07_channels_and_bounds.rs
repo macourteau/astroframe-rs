@@ -1,7 +1,7 @@
-//! `select_channel` and `with_bounds` — narrowing a decode, and supplying a range the file
+//! `select_channel` and `set_bounds` — narrowing a decode, and supplying a range the file
 //! does not have.
 //!
-//! **`with_bounds` is the escape hatch for `Bounds::Unavailable`.** A FITS float frame defines
+//! **`set_bounds` is the escape hatch for `Bounds::Unavailable`.** A FITS float frame defines
 //! no representable range, so normalized output is refused rather than invented (`01_header`
 //! prints this; `02_read_image` handles it). If you know what the range should be, say so and
 //! the frame normalizes. The crate will not guess it for you, because guessing is the silent
@@ -59,7 +59,7 @@ fn main() -> astroframe::Result<()> {
     // rescales a frame whose author already said what its range was.
     if matches!(header.bounds(), Bounds::Unavailable(_)) {
         println!("the file states no range; supplying the measured one");
-        reader.with_bounds(lo, hi)?;
+        reader.set_bounds(lo, hi)?;
     }
 
     // `select_channel` narrows the decode itself rather than slicing afterwards: with `Planar`

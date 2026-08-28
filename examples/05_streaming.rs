@@ -30,21 +30,20 @@ fn main() -> astroframe::Result<()> {
     match std::env::args().nth(1) {
         Some(path) => {
             let file = std::io::BufReader::new(std::fs::File::open(&path)?);
-            // A seekable source may decode the same image twice, which is what lets the
-            // cross-check below run at all.
-            run(Reader::seekable(file)?, true)
+            run(Reader::seekable(file)?)
         }
         None => {
             eprintln!("(no path given: reading a frame from stdin, forward-only)");
             let stdin = std::io::BufReader::new(std::io::stdin().lock());
-            run(Reader::sequential(stdin)?, false)
+            run(Reader::sequential(stdin)?)
         }
     }
 }
 
-/// `rereadable` says whether the source can decode one image a second time — true for a file,
-/// false for a pipe. Only the cross-check needs it.
-fn run<S: Source>(mut reader: Reader<S>, rereadable: bool) -> astroframe::Result<()> {
+/// Generic over the source, which is the bound a caller writes. Whether this one can decode an
+/// image a second time is the reader's own answer — `is_seekable()` — rather than something the
+/// caller has to thread down from wherever the reader was built.
+fn run<S: Source>(mut reader: Reader<S>) -> astroframe::Result<()> {
     while reader.next_image()? {
         let header = reader.current_header()?;
         if header.decline_reason().is_some() {
@@ -59,7 +58,7 @@ fn run<S: Source>(mut reader: Reader<S>, rereadable: bool) -> astroframe::Result
         }
 
         // The primitive, asked for **before** the cursor commits the reader to the pixel
-        // phase, and after any `select_channel`/`with_bounds` — it describes what this reader
+        // phase, and after any `select_channel`/`set_bounds` — it describes what this reader
         // will produce. A frame the file states no range for is refused here rather than
         // normalized against an invented one; see 07_channels_and_bounds for the escape hatch.
         let normalizer = match reader.normalizer() {
@@ -101,7 +100,9 @@ fn run<S: Source>(mut reader: Reader<S>, rereadable: bool) -> astroframe::Result
             assembled.len()
         );
 
-        if rereadable {
+        // Decoding this image a second time moves the cursor backwards, so the cross-check
+        // runs on a file and is skipped on a pipe. The reader answers that itself.
+        if reader.is_seekable() {
             // The claim, run rather than asserted: the same image decoded whole, compared by
             // `to_bits()`. `==` would accept a sign-of-zero difference, which is exactly the
             // difference a normalization defect produces.

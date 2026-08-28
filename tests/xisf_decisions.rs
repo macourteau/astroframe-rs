@@ -587,7 +587,9 @@ fn entity_references_are_resolved_before_a_value_is_reported() {
         &levels,
         "entity references",
     );
-    let keyword = header.get("OBJECT").expect("the fixture declares OBJECT");
+    let keyword = header
+        .keyword("OBJECT")
+        .expect("the fixture declares OBJECT");
     // The FITS quoting is unwrapped *after* unescaping: the doubled `&#39;&#39;` is one
     // escaped quote per XML and then one literal quote per FITS §4.2.1, and reading the two
     // rules in the other order yields `M & M` and drops everything after it.
@@ -641,7 +643,7 @@ fn a_namespace_prefixed_header_decodes() {
     );
     let header = decodes_to(unit, &levels, "namespace-prefixed header");
     // The child elements match by local name too, not just the root.
-    assert_eq!(header.get("EXPTIME").map(|k| k.value()), Some("120.0"));
+    assert_eq!(header.keyword("EXPTIME").map(|k| k.value()), Some("120.0"));
 }
 
 /// The other half of the same row: **a root element in some other namespace is `Malformed` at
@@ -1726,7 +1728,7 @@ fn a_keyword_inside_metadata_is_ignored_and_a_property_id_is_never_validated() {
         .build();
     let header = decodes_to(unit, &levels, "a keyword inside Metadata");
     assert!(header.keywords().is_empty(), "{:?}", header.keywords());
-    assert!(header.get("OBJECT").is_none());
+    assert!(header.keyword("OBJECT").is_none());
 
     // A space-bearing identifier has been reported in the wild, and validating ids against a
     // well-formed `Namespace:Path` grammar would reject the file that carries one.
@@ -1783,8 +1785,8 @@ fn every_reported_attribute_is_reachable_by_its_own_accessor() {
 
     // None of them is reachable through the two text surfaces, which is the whole reason the
     // accessors exist.
-    assert!(header.get("orientation").is_none());
-    assert!(header.get("imageType").is_none());
+    assert!(header.keyword("orientation").is_none());
+    assert!(header.keyword("imageType").is_none());
     assert!(header.properties().is_empty());
 
     // `imageType` and `orientation` are closed enumerations, but decoding does not depend on
@@ -1913,7 +1915,7 @@ fn property_values_survive_in_all_three_of_their_shapes() {
         .map(|k| k.comment().expect("XISF makes comment mandatory"))
         .collect();
     assert_eq!(history, vec!["first step", "second step", "third step"]);
-    assert_eq!(header.get("HISTORY").map(|k| k.value()), Some(""));
+    assert_eq!(header.keyword("HISTORY").map(|k| k.value()), Some(""));
 }
 
 // ------------------------------------------- *`granularity()` reports the right value*

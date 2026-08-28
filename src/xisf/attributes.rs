@@ -7,7 +7,7 @@
 //! faults are taken in belongs to the caller. Nothing here sees the document or the walk's memo.
 
 use crate::header::{Bounds, BoundsUnavailable, ColorSpace, DeclineReason, Geometry, PixelStorage};
-use crate::normalize::Range;
+use crate::normalize::SampleRange;
 use crate::samples::SampleFormat;
 use crate::xisf::block::{Checksum, parse_checksum};
 use crate::xisf::cache::{decline_from, malformed, unsupported};
@@ -220,7 +220,7 @@ pub(super) fn read_bounds(declared: Option<&str>, format: Option<SampleFormat>) 
             // The validity rule is stated on `k` rather than on the endpoints, and it applies
             // to integer images too. The checked range is what `Bounds` carries, so nothing
             // downstream re-derives it.
-            && let Some(range) = Range::new(lo, hi)
+            && let Some(range) = SampleRange::new(lo, hi)
         {
             return Bounds::Declared(range);
         }
@@ -228,7 +228,7 @@ pub(super) fn read_bounds(declared: Option<&str>, format: Option<SampleFormat>) 
     }
     match format {
         // §8.5.5's [0, 2ⁿ − 1] default, which §11.5.1 makes `bounds` optional against.
-        Some(f) if f.is_integer() => match Range::unsigned_default(f.bytes() * 8) {
+        Some(f) if f.is_integer() => match SampleRange::unsigned_default(f.bytes() * 8) {
             Some(range) => Bounds::FormatDefault(range),
             None => Bounds::Unavailable(BoundsUnavailable::NoFormatDefault),
         },
@@ -429,12 +429,12 @@ mod tests {
             Bounds::Unavailable(BoundsUnavailable::InvalidDeclared)
         );
 
-        let with_bounds = one(
+        let declared = one(
             r#"<xisf version="1.0"><Image geometry="4:4:1" sampleFormat="Float32"
                  bounds="0:1" location="attachment:1024:64"/></xisf>"#,
         );
         assert!(
-            matches!(with_bounds.header.bounds(), Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1.0)
+            matches!(declared.header.bounds(), Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1.0)
         );
     }
 

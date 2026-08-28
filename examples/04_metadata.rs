@@ -75,7 +75,7 @@ fn main() -> astroframe::Result<()> {
         // in file order — a name may repeat, and every occurrence stays reachable through
         // `keywords()`/`properties()`.
         for name in &wanted {
-            if let Some(keyword) = header.get(name) {
+            if let Some(keyword) = header.keyword(name) {
                 println!("{name} = {}", keyword.value());
             } else if let Some(property) = header.property(name) {
                 println!(

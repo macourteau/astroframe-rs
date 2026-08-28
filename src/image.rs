@@ -93,6 +93,7 @@ impl Image {
     /// Without it a caller wanting the header *and* the buffer has to clone the header before
     /// [`Image::into_samples`] drops it, which is a copy of the metadata collections for no
     /// reason — the `Image` is being consumed either way.
+    #[must_use = "into_parts consumes the image and hands back both halves"]
     pub fn into_parts(self) -> (Header, Vec<f32>) {
         (self.header, self.data)
     }

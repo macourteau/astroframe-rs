@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 use crate::header::PixelStorage;
-use crate::header::{DeclineReason, Geometry, Granularity, Header, ImageType, Orientation};
+use crate::header::{DeclineReason, Format, Geometry, Granularity, Header, ImageType, Orientation};
 use crate::limits::Limits;
 use crate::metadata::{
     Cfa, DisplayChannels, DisplayFunction, KeywordOrigin, KeywordSet, Property, PropertyScope,
@@ -70,12 +70,12 @@ pub(crate) struct Occurrence {
     /// How to reach the pixels; `None` at a declined position.
     pub(crate) plan: Option<BlockPlan>,
     /// The file's own `bounds` text, verbatim, whenever the image declared one at all —
-    /// usable or not. `with_bounds` reports it so an override never erases the evidence.
+    /// usable or not. `set_bounds` reports it so an override never erases the evidence.
     ///
     /// Shared, not owned: `bounds` is an attribute like any other, and one at the
     /// `Attribute value length` cap on an image reached by 256 references retained 276 MB from
     /// a one-megabyte header. `declared_bounds_text` allocates the caller's `String` once, at
-    /// the `with_bounds` call that asks for it.
+    /// the `set_bounds` call that asks for it.
     pub(crate) declared_bounds: Option<Arc<str>>,
 }
 
@@ -299,6 +299,7 @@ fn build_occurrence(
     let properties = PropertySet::new(shared_metadata.clone(), own, split);
 
     let header = Header {
+        format: Format::Xisf,
         geometry,
         sample_format,
         bounds,
@@ -784,9 +785,8 @@ fn read_resolution(doc: &Doc, node: usize) -> Ancillary<Resolution> {
                 // §11.11.2 defines two spellings and makes the attribute optional, its absence
                 // meaning pixels per inch. An unrecognized spelling is a different answer and
                 // is reported as one, verbatim, rather than folded into that default.
-                None | Some("inch") => ResolutionUnit::Inch,
-                Some("cm") => ResolutionUnit::Centimetre,
-                Some(other) => ResolutionUnit::Other(Arc::from(other)),
+                None => ResolutionUnit::Inch,
+                Some(text) => ResolutionUnit::classify(text),
             },
         },
         horizontal_fault.or(vertical_fault),
@@ -1306,7 +1306,7 @@ pub(super) mod tests {
                  <Image geometry="4:4:1" sampleFormat="UInt8" location="attachment:1024:16"/>
                </xisf>"#);
         assert!(o.header.keywords().is_empty());
-        assert!(o.header.get("STRAY").is_none());
+        assert!(o.header.keyword("STRAY").is_none());
     }
 
     // -------------------------------------------------------------- the other elements
@@ -1331,6 +1331,17 @@ pub(super) mod tests {
         let resolution = o.header.resolution().expect("XISF states a resolution");
         assert_eq!(resolution.horizontal(), 120.0);
         assert_eq!(resolution.unit(), &ResolutionUnit::Centimetre);
+        // A consumer re-emitting the attribute reads the spelling back, as it does for every
+        // other reported attribute; and `classify` is the same map this decoder ran.
+        assert_eq!(resolution.unit().as_str(), "cm");
+        assert_eq!(ResolutionUnit::classify("cm"), ResolutionUnit::Centimetre);
+        assert_eq!(ResolutionUnit::classify("inch"), ResolutionUnit::Inch);
+        assert_eq!(ResolutionUnit::classify("furlong").as_str(), "furlong");
+        assert_eq!(
+            o.header.pixel_storage().map(|s| s.as_str()),
+            Some("Planar"),
+            "the layout attribute reports its Table 13 spelling too"
+        );
 
         let df = o
             .header
