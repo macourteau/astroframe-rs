@@ -164,6 +164,33 @@ impl Keyword {
     }
 }
 
+/// Collapse runs of whitespace to single spaces and trim.
+///
+/// One `HIERARCH` name is spelled across both containers — a card body on the FITS side, a
+/// `name` or `value` attribute on the XISF side — and the collapsing rule that turns either
+/// spelling into a lookup key is the same rule. It lives here, below both, because the two
+/// halves of it that *are* format-specific stay in their own modules: the FITS side reaches
+/// this over `&[u8]` cards decoded lossily, the XISF side over `&str` attributes. There is no
+/// format-specific content left in the collapse itself, and two copies of it is two places for
+/// a name to start reading differently through the two containers.
+///
+/// Folded into the `String` rather than collected into a `Vec` and joined: the intermediate
+/// vector is a second allocation for a name whose length is already known to be short.
+// Both callers are format decoders, so with neither format compiled in this is dead — and
+// § Operations makes the empty feature set a supported build. `Keyword::new` above carries the
+// same gate for the same reason.
+#[cfg(any(feature = "fits", feature = "xisf"))]
+pub(crate) fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace()
+        .fold(String::new(), |mut out, word| {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+            out
+        })
+}
+
 #[cfg(test)]
 mod keyword_layout {
     use super::Keyword;

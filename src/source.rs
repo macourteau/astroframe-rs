@@ -190,6 +190,15 @@ impl<R: Read + Seek> Source for Seekable<R> {
     }
 
     fn seek_to(&mut self, pos: u64, _limits: &Limits) -> Result<()> {
+        // A seek to where the cursor already is is not free: `Seek for BufReader` discards its
+        // read-ahead on every seek, inside the buffer or not, so a no-op seek throws away a
+        // full buffer's worth of bytes already read. Every FITS decode does exactly one —
+        // `begin_pixels` seeks to `data_start`, which is where the header parse left the
+        // cursor. `self.pos` is maintained by every read and every seek, so this is exact
+        // rather than an approximation of where the file is.
+        if pos == self.pos {
+            return Ok(());
+        }
         // The cap bounds a read, not a seek: nothing is transferred here.
         self.inner.seek(SeekFrom::Start(pos))?;
         self.pos = pos;

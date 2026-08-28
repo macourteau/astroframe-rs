@@ -88,9 +88,21 @@ impl<S: Source> Chunks<'_, S> {
             None => Ok(None),
             Some(meta) => {
                 let samples = self.reader.scratch_slice(meta.len);
+                // `checked_add`, for the reason `output_bytes` is written checked: the
+                // total-samples gate already rules out a destination whose extent does not
+                // fit, so this cannot fail today — but § The caps makes checked arithmetic
+                // the rule for every size computation, and that gate's guarantee is an
+                // argument in another function rather than a fact local to this line.
+                let end = meta.start.checked_add(meta.len).ok_or_else(|| {
+                    Error::limit(format!(
+                        "chunk destination range: a chunk of {} samples at offset {} ends past \
+                         the arithmetic a destination index runs in",
+                        meta.len, meta.start
+                    ))
+                })?;
                 Ok(Some(Chunk {
                     channel: meta.channel,
-                    range: meta.start..meta.start + meta.len,
+                    range: meta.start..end,
                     samples,
                 }))
             }
@@ -640,6 +652,13 @@ impl<S: Source> Reader<S> {
         let header = self.current_header_for_pixels()?;
         let expected = self.destination_len(&header)?;
         self.check_output_bytes(output_bytes(expected, 4)?)?;
+        // Asked before the destination is allocated, and **after** `check_output_bytes` so that
+        // no error class reorders: a frame with no representable range — a FITS float frame is
+        // the common one — is refused by `read_image_into` below whatever this does, so
+        // allocating first buys a caller who declines every float frame a `width * height`
+        // buffer per frame it declines. `read_image_into` builds its own; a `Normalizer` is a
+        // range and a reciprocal.
+        self.normalizer(&header)?;
         let mut data = vec![0.0f32; expected];
         self.read_image_into(&mut data)?;
         let header = self.header().expect("header exists in the pixel phase");
