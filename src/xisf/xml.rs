@@ -13,7 +13,6 @@
 //! `trim_text(true)` would silently corrupt every string property. Text is therefore
 //! preserved here and stripped at the two decode sites instead.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -131,8 +130,11 @@ impl Doc {
     pub(crate) fn resolve(&self, node: usize) -> Option<usize> {
         let uid = self.attr(node, "ref")?;
         let target = *self.uids.get(uid)?;
-        // A Reference resolving to another Reference is not expressible, but a hostile file
-        // can still spell `uid` on one; refuse the hop rather than following it.
+        // Belt and braces rather than a reachable hostile case: `collect_uids` indexes a node
+        // only when its name is in `REFERENCEABLE`, and `Reference` is not in that list, so no
+        // hop can land on one however a file spells its `uid`. The invariant that makes this
+        // unreachable lives in another function, and this sits on the resolution path of a
+        // parser reading hostile input, so the check stays where the assumption is used.
         if self.name(target) == "Reference" {
             return None;
         }
@@ -197,10 +199,9 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
         .min(limits.xml_elements as usize);
     let mut nodes: Vec<Node> = Vec::with_capacity(expected);
     let mut stack: Vec<usize> = Vec::new();
-    // The prefix→URI bindings each open element on `stack` declared on its own start tag,
-    // index-aligned with `stack`. Resolving a prefix walks this from the top down, which is
-    // exactly namespace scoping: an inner redeclaration shadows an outer one.
-    let mut scopes: Vec<Bindings> = Vec::new();
+    // The prefix→URI bindings every open element on `stack` declared, as one document-level
+    // stack: pushed on a start tag and unwound on the matching end tag.
+    let mut namespaces = Namespaces::new();
     let mut root: Option<usize> = None;
     let mut buf = Vec::new();
     let mut elements: u64 = 0;
@@ -237,38 +238,28 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
 
                 let qname = start.name();
                 let qname = qname.as_ref();
-                let own_bindings = declared_bindings(&start, limits);
                 // Bindings declared on this very start tag apply to the tag itself (XML
-                // Namespaces §5.3), so `own_bindings` is searched before `scopes`, and
-                // `scopes` is empty at the root — there is nothing above it to inherit from.
-                let prefix = qname_prefix(qname);
-                let resolved = resolve_prefix(prefix.as_deref(), &own_bindings, &scopes);
+                // Namespaces §5.3), so the element's own scope is opened before its name is
+                // resolved.
+                namespaces.open(&start, limits);
+                let prefix = qname_prefix(qname)?;
+                let resolved = namespaces.resolve(prefix);
                 if stack.is_empty() {
-                    check_root_namespace(prefix.as_deref(), resolved)?;
+                    check_root_namespace(prefix, resolved)?;
                 }
-                let local = local_name(qname);
-                let name = if in_xisf_or_no_namespace(prefix.as_deref(), resolved) {
-                    intern(&mut arena, &[&local])?
+                let local = local_name(qname)?;
+                let name = if in_xisf_or_no_namespace(prefix, resolved) {
+                    intern(&mut arena, &[local])?
                 } else {
                     // An undeclared prefix has no URI to key on, so its own text stands in:
                     // `{ev:}Image` is as distinct from `Image` as `{uri}Image` is, and `{` is
                     // not a legal XML name character, so neither can collide with a core name.
                     match resolved {
-                        Some(uri) => intern(&mut arena, &["{", uri, "}", &local])?,
-                        None => intern(
-                            &mut arena,
-                            &["{", prefix.as_deref().unwrap_or(""), ":}", &local],
-                        )?,
+                        Some(uri) => intern(&mut arena, &["{", uri, "}", local])?,
+                        None => intern(&mut arena, &["{", prefix.unwrap_or(""), ":}", local])?,
                     }
                 };
-                let attrs = read_attributes(
-                    &start,
-                    limits,
-                    &own_bindings,
-                    &scopes,
-                    &mut seen,
-                    &mut arena,
-                )?;
+                let attrs = read_attributes(&start, limits, &namespaces, &mut seen, &mut arena)?;
                 let index = nodes.len();
                 nodes.push(Node {
                     name,
@@ -282,11 +273,10 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                     root = Some(index);
                 }
                 stack.push(index);
-                scopes.push(own_bindings);
             }
             Event::End(_) => {
                 let closed = stack.pop();
-                scopes.pop();
+                namespaces.close();
                 if closed == root {
                     break;
                 }
@@ -303,10 +293,16 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                 }
             }
             Event::CData(data) => {
-                let raw = String::from_utf8(data.to_vec())
-                    .map_err(|_| Error::malformed("XISF header CDATA is not valid UTF-8"))?;
+                // XML 1.0 §2.11 normalizes the two-character sequence `\r\n` and a lone `\r`
+                // to a single `\n` *before* parsing, so the rule reaches inside a CDATA
+                // section as well: a `String` property carrying `a\r\nb` reads back as `a\nb`
+                // whichever of the two spellings its writer chose. Decoding it the same way
+                // the `Text` arm does is also what keeps the common section allocation-free.
+                let decoded = data.xml_content(XmlVersion::Explicit1_0).map_err(|e| {
+                    Error::malformed(format!("XISF header CDATA is not valid UTF-8: {e}"))
+                })?;
                 if let Some(&top) = stack.last() {
-                    nodes[top].text.push_str(&raw);
+                    nodes[top].text.push_str(&decoded);
                 }
             }
             Event::GeneralRef(entity) => {
@@ -338,7 +334,22 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                     }
                 }
             }
-            Event::Eof => break,
+            Event::Eof => {
+                // `quick-xml` reports end of input rather than an error when the document
+                // ends with elements still open, so a header cut off mid-document would
+                // otherwise build a `Doc` and decode pixels as though the file were whole.
+                // § Errors places an unparseable XML header at `Malformed`, at construction.
+                // The legitimate two-root case leaves through the `closed == root` break
+                // above, with an empty stack: what §9.5 places after `</xisf>` is a sibling
+                // of the root, not a root that never closed.
+                if let Some(&open) = stack.last() {
+                    return Err(Error::malformed(format!(
+                        "XISF header ends while the element {:?} is still open",
+                        &arena[nodes[open].name.range()]
+                    )));
+                }
+                break;
+            }
             _ => {}
         }
         buf.clear();
@@ -363,6 +374,10 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
 }
 
 /// Index the `uid`-bearing referenceable elements, first occurrence winning.
+///
+/// **A node is indexed only when its name is in [`REFERENCEABLE`]**, and that is the invariant
+/// [`Doc::resolve`]'s refusal of a `Reference` target rests on: `"Reference"` is not in that
+/// list, so no lookup can ever land on one. A name added there is what would change that.
 fn collect_uids(arena: &str, nodes: &[Node]) -> HashMap<String, usize> {
     let mut uids = HashMap::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -406,87 +421,176 @@ fn arena_index(len: usize) -> Result<u32> {
 ///
 /// Used for both halves of the namespace rule: unconditionally for the root (its namespace
 /// is checked separately, by `check_root_namespace`, and a mismatch there aborts the parse
-/// before any other element is reached) and for every other element once `resolve_prefix` has
-/// decided the element resolves into the XISF namespace or into none.
-fn local_name(qname: &[u8]) -> Cow<'_, str> {
+/// before any other element is reached) and for every other element once
+/// [`Namespaces::resolve`] has decided the element resolves into the XISF namespace or into
+/// none.
+fn local_name(qname: &[u8]) -> Result<&str> {
     let local = match qname.iter().rposition(|b| *b == b':') {
         Some(i) => &qname[i + 1..],
         None => qname,
     };
-    String::from_utf8_lossy(local)
+    xml_name(local)
 }
 
 /// A QName's prefix, if it has one — the piece before the last `:`.
-fn qname_prefix(qname: &[u8]) -> Option<Cow<'_, str>> {
-    qname
-        .iter()
-        .rposition(|b| *b == b':')
-        .map(|i| String::from_utf8_lossy(&qname[..i]))
+fn qname_prefix(qname: &[u8]) -> Result<Option<&str>> {
+    match qname.iter().rposition(|b| *b == b':') {
+        Some(i) => xml_name(&qname[..i]).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// One element's `xmlns`/`xmlns:*` bindings, prefix (`None` for the default) to URI.
-type Bindings = Vec<(Option<String>, String)>;
-
-/// The bindings one element's start tag declares.
+/// One name's bytes as text.
 ///
-/// Bounded to the same `attributes_per_element` cap `read_attributes` enforces, and for the
-/// same reason: `start.attributes()` reads lazily from the raw bytes, so an unbounded scan
-/// here would let an attacker's element with an enormous attribute count be walked in full
-/// before `read_attributes` ever gets to reject it. A malformed attribute is skipped rather
-/// than surfaced — `read_attributes` walks the same tag right after and raises the real error.
-fn declared_bindings(start: &quick_xml::events::BytesStart<'_>, limits: &Limits) -> Bindings {
-    let mut out = Bindings::new();
-    for (seen, attr) in start.attributes().enumerate() {
-        if seen as u64 >= u64::from(limits.attributes_per_element) {
-            break;
-        }
-        let Ok(attr) = attr else { continue };
-        let key = attr.key.as_ref();
-        // The prefix is decided before the URI is owned, so an attribute that is not a
-        // declaration leaves this loop without allocating. Owning the value first cost one
-        // heap allocation per attribute in the document, on a path most attributes leave
-        // immediately.
-        let declared = if key == b"xmlns" {
-            Some(None)
-        } else {
-            key.strip_prefix(b"xmlns:".as_slice())
-                .map(|pfx| Some(String::from_utf8_lossy(pfx).into_owned()))
-        };
-        if let Some(prefix) = declared {
-            let uri = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
-            out.push((prefix, uri));
+/// §9.5 fixes the header encoding as UTF-8 and § XISF decisions makes invalid UTF-8
+/// `Malformed`, which the text, CDATA and attribute-*value* paths all honour. A lossy
+/// conversion here honours it nowhere and reports the *wrong reason* besides: U+FFFD
+/// substituted into `geo\xFFmetry` yields an attribute nothing matches, and the file is then
+/// declined for a `geometry` §11.5.1 makes mandatory on a file that carries one.
+fn xml_name(raw: &[u8]) -> Result<&str> {
+    str::from_utf8(raw).map_err(|_| {
+        Error::malformed("XISF header carries an element or attribute name that is not valid UTF-8")
+    })
+}
+
+/// Every prefix→URI binding in scope, as one stack over the whole document.
+///
+/// Resolution is a hash lookup rather than a walk of each open element's declarations. A walk
+/// is quadratic in the in-scope binding count, and the caps let that count reach `xml_depth`
+/// × `attributes_per_element` — 262 144 bindings, every one of which a prefixed name scans
+/// whenever its prefix is bound at the root or nowhere at all. Measured through the public API
+/// on a release build, a 2.3 MB header of that shape cost 3.9 seconds of CPU and 2× the bytes
+/// cost 3.8× the time. It is the shape the duplicate-attribute check in `read_attributes`
+/// meets too, on the same header-only path a consumer runs over untrusted bytes: bounded by
+/// the caps, so not a hang, just far more work than the input justifies.
+///
+/// Scoping is kept exactly: each binding records the one it shadowed, so closing an element
+/// restores what its declarations covered, and an inner redeclaration shadows an outer one
+/// for as long as it is open.
+struct Namespaces {
+    /// Every binding of every open element, in declaration order.
+    bindings: Vec<Binding>,
+    /// The innermost binding in scope for each declared prefix.
+    prefixed: HashMap<Box<str>, usize>,
+    /// The innermost binding in scope for the default namespace, which has no prefix to key on.
+    default: Option<usize>,
+    /// `bindings.len()` as each open element's start tag was met, so its declarations are
+    /// unwound when it closes.
+    marks: Vec<usize>,
+}
+
+/// One `xmlns`/`xmlns:*` declaration.
+struct Binding {
+    /// `None` for the default namespace.
+    prefix: Option<Box<str>>,
+    uri: String,
+    /// The binding this one shadowed, restored when this one goes out of scope.
+    shadowed: Option<usize>,
+}
+
+impl Namespaces {
+    fn new() -> Self {
+        Namespaces {
+            bindings: Vec::new(),
+            prefixed: HashMap::new(),
+            default: None,
+            marks: Vec::new(),
         }
     }
-    out
-}
 
-/// Resolve a prefix (`None` for the default namespace) to the URI it is bound to at one point
-/// in the walk: `own` — the bindings the current element's own start tag declares, which apply
-/// to the tag itself (XML Namespaces §5.3) — take precedence, then `scopes` is searched
-/// innermost-ancestor-first. `None` means no binding is in scope at all, which is the "no
-/// namespace" case for an unprefixed name and — for a prefixed name whose prefix was never
-/// declared — is treated the same as a foreign namespace by every caller below, i.e. as not
-/// XISF's.
-fn resolve_prefix<'a>(
-    prefix: Option<&str>,
-    own: &'a Bindings,
-    scopes: &'a [Bindings],
-) -> Option<&'a str> {
-    let search = |scope: &'a Bindings| {
-        scope
-            .iter()
-            .rev()
-            .find(|(p, _)| p.as_deref() == prefix)
-            .map(|(_, uri)| uri.as_str())
-    };
-    search(own)
-        .or_else(|| scopes.iter().rev().find_map(search))
+    /// Open one element's scope and record the bindings its start tag declares.
+    ///
+    /// Bounded to the same `attributes_per_element` cap `read_attributes` enforces, and for
+    /// the same reason: `start.attributes()` reads lazily from the raw bytes, so an unbounded
+    /// scan here would let an attacker's element with an enormous attribute count be walked in
+    /// full before `read_attributes` ever gets to reject it. A malformed attribute is skipped
+    /// rather than surfaced — `read_attributes` walks the same tag right after and raises the
+    /// real error. That is also why a prefix is converted lossily here where a name elsewhere
+    /// is checked: a declaration whose prefix or URI is not valid UTF-8 is refused on that
+    /// same tag a moment later, so no binding built from a U+FFFD is ever resolved through.
+    fn open(&mut self, start: &quick_xml::events::BytesStart<'_>, limits: &Limits) {
+        self.marks.push(self.bindings.len());
+        for (seen, attr) in start.attributes().enumerate() {
+            if seen as u64 >= u64::from(limits.attributes_per_element) {
+                break;
+            }
+            let Ok(attr) = attr else { continue };
+            let key = attr.key.as_ref();
+            // The prefix is decided before the URI is owned, so an attribute that is not a
+            // declaration leaves this loop without allocating. Owning the value first cost one
+            // heap allocation per attribute in the document, on a path most attributes leave
+            // immediately.
+            let prefix: Option<Box<str>> = if key == b"xmlns" {
+                None
+            } else {
+                match key.strip_prefix(b"xmlns:".as_slice()) {
+                    // XML Namespaces §3 reserves `xmlns` and binds it to no namespace name at
+                    // all, so `xmlns:xmlns="…"` declares nothing and the document carrying it
+                    // is namespace-ill-formed. Recording it would bind a prefix that a name
+                    // beginning `xmlns:` could then resolve *through*, which is the one way an
+                    // `xmlns:` name has a namespace to be in.
+                    Some(b"xmlns") => continue,
+                    Some(pfx) => Some(Box::from(String::from_utf8_lossy(pfx).as_ref())),
+                    None => continue,
+                }
+            };
+            let uri = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+            let index = self.bindings.len();
+            let shadowed = match &prefix {
+                Some(prefix) => self.prefixed.insert(prefix.clone(), index),
+                None => self.default.replace(index),
+            };
+            self.bindings.push(Binding {
+                prefix,
+                uri,
+                shadowed,
+            });
+        }
+    }
+
+    /// Close the innermost open element's scope, restoring whatever its declarations shadowed.
+    fn close(&mut self) {
+        let mark = self.marks.pop().unwrap_or(0);
+        // Popped rather than drained: `drain` is defined to panic on a range past the end,
+        // and a parser reading hostile input may not. Popping is also what unwinds the
+        // bindings in the reverse of the order they were declared, which is what makes the
+        // shadowed chain exact.
+        while self.bindings.len() > mark {
+            let Some(binding) = self.bindings.pop() else {
+                break;
+            };
+            match (binding.prefix, binding.shadowed) {
+                (Some(prefix), Some(shadowed)) => {
+                    self.prefixed.insert(prefix, shadowed);
+                }
+                (Some(prefix), None) => {
+                    self.prefixed.remove(&prefix);
+                }
+                (None, shadowed) => self.default = shadowed,
+            }
+        }
+    }
+
+    /// Resolve a prefix (`None` for the default namespace) to the URI it is bound to at this
+    /// point in the walk.
+    ///
+    /// `None` means no binding is in scope at all, which is the "no namespace" case for an
+    /// unprefixed name and — for a prefixed name whose prefix was never declared — is treated
+    /// the same as a foreign namespace by every caller below, i.e. as not XISF's.
+    fn resolve(&self, prefix: Option<&str>) -> Option<&str> {
+        let index = match prefix {
+            Some(prefix) => *self.prefixed.get(prefix)?,
+            None => self.default?,
+        };
+        let uri = self.bindings[index].uri.as_str();
         // `xmlns=""` *undeclares* the default namespace (XML Namespaces §6.2) rather than
         // binding it to the empty URI, so the answer is "no namespace" — the unprefixed and
         // unbound case §9.5's "should" tolerates, not a foreign one. Read literally, the empty
         // string is a URI that is not XISF's, and an `<Image xmlns="">` would have been
-        // silently skipped and a root carrying it refused.
-        .filter(|uri| !uri.is_empty())
+        // silently skipped and a root carrying it refused. The declaration still *shadows* an
+        // outer one for as long as it is in scope, which is what makes it an undeclaration.
+        (!uri.is_empty()).then_some(uri)
+    }
 }
 
 /// Namespace URIs are compared as XML Namespaces §2.3 compares them: exact, character for
@@ -547,8 +651,7 @@ fn check_root_namespace(prefix: Option<&str>, resolved: Option<&str>) -> Result<
 fn read_attributes(
     start: &quick_xml::events::BytesStart<'_>,
     limits: &Limits,
-    own_bindings: &Bindings,
-    scopes: &[Bindings],
+    namespaces: &Namespaces,
     // `seen` is cleared per element and reused across the document: a set allocated per start
     // tag cost more than the quadratic scan it replaced, on a header of many narrow elements.
     seen: &mut std::collections::HashSet<u64>,
@@ -582,13 +685,23 @@ fn read_attributes(
         // otherwise, so two attributes with the same local name under two distinct (or
         // undeclared) prefixes stay the distinct attributes they are rather than colliding
         // into one.
+        //
+        // A namespace declaration is the exception, and it is checked first: XML Namespaces §3
+        // reserves `xmlns`, binds it to no namespace name, and forbids declaring it, so
+        // `xmlns` and every `xmlns:`-prefixed name is stored exactly as written. Resolving one
+        // is not merely futile, it is the only way an in-scope binding could rewrite the name
+        // of the attribute that declares a namespace.
         let raw_key = attr.key.as_ref();
-        let key = match qname_prefix(raw_key) {
-            Some(prefix) => match resolve_prefix(Some(&prefix), own_bindings, scopes) {
-                Some(uri) if same_namespace(uri, XISF_NAMESPACE) => local_name(raw_key),
-                _ => String::from_utf8_lossy(raw_key),
-            },
-            None => String::from_utf8_lossy(raw_key),
+        let key = if raw_key == b"xmlns" || raw_key.starts_with(b"xmlns:") {
+            xml_name(raw_key)?
+        } else {
+            match qname_prefix(raw_key)? {
+                Some(prefix) => match namespaces.resolve(Some(prefix)) {
+                    Some(uri) if same_namespace(uri, XISF_NAMESPACE) => local_name(raw_key)?,
+                    _ => xml_name(raw_key)?,
+                },
+                None => xml_name(raw_key)?,
+            }
         };
         // Hashed before interning, so the duplicate check below is a set lookup rather than a
         // scan of every key accepted so far. That scan was quadratic in the attribute count,
@@ -604,9 +717,9 @@ fn read_attributes(
         // only against an accidental one.
         let key_hash = {
             use std::hash::BuildHasher as _;
-            seen.hasher().hash_one(key.as_ref())
+            seen.hasher().hash_one(key)
         };
-        let key = intern(arena, &[&key])?;
+        let key = intern(arena, &[key])?;
         // "Verbatim" means after unescaping: a consumer comparing a keyword value against a
         // string should not have to know how the writer chose to escape it. `quick_xml` does
         // not unescape automatically, so this is a decision rather than a default. The

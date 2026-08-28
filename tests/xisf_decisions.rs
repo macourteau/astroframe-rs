@@ -194,6 +194,31 @@ fn a_signed_unit_decodes_although_its_header_carries_two_roots() {
     assert!(header.properties().is_empty());
 }
 
+/// The limit of that tolerance, and the other half of the same row: a root element that never
+/// closes is `Malformed` at construction.
+///
+/// The two shapes are not the same shape. What §9.5 places after `</xisf>` is a *sibling* of
+/// the root, so the walk leaves through the root's own end tag with nothing open — while a
+/// header cut off mid-document leaves elements open, which `quick-xml` reports as end of input
+/// rather than as an error. Accepting it would construct a `Reader` over a header the file
+/// does not carry and decode pixels as though the unit were whole; § Errors places an
+/// unparseable XML header at `Malformed`, at construction.
+#[test]
+fn a_root_element_that_never_closes_is_malformed_at_construction() {
+    let stored = le_u16(&samples());
+    // The whole tail of the document is gone: no `</Data>`, no `</Image>`, no `</xisf>`.
+    let truncated = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><xisf{ROOT}><Image geometry="4:3:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">{}"#,
+        base64(&stored)
+    );
+    let err = seekable(with_header(&truncated, &[])).expect_err("a header that never closes");
+    assert_eq!(kind(&err), "Malformed", "{err}");
+    assert!(
+        err.to_string().contains("Data"),
+        "the reason names the element left open: {err}"
+    );
+}
+
 /// Row *Header encoding is UTF-8 … A missing XML declaration is tolerated*, and row
 /// *`Metadata`'s absence is tolerated*.
 #[test]
@@ -514,6 +539,37 @@ fn character_data_is_assembled_across_cdata_and_entity_boundaries() {
     );
 }
 
+/// The same row, on the one rule that applies *before* the assembly: XML 1.0 §2.11 normalizes
+/// `\r\n` and a lone `\r` to a single `\n` before parsing, so a `String` property carrying a
+/// CRLF reads back the same whether its writer spelled it as a text node or wrapped it in
+/// CDATA. §2.11 is a rule about the document's characters rather than about markup, so a
+/// CDATA section is not an exception to it — and a `String` property containing `<` is exactly
+/// why a writer reaches for CDATA in the first place, which is what makes the two spellings
+/// meet on the same value.
+#[test]
+fn a_crlf_reads_the_same_from_cdata_as_from_a_text_node() {
+    let levels = samples();
+    let stored = le_u16(&levels);
+    let unit = xml_unit(&format!(
+        "<Image geometry=\"4:3:1\" sampleFormat=\"UInt16\" location=\"embedded\">\
+         <Property id=\"Processing:Description\" type=\"String\"><![CDATA[a\r\nb\rc]]></Property>\
+         <Property id=\"Processing:Tool\" type=\"String\">a\r\nb\rc</Property>\
+         <Data encoding=\"base64\">{}</Data></Image>",
+        base64(&stored)
+    ));
+    let header = decodes_to(unit, &levels, "a CRLF in CDATA");
+    assert_eq!(
+        text_of(property(&header, "Processing:Description")),
+        "a\nb\nc",
+        "§2.11 normalizes end-of-line inside a CDATA section too"
+    );
+    assert_eq!(
+        text_of(property(&header, "Processing:Tool")),
+        text_of(property(&header, "Processing:Description")),
+        "the two spellings of one value read alike"
+    );
+}
+
 /// Row *XML entity references are resolved; "verbatim" means after unescaping*.
 ///
 /// A consumer comparing a keyword value against a string should not have to know how the
@@ -745,6 +801,47 @@ fn a_prefixed_attribute_bound_to_the_xisf_namespace_decodes() {
         unit,
         &levels,
         "a pi:geometry attribute with pi bound to the XISF namespace",
+    );
+}
+
+/// The reserved half of the same rule: **`xmlns` is not a prefix a document may bind**, so an
+/// `xmlns:`-prefixed name never resolves into the XISF namespace however the file spells it.
+///
+/// XML Namespaces §3 reserves `xmlns`, binds it to no namespace name, and forbids declaring
+/// it. A document that declares `xmlns:xmlns="http://www.pixinsight.com/xisf"` anyway is
+/// namespace-ill-formed, and honouring it would make the prefix-stripping rule above rewrite
+/// the very names that declare namespaces: `xmlns:geometry` would be read as the `geometry`
+/// §11.5.1 makes mandatory, and `<xmlns:Image>` as an `Image`. Both halves are refused here,
+/// which is the collector and the resolver agreeing — the declaration is not recorded, and a
+/// name beginning `xmlns:` is not resolved.
+#[test]
+fn the_reserved_xmlns_prefix_binds_nothing_however_a_document_declares_it() {
+    let stored = le_u16(&samples());
+    // The attribute half: `xmlns:geometry` is the name of a namespace declaration, whatever it
+    // is bound to, so the image carries no geometry at all and declines for the one it lacks.
+    let unit = xml_unit(&format!(
+        r#"<Image xmlns:xmlns="http://www.pixinsight.com/xisf" xmlns:geometry="4:3:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">{}</Data></Image>"#,
+        base64(&stored)
+    ));
+    let (class, reason) = declined(unit);
+    assert_eq!(class, DeclineClass::Malformed, "{reason}");
+    assert!(
+        reason.contains("geometry"),
+        "the reason names the mandatory attribute the file does not carry: {reason}"
+    );
+
+    // The element half, which the collector rather than the resolver settles: an element whose
+    // prefix is `xmlns` is bound to nothing, so it is not matched by local name and the walk
+    // finds no image.
+    let unit = xml_unit(&format!(
+        r#"<xmlns:Image xmlns:xmlns="http://www.pixinsight.com/xisf" geometry="4:3:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">{}</Data></xmlns:Image>"#,
+        base64(&stored)
+    ));
+    let mut reader = seekable(unit).expect("the unit constructs");
+    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        !reader.next_image().expect("end of source is not an error"),
+        "an element prefixed with the reserved xmlns is not an XISF Image"
     );
 }
 
@@ -2164,6 +2261,31 @@ fn invalid_utf8_in_the_header_region_is_malformed_at_construction() {
     broken[marker + 2] = 0xff;
     let err = seekable(broken).expect_err("a lone 0xff in the header");
     assert_eq!(kind(&err), "Malformed", "{err}");
+}
+
+/// The same row, on the surface where a lossy conversion is not merely wrong but reports the
+/// **wrong reason**: an element or attribute *name*.
+///
+/// Substituting U+FFFD for a bad byte in `geometry` yields an attribute nothing matches, and
+/// the file is then declined at its image position for a `geometry` §11.5.1 makes mandatory —
+/// on a file that plainly carries one. The row says invalid UTF-8 is `Malformed`, and where it
+/// surfaces is the unit rather than the position: the header did not parse.
+#[test]
+fn an_attribute_name_that_is_not_valid_utf8_names_the_encoding_rather_than_the_attribute() {
+    let stored = le_u16(&samples());
+    let good = located_u16(|p, s| format!("attachment:{p}:{s}"), &stored);
+    let marker = good
+        .windows(8)
+        .position(|w| w == b"geometry")
+        .expect("the fixture names its geometry");
+    let mut broken = good;
+    broken[marker + 3] = 0xff;
+    let err = seekable(broken).expect_err("a lone 0xff in an attribute name");
+    assert_eq!(kind(&err), "Malformed", "{err}");
+    assert!(
+        err.to_string().contains("not valid UTF-8"),
+        "the reason names the encoding, not a missing attribute: {err}"
+    );
 }
 
 /// The other half of the same row: **a declared non-UTF-8 encoding is `Unsupported`**.
