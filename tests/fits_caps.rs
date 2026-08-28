@@ -5,8 +5,6 @@
 //! floor rather than a backstop. The two places the source mode is itself the thing under
 //! test say so at the test.
 
-// `tests/common/mod.rs` is shared, and its lints belong to that file's owner rather than to
-// this suite, so they are silenced at the import instead of edited there.
 mod common;
 
 use std::io::Cursor;
