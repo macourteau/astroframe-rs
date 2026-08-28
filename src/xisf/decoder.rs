@@ -800,8 +800,9 @@ fn decode_row(
         }};
     }
 
-    // Cloning the scratch out and back keeps the borrow checker happy without cloning the
-    // buffer: `std::mem::take` leaves an empty Vec behind for the duration.
+    // Moved out and back rather than borrowed in place: `std::mem::replace` leaves an empty
+    // `Vec` behind for the duration, so the fill below writes into the scratch buffer the
+    // caller already has and no second row is ever allocated.
     let mut scratch = std::mem::replace(&mut p.scratch, Samples::U8(Vec::new()));
     match &mut scratch {
         Samples::U8(v) => match unshuffle {
