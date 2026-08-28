@@ -11,9 +11,12 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{Error, Limits, Reader, Sequential};
+use astroframe::{Limits, Reader, Sequential};
 
-use common::{Hdu, file};
+use common::{
+    Hdu, STORED_2X2, assert_same_bits, empty_primary, file, kind, table_extension, unsigned_2x2,
+    unsigned_2x2_expected, unsigned_2x2_extension, unsigned_2x2x3,
+};
 
 // ------------------------------------------------------------------ helpers
 
@@ -23,59 +26,7 @@ fn sequential(bytes: Vec<u8>, limits: Limits) -> astroframe::Result<SeqReader> {
     Reader::sequential_with_limits(Cursor::new(bytes), limits)
 }
 
-/// The error's variant name, so an assertion names the variant rather than matching a message
-/// the crate is free to reword.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
-
-/// Compare buffers by `to_bits()`. `==` silently accepts a sign-of-zero difference.
-fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: destination length");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
-}
-
-/// The pinned normalization form, longhand, so no expectation comes from the code under test.
-fn expected_sample(raw: i16, bzero: f64, lo: f64, hi: f64) -> f32 {
-    let physical: f64 = raw as f64 + bzero;
-    let shifted: f32 = (physical - lo) as f32;
-    shifted * (1.0f32 / ((hi - lo) as f32))
-}
-
 // ------------------------------------------------------------------ fixtures
-
-const STORED_2X2: [i16; 4] = [-32768, -32767, 0, 32767];
-
-/// A decodable 2x2 frame under the FITS unsigned convention: 16 destination bytes.
-fn unsigned_2x2() -> Hdu {
-    Hdu::primary()
-        .image_2d(16, 2, 2)
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2)
-}
-
-fn unsigned_2x2_expected() -> Vec<f32> {
-    STORED_2X2
-        .iter()
-        .map(|&raw| expected_sample(raw, 32768.0, 0.0, 65535.0))
-        .collect()
-}
 
 /// A decodable 4x4 frame: 16 samples, one 8-byte row.
 fn unsigned_4x4() -> Hdu {
@@ -84,42 +35,6 @@ fn unsigned_4x4() -> Hdu {
         .image_2d(16, 4, 4)
         .unsigned_convention(16)
         .data_i16(&stored)
-}
-
-/// A three-channel 2x2 cube: 12 samples in the file, 4 in a narrowed destination.
-const STORED_2X2X3: [i16; 12] = [
-    -32768, -32767, -32766, -32765, 0, 1, 2, 3, 32764, 32765, 32766, 32767,
-];
-
-fn unsigned_2x2x3() -> Hdu {
-    Hdu::primary()
-        .image_3d(16, 2, 2, 3)
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2X3)
-}
-
-fn empty_primary() -> Hdu {
-    Hdu::primary().card("BITPIX", "8").card("NAXIS", "0")
-}
-
-fn table_extension() -> Hdu {
-    Hdu::extension("TABLE")
-        .card("BITPIX", "8")
-        .card("NAXIS", "2")
-        .card("NAXIS1", "4")
-        .card("NAXIS2", "2")
-        .card("PCOUNT", "0")
-        .card("GCOUNT", "1")
-        .data(vec![b'.'; 8])
-}
-
-fn unsigned_2x2_extension() -> Hdu {
-    Hdu::extension("IMAGE")
-        .image_2d(16, 2, 2)
-        .card("PCOUNT", "0")
-        .card("GCOUNT", "1")
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2)
 }
 
 /// A primary whose header runs to three 2880-byte blocks: 7 structural cards, `extra`
@@ -170,11 +85,15 @@ fn fits_header_cards_cap_trips() {
     assert!(format!("{err}").contains("more than 8 cards"), "{err}");
 }
 
-/// Criterion *Every cap has a test that trips it* — `hdus_per_advance`.
+/// Criterion *Every cap has a test that trips it* — `hdus_per_advance`, and with it the
+/// decline table's row *HDU-traversal cap tripped while advancing*.
 ///
 /// The skip loop inside one `next_image()` is bounded individually by the header and
 /// skipped-block caps but unbounded in *number*; over a pipe there is no file length to
 /// terminate it, and a hang is what invariant I5 names alongside panics.
+///
+/// The row's three facts are graded here too — `LimitExceeded`, from `next_image()`, with no
+/// `Header` — since they are the same trip over the same fixture.
 #[test]
 fn hdus_per_advance_cap_trips() {
     let bytes = file(&[
@@ -190,6 +109,7 @@ fn hdus_per_advance_cap_trips() {
     let err = reader.next_image().expect_err("the traversal cap");
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert!(format!("{err}").contains("HDUs traversed"), "{err}");
+    assert!(reader.header().is_none(), "no Header for a failed advance");
 
     // Raised past the four positions the walk steps over, the same file reaches its image.
     let mut limits = Limits::default();

@@ -20,10 +20,12 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{
-    Bounds, DeclineClass, Error, Header, Limits, Reader, Seekable, Sequential, Source,
+use astroframe::{DeclineClass, Error, Header, Limits, Reader, Seekable, Sequential, Source};
+use common::xisf::{
+    Unit, base64, checksum_attr, expected_u16, le_u16, raw_unit, repeating_u16, samples,
+    with_header,
 };
-use common::xisf::{Unit, base64, checksum_attr, le_u16, raw_unit, repeating_u16};
+use common::{assert_same_bits, kind};
 
 // ------------------------------------------------------------------ helpers
 
@@ -35,20 +37,6 @@ fn seekable(bytes: Vec<u8>) -> astroframe::Result<SeekReader> {
 
 fn sequential(bytes: Vec<u8>) -> astroframe::Result<Reader<Sequential<Cursor<Vec<u8>>>>> {
     Reader::sequential(Cursor::new(bytes))
-}
-
-/// The error's variant name. Assertions name the variant rather than matching on a message,
-/// which is text the crate is free to reword.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
 }
 
 /// Both pixel entry points at a declined position, since the table says *any* pixel call is
@@ -108,35 +96,6 @@ fn declined(what: &str, bytes: Vec<u8>) -> (Header, DeclineClass) {
     (header, decline.class())
 }
 
-/// Compare buffers by `to_bits()`. `==` silently accepts a sign-of-zero difference, which is
-/// exactly the difference this crate's normalization contract is about.
-fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: destination length");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
-}
-
-/// The pinned normalization form for a `UInt16` image at the format default range, written out
-/// longhand so an expectation never comes from the code under test.
-fn expected_u16(levels: &[u16]) -> Vec<f32> {
-    levels
-        .iter()
-        .map(|&l| (l as f64 - 0.0) as f32 * (1.0f32 / 65535.0f32))
-        .collect()
-}
-
-/// The 4 × 3 `UInt16` samples the single-image fixtures store.
-fn samples() -> Vec<u16> {
-    repeating_u16(12)
-}
-
 /// A one-image unit whose `<Image>` is written attribute by attribute and whose block is
 /// attached, for the rows whose point is one faulty attribute.
 fn attached(attrs: &str) -> Vec<u8> {
@@ -155,12 +114,6 @@ fn attached(attrs: &str) -> Vec<u8> {
 /// location check runs last.
 fn unattached(attrs: &str) -> Vec<u8> {
     Unit::new().xml(&format!("<Image {attrs}/>")).build()
-}
-
-/// The declared-header-length field, so a fixture that writes its own header region keeps the
-/// preamble honest.
-fn with_header(header: &str, trailing: &[u8]) -> Vec<u8> {
-    raw_unit(b"XISF0100", header.len() as u32, header, trailing)
 }
 
 // ------------------------------------------------------- rows that surface at construction
@@ -607,60 +560,10 @@ fn a_second_occurrence_of_one_block_is_unsupported_on_a_sequential_source_only()
     assert!(!reader.next_image().expect("the walk ends"));
 }
 
-/// `with_bounds` and `select_channel` are **per-image** state and are cleared by
-/// `next_image()`.
-///
-/// The alternative silently carries one image's bounds onto the next, which a multi-image XISF
-/// file makes reachable — and this fixture is exactly that shape.
-#[test]
-fn with_bounds_and_select_channel_reset_across_next_image() {
-    let first = repeating_u16(12);
-    let second = repeating_u16(12);
-    let bytes = Unit::new()
-        .attached(
-            r#"<Image geometry="2:2:3" sampleFormat="UInt16" {loc}/>"#,
-            le_u16(&first),
-        )
-        .attached(
-            r#"<Image geometry="2:2:3" sampleFormat="UInt16" {loc}/>"#,
-            le_u16(&second),
-        )
-        .build();
-
-    let mut reader = seekable(bytes).expect("the unit constructs");
-    assert!(reader.next_image().expect("the walk advances"));
-    reader.select_channel(1).expect("channel 1 of three");
-    reader.with_bounds(0.0, 1000.0).expect("a valid range");
-
-    // Configured, then read: `select_channel` narrows the *reported* geometry, so a caller
-    // sizing a buffer from the header is right by construction only in that order.
-    let header = reader.header().expect("a header");
-    assert_eq!(header.channels(), Some(1));
-    assert_eq!(header.channel_index(), Some(1));
-    assert!(
-        matches!(header.bounds(), Bounds::CallerSupplied { .. }),
-        "{:?}",
-        header.bounds()
-    );
-
-    assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a header");
-    // Both cleared: the file's full channel count is reported again, `channel_index` is `None`
-    // rather than `Some(0)` — "no selection" and "selected channel zero" stay distinguishable —
-    // and the range is the format's own default rather than the previous image's override.
-    assert_eq!(header.channels(), Some(3));
-    assert_eq!(header.channel_index(), None);
-    assert_eq!(*header.bounds(), Bounds::FormatDefault(0.0, 65535.0));
-
-    // And the reset is real rather than cosmetic: the destination length the header now
-    // describes is the one the decode accepts.
-    let image = reader.read_image().expect("the second image decodes whole");
-    assert_same_bits(
-        &image.into_samples(),
-        &expected_u16(&second),
-        "the second image decodes at its own settings",
-    );
-}
+// The per-image reset of `with_bounds` and `select_channel` is graded in
+// `pipeline::with_bounds_and_select_channel_reset_across_next_image`, over the same multi-image
+// XISF shape and with the assertion that decides it: the cleared override changes the decoded
+// pixels rather than only the reported range.
 
 /// A per-image attribute fault declines **that image** without failing the source.
 ///

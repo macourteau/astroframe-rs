@@ -25,14 +25,15 @@ mod common;
 use std::io::Cursor;
 
 use astroframe::{
-    ColorSpace, DeclineClass, Error, Granularity, Header, ImageType, KeywordOrigin, Orientation,
+    ColorSpace, DeclineClass, Granularity, Header, ImageType, KeywordOrigin, Orientation,
     PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, SampleFormat,
     Samples, Seekable, Sequential,
 };
 use common::xisf::{
-    PREAMBLE, Unit, base64, be_u16, checksum_attr, hex, le_f32, le_u8, le_u16, lz4, raw_unit,
-    repeating_u16, shuffle, zlib,
+    PREAMBLE, Unit, base64, be_u16, checksum_attr, expected_u16, hex, le_f32, le_u8, le_u16, lz4,
+    repeating_u16, samples, shuffle, with_header, zlib,
 };
+use common::{assert_same_bits, kind};
 
 // ------------------------------------------------------------------ helpers
 
@@ -44,49 +45,6 @@ fn seekable(bytes: Vec<u8>) -> astroframe::Result<SeekReader> {
 
 fn sequential(bytes: Vec<u8>) -> astroframe::Result<Reader<Sequential<Cursor<Vec<u8>>>>> {
     Reader::sequential(Cursor::new(bytes))
-}
-
-/// The error's variant name. Assertions name the variant rather than matching on a message,
-/// which is text the crate is free to reword.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
-
-/// Compare by `to_bits()`, never `==`: `==` accepts a sign-of-zero difference, which is
-/// exactly the difference this crate's normalization contract is about.
-fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: sample count");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
-}
-
-/// The pinned normalization form for a `UInt16` image at the format default range, written
-/// out longhand so an expectation never comes from the code under test.
-fn expected_u16(levels: &[u16]) -> Vec<f32> {
-    levels
-        .iter()
-        .map(|&l| (l as f64 - 0.0) as f32 * (1.0f32 / 65535.0f32))
-        .collect()
-}
-
-/// The 4 × 3 `UInt16` samples nearly every fixture here stores.
-fn samples() -> Vec<u16> {
-    repeating_u16(12)
 }
 
 /// `<Image>` over the standard fixture geometry, with `extra` attributes spliced in.
@@ -118,12 +76,6 @@ fn decodes_to(bytes: Vec<u8>, levels: &[u16], what: &str) -> Header {
     let (header, got) = read_one(bytes);
     assert_same_bits(&got, &expected_u16(levels), what);
     header
-}
-
-/// The declared-header-length field, so a fixture that rewrites the header region keeps the
-/// preamble honest.
-fn with_header(header: &str, trailing: &[u8]) -> Vec<u8> {
-    raw_unit(b"XISF0100", header.len() as u32, header, trailing)
 }
 
 /// Build a unit whose single attachment writes its **own** `location` spelling.
@@ -2216,17 +2168,10 @@ fn invalid_utf8_in_the_header_region_is_malformed_at_construction() {
 
 /// The other half of the same row: **a declared non-UTF-8 encoding is `Unsupported`**.
 ///
-/// This is a **library defect**, not a property of the fixture. `quick-xml` is built without
-/// its transcoding feature, so it cannot honour such a declaration — but `src/xisf/xml.rs`
-/// never inspects the declaration at all: `Event::Decl` falls into `parse`'s catch-all arm, so
-/// a header announcing `encoding="ISO-8859-1"` is read as UTF-8 and decodes, which is the
-/// guess the row says is worse than refusing. Any byte above `0x7f` then means something
-/// different from what the file said it meant, silently.
-///
-/// The fix belongs in `src/xisf/xml.rs::parse`: match `Event::Decl`, read its `encoding`
-/// attribute, and raise `Unsupported` for anything that is not a UTF-8 spelling.
-///
-/// `#[ignore]`d rather than deleted so it passes the moment that lands.
+/// `quick-xml` is built without its transcoding feature, so honouring such a declaration is
+/// not on the table; reading the bytes as UTF-8 anyway is the guess the row says is worse than
+/// refusing, because every byte above `0x7f` would then mean something other than what the
+/// file said it meant.
 #[test]
 fn a_declared_non_utf8_header_encoding_is_unsupported() {
     let levels = samples();
