@@ -44,9 +44,13 @@ pub(super) struct Cache {
     /// written down.
     pub(super) chains: std::collections::HashMap<ChainKey, Keyword>,
     pub(super) properties: std::collections::HashMap<(usize, PropertyScope), Option<Property>>,
-    pub(super) cfa: std::collections::HashMap<usize, Option<Cfa>>,
-    pub(super) resolution: std::collections::HashMap<usize, Resolution>,
-    pub(super) display_function: std::collections::HashMap<usize, DisplayFunction>,
+    /// The three ancillary elements are memoized with the fault their read produced, not just
+    /// with the value: a malformed element declines every image that reaches it, and a memo
+    /// holding the value alone would decline only the first.
+    pub(super) cfa: std::collections::HashMap<usize, (Option<Cfa>, Option<DeclineReason>)>,
+    pub(super) resolution: std::collections::HashMap<usize, (Resolution, Option<DeclineReason>)>,
+    pub(super) display_function:
+        std::collections::HashMap<usize, (DisplayFunction, Option<DeclineReason>)>,
 }
 
 /// Read `node` once per document: `read` runs on a miss and its result is memoized, and a hit

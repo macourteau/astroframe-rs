@@ -26,8 +26,8 @@ use std::io::Cursor;
 
 use astroframe::{
     ColorSpace, DeclineClass, Granularity, Header, ImageType, KeywordOrigin, Orientation,
-    PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, SampleFormat,
-    Samples, Seekable, Sequential,
+    PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, ResolutionUnit,
+    SampleFormat, Samples, Seekable, Sequential,
 };
 use common::xisf::{
     PREAMBLE, Unit, base64, be_u16, checksum_attr, expected_u16, hex, le_f32, le_u8, le_u16, lz4,
@@ -1471,10 +1471,11 @@ fn a_thumbnails_attached_block_is_stepped_over_and_the_right_cap_bounds_the_step
 /// Row *The core elements this crate meets and does not read are dispositioned explicitly*,
 /// and the silent half of row *"Declined" means two different things*.
 ///
-/// An element never fails a frame it does not prevent decoding. `RGBWorkingSpace` appears in
-/// §11.13's own worked example and PixInsight writes it routinely, so treating it as
-/// frame-level would refuse a large share of real RGB files for a colour-management element
-/// that has nothing to do with pixels.
+/// An element this crate does not read never fails a frame it does not prevent decoding.
+/// `RGBWorkingSpace` appears in §11.13's own worked example and PixInsight writes it routinely,
+/// so treating it as frame-level would refuse a large share of real RGB files for a
+/// colour-management element that has nothing to do with pixels. The elements it *does* read
+/// answer the other way, and `tests/xisf_declines.rs` grades that half.
 #[test]
 fn the_declined_elements_never_fail_the_frame_and_the_two_reported_ones_are_reachable() {
     let levels = samples();
@@ -1484,7 +1485,12 @@ fn the_declined_elements_never_fail_the_frame_and_the_two_reported_ones_are_reac
         r#"<Table><Property id="Table:Col" type="String" value="skipped"/></Table>"#,
         r#"<Structure location="attachment:99999:16"/>"#,
         r#"<Resolution horizontal="300" vertical="150" unit="cm"/>"#,
-        r#"<DisplayFunction m="0.25:0.25:0.25:0.25" s="0.1:0.1:0.1:0.1"/>"#,
+        // All five of §11.9.1's parameters: an element carrying only some of them is a
+        // declined position, which `tests/xisf_declines.rs` grades.
+        concat!(
+            r#"<DisplayFunction m="0.25:0.25:0.25:0.25" s="0.1:0.1:0.1:0.1" "#,
+            r#"h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+        ),
         // An element no version of the specification defines: ignored, which is the only
         // reading under which a 1.0 decoder survives a later revision.
         r#"<SomethingFromTheFuture answer="42"/>"#,
@@ -1500,13 +1506,12 @@ fn the_declined_elements_never_fail_the_frame_and_the_two_reported_ones_are_reac
     let resolution = header.resolution().expect("XISF defines a resolution");
     assert_eq!(resolution.horizontal(), 300.0);
     assert_eq!(resolution.vertical(), 150.0);
-    assert_eq!(resolution.unit(), astroframe::ResolutionUnit::Centimetre);
+    assert_eq!(resolution.unit(), &astroframe::ResolutionUnit::Centimetre);
     let df = header
         .display_function()
         .expect("XISF defines a display function");
     assert_eq!(df.midtones().red_gray, 0.25);
     assert_eq!(df.shadows().lightness, 0.1);
-    // An attribute the element did not carry keeps the identity function's value.
     assert_eq!(df.highlights().blue, 1.0);
 
     // The `Table`'s property is declined with it, rather than leaking into the image's list.
@@ -1524,11 +1529,126 @@ fn the_declined_elements_never_fail_the_frame_and_the_two_reported_ones_are_reac
     let resolution = header.resolution().expect("the XISF default");
     assert_eq!(resolution.horizontal(), 72.0);
     assert_eq!(resolution.vertical(), 72.0);
-    assert_eq!(resolution.unit(), astroframe::ResolutionUnit::Inch);
+    assert_eq!(resolution.unit(), &astroframe::ResolutionUnit::Inch);
     let df = header.display_function().expect("the XISF default");
     assert_eq!(df.midtones().red_gray, 0.5);
     assert_eq!(df.shadows().red_gray, 0.0);
     assert_eq!(df.highlights().red_gray, 1.0);
+}
+
+/// Row *unknown values of `imageType`, `orientation` and a `Resolution`'s `unit` degrade to
+/// "unknown" and are reported as text*, for the third of the three.
+///
+/// §11.11.2 makes `unit` optional and defines two spellings, so absence and an unrecognized
+/// spelling are different answers. Folding them together reports pixels per inch for a file
+/// that said something else entirely.
+#[test]
+fn an_unrecognized_resolution_unit_is_reported_verbatim_rather_than_read_as_the_default() {
+    let levels = samples();
+    let unit_of = |declared: &str| {
+        let children = format!(r#"<Resolution horizontal="300" vertical="300" {declared}/>"#);
+        let header = decodes_to(
+            attached_u16_with("", &children, le_u16(&levels)),
+            &levels,
+            "an unrecognized resolution unit never fails the frame",
+        );
+        header
+            .resolution()
+            .expect("XISF defines a resolution")
+            .unit()
+            .clone()
+    };
+
+    // Both spellings §11.11.2 defines, and the absence it defines a default for.
+    assert_eq!(unit_of(r#"unit="inch""#), ResolutionUnit::Inch);
+    assert_eq!(unit_of(r#"unit="cm""#), ResolutionUnit::Centimetre);
+    assert_eq!(unit_of(""), ResolutionUnit::Inch);
+
+    // A spelling the file states and this crate does not know is reported as that text, and
+    // the frame still decodes: nothing is applied from the unit, so it degrades to "unknown"
+    // rather than declining the position.
+    assert_eq!(
+        unit_of(r#"unit="parsecs""#),
+        ResolutionUnit::Other("parsecs".into())
+    );
+    // Including the empty spelling, which is a stated value like any other.
+    assert_eq!(unit_of(r#"unit="""#), ResolutionUnit::Other("".into()));
+}
+
+/// Row *Where an image carries several of one element, the first in document order is reported
+/// and the rest ignored*.
+///
+/// Selection among well-formed elements states nothing the file does not, so unlike an element
+/// that cannot be read it is not a decline — but it is a rule a caller can observe, so it is
+/// pinned rather than left to fall out of the walk.
+#[test]
+fn the_first_of_several_ancillary_elements_wins_and_the_rest_are_ignored() {
+    let levels = samples();
+    let children = concat!(
+        r#"<Resolution horizontal="300" vertical="300" unit="cm"/>"#,
+        r#"<Resolution horizontal="150" vertical="150"/>"#,
+        r#"<ColorFilterArray pattern="GRBG" width="2" height="2"/>"#,
+        r#"<ColorFilterArray pattern="RGGB" width="2" height="2"/>"#,
+        r#"<DisplayFunction m="0.25:0.25:0.25:0.25" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+        r#"<DisplayFunction m="0.75:0.75:0.75:0.75" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+    );
+    let header = decodes_to(
+        attached_u16_with("", children, le_u16(&levels)),
+        &levels,
+        "a second element of a kind is discarded, not a fault",
+    );
+    assert!(
+        header.decline_reason().is_none(),
+        "selection is not a fault"
+    );
+
+    let resolution = header.resolution().expect("XISF defines a resolution");
+    assert_eq!(resolution.horizontal(), 300.0);
+    assert_eq!(resolution.unit(), &ResolutionUnit::Centimetre);
+    assert_eq!(header.cfa().expect("the first CFA").pattern(), "GRBG");
+    assert_eq!(
+        header
+            .display_function()
+            .expect("XISF defines a display function")
+            .midtones()
+            .red_gray,
+        0.25
+    );
+}
+
+/// Row *§11.1.1's `id` and `type` are both mandatory*: a `Property` missing either is not
+/// reported at all.
+///
+/// The alternative is `PropertyType::Other("")`, one value standing for both "the file
+/// declared no type" and "the file declared the empty type". A property is dropped rather than
+/// declining the frame because absence of a property claims nothing about the image, which is
+/// exactly what makes a dropped `ColorFilterArray` different.
+#[test]
+fn a_property_missing_either_mandatory_attribute_is_not_reported() {
+    let levels = samples();
+    let children = concat!(
+        r#"<Property id="Test:Typed" type="String" value="reported"/>"#,
+        r#"<Property id="Test:Untyped" value="no type attribute"/>"#,
+        r#"<Property type="String" value="no id attribute"/>"#,
+        // A stated but unrecognized type is a different answer, and is reported as its text.
+        r#"<Property id="Test:Unknown" type="Quaternion" value="reported too"/>"#,
+    );
+    let header = decodes_to(
+        attached_u16_with("", children, le_u16(&levels)),
+        &levels,
+        "a property missing a mandatory attribute never fails the frame",
+    );
+    assert!(
+        header.decline_reason().is_none(),
+        "a property prevents nothing"
+    );
+
+    let ids: Vec<&str> = header.properties().iter().map(|p| p.id()).collect();
+    assert_eq!(ids, ["Test:Typed", "Test:Unknown"], "{ids:?}");
+    assert_eq!(
+        property(&header, "Test:Unknown").property_type(),
+        &PropertyType::Other("Quaternion".into())
+    );
 }
 
 // ------------------------------------------------------------- defaults and channel counts

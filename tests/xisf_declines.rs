@@ -116,6 +116,17 @@ fn unattached(attrs: &str) -> Vec<u8> {
     Unit::new().xml(&format!("<Image {attrs}/>")).build()
 }
 
+/// A one-image unit whose `<Image>` carries children and an otherwise faultless attribute set,
+/// for the rows whose point is one faulty ancillary element.
+fn with_children(children: &str) -> Vec<u8> {
+    Unit::new()
+        .attached(
+            &format!(r#"<Image geometry="4:3:1" sampleFormat="UInt16" {{loc}}>{children}</Image>"#),
+            le_u16(&repeating_u16(12)),
+        )
+        .build()
+}
+
 // ------------------------------------------------------- rows that surface at construction
 
 /// Row *Source matches neither `SIMPLE` nor `XISF0100`*: `Malformed`, at construction, with no
@@ -358,7 +369,8 @@ fn a_per_image_attribute_fault_declines_that_position_with_the_geometry_it_could
 /// § Errors → *Validation order*, graded directly:
 ///
 /// > geometry → `colorSpace` → `sampleFormat` → `byteOrder` → `pixelStorage` → `location`
-/// > → `compression` → `offset`, first error wins
+/// > → `compression` → `offset` → `ColorFilterArray` → `Resolution` → `DisplayFunction`,
+/// > first error wins
 ///
 /// The classes depend on it, so each pair below carries **two** faults and asserts which one
 /// the caller sees. Where the two faults raise the same class the reason text is asserted
@@ -421,6 +433,61 @@ fn the_header_phase_validation_order_is_first_error_wins_in_the_stated_sequence(
     );
     assert_eq!(class, DeclineClass::Unsupported);
 
+    // offset beats the ancillary elements — both `Malformed`, so the reason distinguishes
+    // them. Every attribute is settled before the first child element is classified.
+    let bytes = Unit::new()
+        .attached(
+            concat!(
+                r#"<Image geometry="4:3:1" sampleFormat="UInt16" offset="-1" {loc}>"#,
+                r#"<Resolution horizontal="-5" vertical="300"/></Image>"#,
+            ),
+            le_u16(&repeating_u16(12)),
+        )
+        .build();
+    let (header, _) = declined("offset before Resolution", bytes);
+    let reason = header.decline_reason().expect("declined").reason();
+    assert!(reason.contains("offset"), "{reason}");
+
+    // Among the three the order is by element name and never by document position: §11.5
+    // leaves the order of an image's children free, so a file writing its `DisplayFunction`
+    // first must classify exactly as one writing its `ColorFilterArray` first does.
+    for (what, children) in [
+        (
+            "ColorFilterArray before Resolution",
+            concat!(
+                r#"<Resolution horizontal="-5" vertical="300"/>"#,
+                r#"<ColorFilterArray width="2" height="2"/>"#,
+            ),
+        ),
+        (
+            "Resolution before DisplayFunction",
+            concat!(
+                r#"<DisplayFunction m="0.5:0.5" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+                r#"<Resolution horizontal="-5" vertical="300"/>"#,
+            ),
+        ),
+    ] {
+        let (header, _) = declined(what, with_children(children));
+        let reason = header.decline_reason().expect("declined").reason();
+        let first = what.split(' ').next().expect("the element name");
+        assert!(reason.contains(first), "{what}: {reason}");
+    }
+
+    // And all three beat `checksum`, which is not one of the positions the order names: an
+    // unreadable element is `Malformed` and an unknown digest algorithm is `Unsupported`, so
+    // the class says which ran first.
+    let bytes = Unit::new()
+        .attached(
+            concat!(
+                r#"<Image geometry="4:3:1" sampleFormat="UInt16" checksum="md5:00" {loc}>"#,
+                r#"<Resolution horizontal="-5" vertical="300"/></Image>"#,
+            ),
+            le_u16(&repeating_u16(12)),
+        )
+        .build();
+    let (_, class) = declined("Resolution before checksum", bytes);
+    assert_eq!(class, DeclineClass::Malformed);
+
     // **The case the order exists for.** An unsupported *attribute* and no `location` at all
     // must yield `Unsupported`, not `Malformed` — and does so only because the location check
     // runs last. Validating `location` early, the natural instinct since it drives the read,
@@ -436,6 +503,148 @@ fn the_header_phase_validation_order_is_first_error_wins_in_the_stated_sequence(
         );
         assert_eq!(class, DeclineClass::Unsupported, "{attrs}");
     }
+}
+
+// -------------------------------------------------------------- the ancillary elements
+
+/// Row *… or an unreadable `ColorFilterArray`, `Resolution` or `DisplayFunction` child*:
+/// `Malformed`, at a declined position, with the geometry reported in full.
+///
+/// The three elements are reported and applied to nothing, which is why the temptation is to
+/// repair them — and § The organizing principle is what rules that out. Each case below is one
+/// the crate could answer with a value the file never wrote.
+#[test]
+fn an_unreadable_ancillary_element_declines_rather_than_repairing_the_file() {
+    // `Resolution`, in both halves of "unreadable": a value that does not parse, and one that
+    // parses and is not a resolution (§11.11.1 requires each axis to be greater than zero).
+    // 72.0 reported for either of them is a figure the file never wrote, beside the 300.0 it
+    // did.
+    for (what, element) in [
+        (
+            "a horizontal that does not parse",
+            r#"<Resolution horizontal="not-a-number" vertical="300"/>"#,
+        ),
+        (
+            "a negative horizontal",
+            r#"<Resolution horizontal="-5" vertical="300"/>"#,
+        ),
+        (
+            "a zero vertical",
+            r#"<Resolution horizontal="300" vertical="0"/>"#,
+        ),
+        (
+            "a NaN vertical, which §8.3.3 spells",
+            r#"<Resolution horizontal="300" vertical="NaN"/>"#,
+        ),
+        (
+            "no horizontal at all, which §11.11.1 requires",
+            r#"<Resolution vertical="300"/>"#,
+        ),
+    ] {
+        let (header, class) = declined(what, with_children(element));
+        assert_eq!(class, DeclineClass::Malformed, "{what}");
+        assert_eq!(geometry(&header), (Some(4), Some(3), Some(1)), "{what}");
+        let reason = header.decline_reason().expect("declined").reason();
+        assert!(reason.contains("Resolution"), "{what}: {reason}");
+    }
+
+    // A parseable value is reported verbatim beside its decline — the file did state it — and
+    // the specification's default stands in only where there is no number to state.
+    let (header, _) = declined(
+        "the reported pair",
+        with_children(r#"<Resolution horizontal="-5" vertical="300"/>"#),
+    );
+    let resolution = header.resolution().expect("XISF defines a resolution");
+    assert_eq!(
+        (resolution.horizontal(), resolution.vertical()),
+        (-5.0, 300.0),
+        "the stated figures, not the 72.0 default"
+    );
+
+    // `ColorFilterArray` is the worst of the three to drop: `cfa()` reporting `None` is the
+    // positive claim *this image is not mosaiced*, so a consumer branching on it to decide
+    // whether to debayer would be told the opposite of what a one-shot-colour frame says.
+    for (what, element) in [
+        (
+            "a width that does not parse",
+            r#"<ColorFilterArray pattern="GRBG" width="two" height="2"/>"#,
+        ),
+        (
+            "no pattern, which §11.10.1 requires",
+            r#"<ColorFilterArray width="2" height="2"/>"#,
+        ),
+        (
+            "no height, which §11.10.1 requires",
+            r#"<ColorFilterArray pattern="GRBG" width="2"/>"#,
+        ),
+    ] {
+        let (header, class) = declined(what, with_children(element));
+        assert_eq!(class, DeclineClass::Malformed, "{what}");
+        assert_eq!(geometry(&header), (Some(4), Some(3), Some(1)), "{what}");
+        let reason = header.decline_reason().expect("declined").reason();
+        assert!(reason.contains("ColorFilterArray"), "{what}: {reason}");
+        // `cfa()` is `None` here, and it is the decline rather than that `None` that carries
+        // the answer: absence of the element is what means "not mosaiced".
+        assert!(header.cfa().is_none(), "{what}");
+    }
+
+    // `DisplayFunction`: §11.9.1 requires all five parameters, each written as four fields.
+    for (what, element) in [
+        (
+            "no r at all",
+            r#"<DisplayFunction m="0.5:0.5:0.5:0.5" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0"/>"#,
+        ),
+        (
+            "an m of two fields",
+            r#"<DisplayFunction m="0.5:0.5" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+        ),
+        (
+            "an s field that does not parse",
+            r#"<DisplayFunction m="0.5:0.5:0.5:0.5" s="x:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
+        ),
+    ] {
+        let (header, class) = declined(what, with_children(element));
+        assert_eq!(class, DeclineClass::Malformed, "{what}");
+        assert_eq!(geometry(&header), (Some(4), Some(3), Some(1)), "{what}");
+        let reason = header.decline_reason().expect("declined").reason();
+        assert!(reason.contains("DisplayFunction"), "{what}: {reason}");
+    }
+}
+
+/// One root-level element reached by several `<Reference>` elements is read once for the whole
+/// document, and its fault reaches **every** image that references it.
+///
+/// The memo is what this grades: one holding the read value alone would decline the first
+/// image and hand the second a repaired element, which is the same fabrication by another
+/// route.
+#[test]
+fn an_unreadable_referenced_element_declines_every_image_that_reaches_it() {
+    let bytes = Unit::new()
+        .xml(r#"<Resolution uid="r" horizontal="-5" vertical="300"/>"#)
+        .attached(
+            r#"<Image geometry="4:3:1" sampleFormat="UInt16" {loc}><Reference ref="r"/></Image>"#,
+            le_u16(&repeating_u16(12)),
+        )
+        .attached(
+            r#"<Image geometry="4:3:1" sampleFormat="UInt16" {loc}><Reference ref="r"/></Image>"#,
+            le_u16(&repeating_u16(12)),
+        )
+        .build();
+
+    let mut reader = seekable(bytes).expect("the unit constructs");
+    for position in 0..2 {
+        assert!(
+            reader.next_image().expect("the walk advances"),
+            "{position}"
+        );
+        let header = reader.header().expect("a declined position still reports");
+        let decline = header
+            .decline_reason()
+            .unwrap_or_else(|| panic!("image {position} declines"));
+        assert_eq!(decline.class(), DeclineClass::Malformed, "{position}");
+        assert!(decline.reason().contains("Resolution"), "{position}");
+    }
+    assert!(!reader.next_image().expect("the walk ends"));
 }
 
 // ------------------------------------------------------------------ the Neither row
