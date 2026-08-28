@@ -82,8 +82,6 @@ pub(crate) struct Occurrence {
 /// Walk the header's image occurrences in document order.
 pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurrence>> {
     let mut cache = Cache::default();
-    // Root-level `Metadata` properties (§11.4) apply to every image in the unit, so they are
-    // read once and reported at their document position in every image's list below.
     // Positions and properties come back as two lists rather than as pairs, because the two
     // halves have different lifetimes below: the properties are consumed into the shared list
     // immediately, and only the positions are read again per occurrence. Zipped, the pairs
@@ -216,7 +214,7 @@ fn build_occurrence(
 
     // The XISF header-phase validation order, first error wins. It is load-bearing: several
     // adversarial fixtures carry an unsupported *attribute* and no `location` at all, and
-    // they yield `Unsupported` only because the location check runs last.
+    // they yield `Unsupported` only because the location check runs after the attributes.
     let decline_reason = geometry_fault
         .or(color_space_fault)
         .or(sample_format_fault)
@@ -514,8 +512,10 @@ fn read_compression(
         Ok(subblocks) => subblocks,
         Err(e) => return (compression, None, Some(decline_from(e))),
     };
-    // Two of the three added checks; the count cap is inside `parse_subblocks`. All three run
-    // before any allocation.
+    // Two of the three checks this crate adds to the list; the count cap is the third and is
+    // inside `parse_subblocks`. §10.6 requires none of them and sets no upper limit on the
+    // number of subblocks, and the whole list is one attribute string rather than elements, so
+    // the element-count cap does not reach it. All three run before any allocation.
     if let Some(stored) = stored
         && let Err(e) = check_subblock_sums(&subblocks, stored, implied_bytes)
     {
