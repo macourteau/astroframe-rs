@@ -15,7 +15,7 @@ crate itself sets `#![forbid(unsafe_code)]`.
 
 ```toml
 [dependencies]
-astroframe = "0.1"
+astroframe = "0.2"
 ```
 
 ## Reading a header without decoding a pixel
