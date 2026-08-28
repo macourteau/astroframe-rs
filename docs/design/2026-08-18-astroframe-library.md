@@ -1234,9 +1234,10 @@ those assertions unstable:**
 
 **This is the single normative home of the validation order.** Error classes depend on it
 — several adversarial fixtures carry an unsupported *attribute* and no `location` at all,
-and they yield `Unsupported` only because the location check runs last. Validating
-`location` early — the natural instinct, since it drives the read — would reclassify them
-as `Malformed`.
+and they yield `Unsupported` only because the location check runs after the attributes.
+Validating `location` early — the natural instinct, since it drives the read — would
+reclassify them as `Malformed`. Positions do follow it, so "after the attributes" is the
+property those fixtures rest on rather than `location` being last in the order.
 
 XISF header phase, first error wins:
 

@@ -214,7 +214,7 @@ fn build_occurrence(
 
     // The XISF header-phase validation order, first error wins. It is load-bearing: several
     // adversarial fixtures carry an unsupported *attribute* and no `location` at all, and
-    // they yield `Unsupported` only because the location check runs last.
+    // they yield `Unsupported` only because the location check runs after the attributes.
     let decline_reason = geometry_fault
         .or(color_space_fault)
         .or(sample_format_fault)
