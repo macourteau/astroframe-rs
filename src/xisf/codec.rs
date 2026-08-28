@@ -90,8 +90,12 @@ pub(crate) fn decompress(
     out: &mut [u8],
     limits: &Limits,
 ) -> Result<()> {
+    // One codec state for the whole block, whatever the split. `Stream::open` carries one
+    // across the streaming path for the same reason [`Codecs`] gives.
+    let mut codecs = Codecs::default();
+
     let Some(list) = subblocks else {
-        return decompress_one(stored, compression.codec, out, limits);
+        return decompress_one(&mut codecs, stored, compression.codec, out, limits);
     };
 
     // §10.6's subblock split is over the *compression*, so each pair decompresses
@@ -112,43 +116,131 @@ pub(crate) fn decompress(
                 "subblock {index} runs past the geometry-implied size"
             ))
         })?;
-        decompress_one(src, compression.codec, dst, limits)?;
+        decompress_one(&mut codecs, src, compression.codec, dst, limits)?;
         in_at += compressed;
         out_at += uncompressed;
     }
     Ok(())
 }
 
-fn decompress_one(stored: &[u8], codec: Codec, out: &mut [u8], limits: &Limits) -> Result<()> {
+/// The framed codecs' state, carried across a block's subblocks.
+///
+/// §10.6 restarts the codec at every subblock boundary, so a state built at a boundary is
+/// built `Subblock count` times — 4096 — from a block whose stored bytes are whatever the file
+/// felt like. `docs/intentional-patterns.md` states the rule that breaks: **no per-occurrence
+/// allocation may be sized by a cap**. A `flate2::read::ZlibDecoder` costs about 76 KB to
+/// construct (a `Decompress` and the 32 KiB buffer its reader wraps) and a
+/// `ruzstd::FrameDecoder` about 9 KB, and neither figure has anything to do with the subblock
+/// it decodes.
+///
+/// Both codecs' resets keep the buffers and clear the state, which is the same decode from a
+/// clean stream position. The peak is unchanged: at most one state exists, because a block
+/// declares one codec, and reuse holds strictly less than construction did.
+///
+/// LZ4 is absent because it has no state to carry — `lz4_flex::block::decompress_into`
+/// allocates no codec and writes straight into the destination.
+#[derive(Default)]
+struct Codecs {
+    zlib: Option<flate2::Decompress>,
+    zstd: Option<Box<ruzstd::decoding::FrameDecoder>>,
+}
+
+fn decompress_one(
+    codecs: &mut Codecs,
+    stored: &[u8],
+    codec: Codec,
+    out: &mut [u8],
+    limits: &Limits,
+) -> Result<()> {
     match codec {
-        // A bare LZ4 block: no frame header, decompresses only as a whole, and the output
-        // length is known from the geometry rather than read from the stream.
-        Codec::Lz4 | Codec::Lz4Hc => {
-            let written = lz4_flex::block::decompress_into(stored, out)
-                .map_err(|e| Error::malformed(format!("LZ4 block does not decompress: {e}")))?;
-            if written != out.len() {
-                return Err(Error::malformed(format!(
-                    "LZ4 block inflates to {written} bytes where the geometry implies {}",
-                    out.len()
-                )));
-            }
-            Ok(())
-        }
+        Codec::Lz4 | Codec::Lz4Hc => decompress_lz4(stored, out),
         // zlib-wrapped, not raw deflate: feeding these bytes to an inflate-raw reader
         // type-checks and then fails on every block.
-        Codec::Zlib => exact_stream(flate2::read::ZlibDecoder::new(stored), out, "zlib"),
+        Codec::Zlib => {
+            let d = codecs
+                .zlib
+                .get_or_insert_with(|| flate2::Decompress::new(true));
+            d.reset(true);
+            exact_stream(
+                Inflate {
+                    d,
+                    input: stored,
+                    done: false,
+                },
+                out,
+                "zlib",
+            )
+        }
         // Framed, so a streaming decoder applies. The frame header declares a window size and
         // a zstd decoder allocates that window before producing a byte -- the precise shape of
-        // "an allocation sized from an unvalidated declared size" -- so the cap is passed to
-        // the constructor, which checks it before the window is allocated.
+        // "an allocation sized from an unvalidated declared size" -- so the cap is set on the
+        // decoder before the frame is read, and the read checks it before the allocation.
         Codec::Zstd => {
-            let decoder = ruzstd::decoding::StreamingDecoder::new_with_max_window_size(
-                stored,
-                limits.zstd_window_bytes,
-            )
-            .map_err(|e| zstd_header_error(e, limits))?;
+            let fd = codecs
+                .zstd
+                .get_or_insert_with(|| Box::new(ruzstd::decoding::FrameDecoder::new()));
+            fd.set_max_window_size(limits.zstd_window_bytes);
+            let decoder = ruzstd::decoding::StreamingDecoder::new_with_decoder(stored, fd.as_mut())
+                .map_err(|e| zstd_header_error(e, limits))?;
             exact_stream(decoder, out, "zstd")
         }
+    }
+}
+
+/// A bare LZ4 block: no frame header, decompresses only as a whole, and the output length is
+/// known from the geometry rather than read from the stream.
+fn decompress_lz4(stored: &[u8], out: &mut [u8]) -> Result<()> {
+    let written = lz4_flex::block::decompress_into(stored, out)
+        .map_err(|e| Error::malformed(format!("LZ4 block does not decompress: {e}")))?;
+    if written != out.len() {
+        return Err(Error::malformed(format!(
+            "LZ4 block inflates to {written} bytes where the geometry implies {}",
+            out.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A `Read` over one subblock's stored bytes, driving a decompressor the whole block shares.
+///
+/// `flate2::read::ZlibDecoder` is the obvious spelling and is the one thing that cannot be
+/// reused: its own `reset` **builds a fresh `Decompress`** rather than resetting the one it
+/// holds, so a decoder carried across the subblock list that way costs exactly what
+/// constructing one per subblock costs. `Decompress::reset` is the reset that keeps the
+/// buffers, and it is reached only by driving the decompressor directly.
+///
+/// Every subblock is resident before this runs, so the whole of it is offered on each call and
+/// `Finish` is the honest flush: there is no more input coming.
+struct Inflate<'a> {
+    d: &'a mut flate2::Decompress,
+    input: &'a [u8],
+    /// Set once the stream has ended, so that the byte `exact_stream` reads past the
+    /// destination reaches a spent decompressor rather than an undefined one.
+    done: bool,
+}
+
+impl Read for Inflate<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || out.is_empty() {
+            return Ok(0);
+        }
+        let before_in = self.d.total_in();
+        let before_out = self.d.total_out();
+        let status = self
+            .d
+            .decompress(self.input, out, flate2::FlushDecompress::Finish)
+            .map_err(std::io::Error::other)?;
+        let consumed = (self.d.total_in() - before_in) as usize;
+        let produced = (self.d.total_out() - before_out) as usize;
+        self.input = &self.input[consumed..];
+        // A finished stream and an iteration that moved neither counter both mean there is
+        // nothing further to give, which a reader says by returning zero: `exact_stream` turns
+        // a short read into the truncation it is, and its one-byte read past the destination
+        // catches a block that inflates too far. Trailing bytes after the stream's end are
+        // ignored rather than refused, which is the treatment a reader over the same
+        // decompressor gives them.
+        self.done = matches!(status, flate2::Status::StreamEnd) || (produced == 0 && consumed == 0);
+        Ok(produced)
     }
 }
 
@@ -403,7 +495,7 @@ impl Stream {
                     Error::malformed(format!("LZ4 subblock's stored bytes are unreadable: {e}"))
                 })?;
                 let mut buf = vec![0u8; out_len];
-                decompress_one(&stored, codec, &mut buf, limits)?;
+                decompress_lz4(&stored, &mut buf)?;
                 *self = Stream::Lz4(Box::new(Lz4State { buf, at: 0 }));
                 Ok(())
             }
