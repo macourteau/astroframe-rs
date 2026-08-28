@@ -24,6 +24,15 @@ impl Image {
     }
 
     /// Image width in pixels.
+    ///
+    /// # Panics
+    ///
+    /// Never, for an `Image` this crate produced: an `Image` exists only for a frame that
+    /// decoded, and a frame that decoded reported its geometry. The `expect` inside guards
+    /// that internal invariant rather than anything a file can state, so it is outside the
+    /// scope of the crate's "malformed input produces an `Err`, never a panic" contract —
+    /// [`Header::width`] is where a *declared* geometry that has no representable form
+    /// reports `None`. [`Image::height`] and [`Image::channels`] carry the identical rule.
     pub fn width(&self) -> u32 {
         self.header
             .width()
@@ -31,6 +40,10 @@ impl Image {
     }
 
     /// Image height in pixels.
+    ///
+    /// # Panics
+    ///
+    /// Never, for an `Image` this crate produced. See [`Image::width`].
     pub fn height(&self) -> u32 {
         self.header
             .height()
@@ -38,6 +51,10 @@ impl Image {
     }
 
     /// Channel count — `1` after `select_channel`.
+    ///
+    /// # Panics
+    ///
+    /// Never, for an `Image` this crate produced. See [`Image::width`].
     pub fn channels(&self) -> u32 {
         self.header
             .channels()
@@ -64,8 +81,29 @@ impl Image {
         self.data.get(start..start + plane)
     }
 
-    /// Take the sample buffer, dropping the header.
+    /// Take the sample buffer, dropping the header — the shorthand for
+    /// [`Image::into_parts`] when only the pixels are wanted.
+    #[must_use = "into_samples consumes the image and hands back its buffer"]
     pub fn into_samples(self) -> Vec<f32> {
         self.data
+    }
+
+    /// Take both halves.
+    ///
+    /// Without it a caller wanting the header *and* the buffer has to clone the header before
+    /// [`Image::into_samples`] drops it, which is a copy of the metadata collections for no
+    /// reason — the `Image` is being consumed either way.
+    #[must_use = "into_parts consumes the image and hands back both halves"]
+    pub fn into_parts(self) -> (Header, Vec<f32>) {
+        (self.header, self.data)
+    }
+}
+
+/// The whole buffer, for the ordinary generic-over-`AsRef<[f32]>` routine. Exactly
+/// [`Image::samples`]; there is deliberately no `Index`, because [`Image::channel`] returning
+/// an `Option` is the right shape for a bound a caller can exceed.
+impl AsRef<[f32]> for Image {
+    fn as_ref(&self) -> &[f32] {
+        self.samples()
     }
 }

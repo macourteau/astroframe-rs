@@ -149,14 +149,14 @@ fn both_headers_cards_are_always_reported_and_tagged() {
     let header = reader.header().expect("header");
 
     let exptime = header
-        .get("EXPTIME")
+        .keyword("EXPTIME")
         .expect("the primary's EXPTIME is reported");
     assert_eq!(exptime.value(), "120.0");
     assert_eq!(exptime.origin(), KeywordOrigin::PrimaryHeader);
 
     // The extension's own card wins a lookup, because lookup returns the first match in
     // stored order and the extension's cards are stored first.
-    let bitpix = header.get("BITPIX").expect("BITPIX");
+    let bitpix = header.keyword("BITPIX").expect("BITPIX");
     assert_eq!(bitpix.origin(), KeywordOrigin::Image);
     assert_eq!(bitpix.value(), "16");
 
@@ -181,7 +181,7 @@ fn inherit_in_a_primary_header_is_data_not_an_instruction() {
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     assert!(reader.next_image().expect("advance"));
     let header = reader.header().expect("header");
-    assert_eq!(header.get("INHERIT").map(|k| k.value()), Some("T"));
+    assert_eq!(header.keyword("INHERIT").map(|k| k.value()), Some("T"));
     // It gated nothing: the primary's own scaling stands and the frame still decodes.
     assert_eq!(
         header.scaling(),
@@ -192,7 +192,7 @@ fn inherit_in_a_primary_header_is_data_not_an_instruction() {
     );
     assert!(matches!(
         header.bounds(),
-        Bounds::FormatDefault(0.0, 65535.0)
+        Bounds::FormatDefault(range) if range.lo() == 0.0 && range.hi() == 65535.0
     ));
 }
 
@@ -214,7 +214,7 @@ fn blank_is_reported_and_no_sample_is_substituted() {
     let mut reader = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
     assert!(reader.next_image().expect("advance"));
     let header = reader.header().expect("header");
-    assert_eq!(header.get("BLANK").map(|k| k.value()), Some("-32768"));
+    assert_eq!(header.keyword("BLANK").map(|k| k.value()), Some("-32768"));
 
     let mut samples = Samples::zeroed(header.sample_format().expect("format"), 4);
     reader
@@ -247,10 +247,13 @@ fn fits_checksum_keywords_are_reported_and_not_verified() {
     assert!(reader.next_image().expect("advance"));
     let header = reader.header().expect("header");
     assert_eq!(
-        header.get("CHECKSUM").map(|k| k.value()),
+        header.keyword("CHECKSUM").map(|k| k.value()),
         Some("0000000000000000")
     );
-    assert_eq!(header.get("DATASUM").map(|k| k.value()), Some("99999999"));
+    assert_eq!(
+        header.keyword("DATASUM").map(|k| k.value()),
+        Some("99999999")
+    );
     // A deliberately wrong pair; the frame decodes anyway.
     let image = advance_and_decode(&bytes);
     assert_eq!(image[0].to_bits(), 0x0000_0000);
@@ -300,6 +303,23 @@ fn roworder_spellings_normalize_and_unknown_values_survive_verbatim() {
         reader.header().expect("header").row_order(),
         Some(&RowOrder::Unspecified)
     );
+}
+
+/// **A `ROWORDER` card holding only spaces and no `ROWORDER` card at all stay distinguishable
+/// through the re-emission surface.** `classify` trims, so the first is `Other("")`; a
+/// `RowOrder::as_str` returning a bare `&str` would answer both with `""` and lose the
+/// difference between two files, in a crate whose premise is reporting what the file says.
+#[test]
+fn an_absent_roworder_and_an_empty_one_report_different_spellings() {
+    assert_eq!(RowOrder::Unspecified.as_str(), None);
+    assert_eq!(RowOrder::classify("   ").as_str(), Some(""));
+    assert_eq!(RowOrder::classify("  TOP-DOWN ").as_str(), Some("TOP-DOWN"));
+    assert_eq!(RowOrder::classify("SPIRAL").as_str(), Some("SPIRAL"));
+
+    // `Display` collapses the two, one line of output being one line either way — which is
+    // why the distinction lives on `as_str` rather than on the rendering.
+    assert_eq!(RowOrder::Unspecified.to_string(), "");
+    assert_eq!(RowOrder::classify("   ").to_string(), "");
 }
 
 /// **FITS pixel data is big-endian two's-complement, always.** The format carries no attribute

@@ -7,7 +7,7 @@
 //! reviews. If one appears wrong, that is a finding worth raising rather than an edit
 //! worth making.
 
-use astroframe::{Normalizer, Range, Scaling};
+use astroframe::{Normalizer, SampleRange, Scaling};
 
 /// The pinned reference form for a 16-bit unsigned image, written out longhand.
 fn reference_u16(level: u16) -> f32 {
@@ -20,7 +20,10 @@ fn reference_u8(level: u8) -> f32 {
 }
 
 fn unsigned(bits: u32) -> Normalizer {
-    Normalizer::new(None, Range::unsigned_default(bits).expect("standard width"))
+    Normalizer::new(
+        None,
+        SampleRange::unsigned_default(bits).expect("standard width"),
+    )
 }
 
 /// Criterion *Exhaustive `UInt16` normalization*.
@@ -161,7 +164,7 @@ fn wide_integer_levels_collide_in_normalized_output() {
 /// Criterion *Non-finite handling is total*.
 #[test]
 fn non_finite_handling_is_total() {
-    let n = Normalizer::new(None, Range::new(0.0, 1.0).expect("unit range"));
+    let n = Normalizer::new(None, SampleRange::new(0.0, 1.0).expect("unit range"));
 
     assert_eq!(n.normalize(f32::INFINITY).to_bits(), 1.0f32.to_bits());
     assert_eq!(n.normalize(f32::NEG_INFINITY).to_bits(), 0x0000_0000);
@@ -186,7 +189,7 @@ fn non_finite_handling_is_total() {
 
     // NaN is preserved rather than folded to a bound, which is what a `min`/`max` clamp
     // would do. A shifted-range frame reaches the same answer.
-    let shifted = Normalizer::new(None, Range::new(-5.0, 5.0).expect("range"));
+    let shifted = Normalizer::new(None, SampleRange::new(-5.0, 5.0).expect("range"));
     assert!(shifted.normalize(f32::NAN).is_nan());
     assert_eq!(shifted.normalize(f32::NEG_INFINITY).to_bits(), 0x0000_0000);
     assert_eq!(shifted.normalize(f32::INFINITY).to_bits(), 1.0f32.to_bits());
@@ -194,28 +197,34 @@ fn non_finite_handling_is_total() {
 }
 
 /// Criterion *Range validity is one rule about `k`* — the half reachable without a
-/// container. The `with_bounds` half is graded in the reader tests.
+/// container. The `set_bounds` half is graded in the reader tests.
 #[test]
 fn range_validity_is_one_rule_about_k() {
     // The cases an endpoint check also catches.
-    assert!(Range::new(1.0, 1.0).is_none(), "lo == hi");
-    assert!(Range::new(2.0, 1.0).is_none(), "lo > hi");
-    assert!(Range::new(f64::NAN, 1.0).is_none(), "non-finite lo");
-    assert!(Range::new(0.0, f64::NAN).is_none(), "non-finite hi");
-    assert!(Range::new(0.0, f64::INFINITY).is_none(), "infinite hi");
-    assert!(Range::new(f64::NEG_INFINITY, 0.0).is_none(), "infinite lo");
+    assert!(SampleRange::new(1.0, 1.0).is_none(), "lo == hi");
+    assert!(SampleRange::new(2.0, 1.0).is_none(), "lo > hi");
+    assert!(SampleRange::new(f64::NAN, 1.0).is_none(), "non-finite lo");
+    assert!(SampleRange::new(0.0, f64::NAN).is_none(), "non-finite hi");
+    assert!(
+        SampleRange::new(0.0, f64::INFINITY).is_none(),
+        "infinite hi"
+    );
+    assert!(
+        SampleRange::new(f64::NEG_INFINITY, 0.0).is_none(),
+        "infinite lo"
+    );
 
     // The cases an endpoint check misses. All three have finite ordered endpoints.
     assert!(
-        Range::new(0.0, 1e-46).is_none(),
+        SampleRange::new(0.0, 1e-46).is_none(),
         "width underflows to zero in f32; every in-range sample would decode to NaN"
     );
     assert!(
-        Range::new(0.0, 5e-45).is_none(),
+        SampleRange::new(0.0, 5e-45).is_none(),
         "width narrows to a subnormal; the frame would decode uniformly white"
     );
     assert!(
-        Range::new(-1e308, 1e308).is_none(),
+        SampleRange::new(-1e308, 1e308).is_none(),
         "width overflows in f64 before the cast; the frame would decode to NaN"
     );
 
@@ -223,7 +232,8 @@ fn range_validity_is_one_rule_about_k() {
     // 2^126 is exact in both f32 and f64; `powi` is banned on this path, so it is built by
     // shift rather than by exponentiation.
     let w126 = (1u128 << 126) as f64;
-    let at_boundary = Range::new(0.0, w126).expect("2^126 is the last width the rule accepts");
+    let at_boundary =
+        SampleRange::new(0.0, w126).expect("2^126 is the last width the rule accepts");
     assert_eq!(
         at_boundary.reciprocal().to_bits(),
         f32::MIN_POSITIVE.to_bits(),
@@ -235,18 +245,21 @@ fn range_validity_is_one_rule_about_k() {
     let next_width = f64::from(f32::from_bits((w126 as f32).to_bits() + 1));
     assert!(next_width > w126);
     assert!(
-        Range::new(0.0, next_width).is_none(),
+        SampleRange::new(0.0, next_width).is_none(),
         "a normal width whose reciprocal is subnormal is rejected"
     );
-    assert!(Range::new(0.0, 1e38).is_none(), "k = 1.000e-38, subnormal");
     assert!(
-        Range::new(0.0, f64::from(f32::MAX)).is_none(),
+        SampleRange::new(0.0, 1e38).is_none(),
+        "k = 1.000e-38, subnormal"
+    );
+    assert!(
+        SampleRange::new(0.0, f64::from(f32::MAX)).is_none(),
         "k = 2.939e-39, subnormal"
     );
 
     // Knowingly asymmetric the other way: a subnormal *width* whose reciprocal is normal
     // passes, costing one to three mantissa bits.
-    let subnormal_width = Range::new(0.0, 1e-38).expect("subnormal width, normal reciprocal");
+    let subnormal_width = SampleRange::new(0.0, 1e-38).expect("subnormal width, normal reciprocal");
     assert!(!((subnormal_width.hi() - subnormal_width.lo()) as f32).is_normal());
     assert!(subnormal_width.reciprocal().is_normal());
 }
@@ -298,7 +311,7 @@ fn fits_unsigned_convention_matches_the_reference_two_step_form() {
             bscale: 1.0,
             bzero: 32768.0,
         }),
-        Range::unsigned_default(16).expect("16-bit default"),
+        SampleRange::unsigned_default(16).expect("16-bit default"),
     );
 
     for level in 0u16..=u16::MAX {

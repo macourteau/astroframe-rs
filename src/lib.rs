@@ -35,7 +35,7 @@
 //! 65 536 `UInt16` levels and on 126 of 256 `UInt8` levels. Which is *more* accurate is not
 //! the point — the point is that one of them has to be chosen and written down, because a
 //! consumer comparing this crate's output against another decoder's needs to know which.
-//! See [`normalize`] and `docs/intentional-patterns.md`.
+//! See [`Normalizer`] and `docs/intentional-patterns.md`.
 //!
 //! **The decoded bits are part of the public API.** A release that changes one ULP of output
 //! for an input it previously decoded is a breaking change.
@@ -48,7 +48,7 @@
 //! # fn main() -> astroframe::Result<()> {
 //! let mut reader = Reader::open("frame.fits")?;
 //! while reader.next_image()? {
-//!     let header = reader.header().expect("an advanced reader has a header");
+//!     let header = reader.current_header()?;
 //!     if header.decline_reason().is_some() {
 //!         continue; // a position this version will not decode
 //!     }
@@ -61,7 +61,8 @@
 //! Tier 1 is the header alone — constructing a `Reader` reads no pixel byte. Tier 2 decodes a
 //! whole image into a destination. Tier 3 is chunked delivery, and tier 2 is implemented on
 //! top of it, which makes "streamed and whole-buffer decode produce bit-identical buffers"
-//! true by construction rather than by two code paths agreeing.
+//! true by construction rather than by two code paths agreeing — and a tier-3 caller reaches
+//! the same guarantee by handing [`Reader::normalizer`] to [`Chunk::normalize_into`].
 //!
 //! # Streaming is real, and the API says how real before you decode
 //!
@@ -105,15 +106,20 @@
 // of the rendered crate documentation, which covers the same ground in its own words.
 #![cfg_attr(doctest, doc = include_str!("../README.md"))]
 
-pub mod error;
-pub mod header;
-pub mod image;
-pub mod limits;
-pub mod metadata;
-pub mod normalize;
-pub mod reader;
-pub mod samples;
-pub mod source;
+// Every public item has exactly one stable path: the modules are private and the root
+// re-exports them. Publishing both `astroframe::Error` and `astroframe::error::Error` would
+// document each type twice and semver-lock nine module paths for nothing — a caller writes
+// one `use astroframe::{…}` either way. What the modules keep is their `//!` prose, which is
+// maintainer-facing; the part a caller needs lives on the types, where it is met.
+pub(crate) mod error;
+pub(crate) mod header;
+pub(crate) mod image;
+pub(crate) mod limits;
+pub(crate) mod metadata;
+pub(crate) mod normalize;
+pub(crate) mod reader;
+pub(crate) mod samples;
+pub(crate) mod source;
 
 #[cfg(feature = "fits")]
 pub(crate) mod fits;
@@ -122,8 +128,8 @@ pub(crate) mod xisf;
 
 pub use error::{Error, Result};
 pub use header::{
-    Bounds, BoundsUnavailable, ColorSpace, DeclineClass, DeclineReason, Granularity, Header,
-    ImageType, Orientation, PixelStorage, RowOrder,
+    Bounds, BoundsUnavailable, ColorSpace, DeclineClass, DeclineReason, Format, Geometry,
+    Granularity, Header, ImageType, Orientation, PixelStorage, RowOrder,
 };
 pub use image::Image;
 pub use limits::Limits;
@@ -132,7 +138,7 @@ pub use metadata::{
     Properties, Property, PropertyIter, PropertyScope, PropertyType, PropertyValue, Resolution,
     ResolutionUnit, ValueKind,
 };
-pub use normalize::{Normalizer, Range, Sample, Scaling};
+pub use normalize::{Normalizer, Sample, SampleRange, Scaling};
 pub use reader::{Chunk, Chunks, Reader};
-pub use samples::{SampleFormat, SampleSlice, Samples};
+pub use samples::{F64Iter, SampleFormat, SampleSlice, Samples};
 pub use source::{Seekable, Sequential, Source};

@@ -1,40 +1,48 @@
-//! The caps.
-//!
-//! A per-[`Reader`](crate::Reader) parameter rather than a compile-time constant or a
-//! global, because **both directions are real**. A service accepting uploads wants them
-//! tighter than the defaults; a workstation tool wants the output-byte cap raised, since
-//! 2³⁰ bytes is 268 megapixels at `f32` and an ordinary 3× drizzle of a 61 MP frame is
-//! refused by the default.
-//!
-//! Two mechanisms for the same knob were rejected, both because they let one consumer's
-//! choice reach another's. A **cargo feature** unifies across the whole dependency graph and
-//! the union takes the loosest value, so a feature any crate in a build enables silently
-//! raises the caps for a header-only consumer that never asked. A **library-global
-//! initializer** is the same hazard at runtime, plus an ordering trap: a `Reader` built
-//! before the initializer runs gets different limits from one built after, and neither call
-//! site says so.
-//!
-//! The one real cost is accepted rather than argued away: a caller can set a cap high enough
-//! to offer no protection. That appears in the caller's own source, which is the difference
-//! between this and the two rejected mechanisms.
-//!
-//! ```
-//! use astroframe::Limits;
-//!
-//! let mut limits = Limits::default();
-//! limits.decoded_output_bytes = 4 << 30; // this caller produced these frames itself
-//! ```
+//! The caps. The user-facing prose lives on [`Limits`] itself, which is where a caller meets
+//! it.
 
 use crate::error::{Error, Result};
 
 /// Per-`Reader` caps. Tripping one is [`Error::LimitExceeded`].
 ///
-/// Fixed for a reader's life, with no setter: the header parse the constructor performs is
-/// already subject to them, and a cap that could change afterwards would have to describe
-/// which of the two settings governed the bytes already read.
+/// A per-[`Reader`](crate::Reader) parameter rather than a compile-time constant or a global,
+/// because **both directions are real**. A service accepting uploads wants them tighter than
+/// the defaults; a workstation tool wants the output-byte cap raised, since 2³⁰ bytes is 268
+/// megapixels at `f32` and an ordinary 3× drizzle of a 61 MP frame is refused by the default.
 ///
-/// Built from [`Limits::default()`] and mutated — `#[non_exhaustive]` so a later cap is an
-/// addition rather than a break.
+/// Two mechanisms for the same knob were rejected, both because they let one consumer's
+/// choice reach another's. A **cargo feature** unifies across the whole dependency graph and
+/// the union takes the loosest value, so a feature any crate in a build enables silently
+/// raises the caps for a header-only consumer that never asked. A **library-global
+/// initializer** is the same hazard at runtime, plus an ordering trap: a `Reader` built
+/// before the initializer runs gets different limits from one built after, and neither call
+/// site says so.
+///
+/// The one real cost is accepted rather than argued away: a caller can set a cap high enough
+/// to offer no protection. That appears in the caller's own source, which is the difference
+/// between this and the two rejected mechanisms.
+///
+/// Fixed for a reader's life, with no setter *on the reader*: the header parse the
+/// constructor performs is already subject to them, and a cap that could change afterwards
+/// would have to describe which of the two settings governed the bytes already read.
+///
+/// Built from [`Limits::default()`] — `#[non_exhaustive]` so a later cap is an addition
+/// rather than a break — and then either mutated field by field or chained through the
+/// `with_*` setters, which exist for the four caps a caller actually moves:
+///
+/// ```
+/// use astroframe::Limits;
+///
+/// // This caller produced these frames itself.
+/// let generous = Limits::default().with_decoded_output_bytes(4 << 30);
+///
+/// // The same thing written as a mutation. The fields stay public: they are the mechanism,
+/// // and a setter per cap would be eighteen methods restating eighteen field names.
+/// let mut limits = Limits::default();
+/// limits.decoded_output_bytes = 4 << 30;
+/// limits.xml_depth = 16;
+/// assert_eq!(generous.decoded_output_bytes, limits.decoded_output_bytes);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
@@ -136,6 +144,36 @@ pub struct Limits {
     ///
     /// Inherited from an XISF decoder where multi-image is rare; FITS MEF is where it binds.
     pub images_per_source: u32,
+}
+
+impl Limits {
+    /// [`Limits::decoded_output_bytes`], chained.
+    #[must_use]
+    pub fn with_decoded_output_bytes(mut self, bytes: u64) -> Self {
+        self.decoded_output_bytes = bytes;
+        self
+    }
+
+    /// [`Limits::total_samples`], chained.
+    #[must_use]
+    pub fn with_total_samples(mut self, samples: u64) -> Self {
+        self.total_samples = samples;
+        self
+    }
+
+    /// [`Limits::materialized_bytes`], chained.
+    #[must_use]
+    pub fn with_materialized_bytes(mut self, bytes: u64) -> Self {
+        self.materialized_bytes = bytes;
+        self
+    }
+
+    /// [`Limits::images_per_source`], chained.
+    #[must_use]
+    pub fn with_images_per_source(mut self, images: u32) -> Self {
+        self.images_per_source = images;
+        self
+    }
 }
 
 impl Default for Limits {

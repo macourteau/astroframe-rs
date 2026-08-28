@@ -193,7 +193,49 @@ pub enum SampleSlice<'a> {
     F64(&'a [f64]),
 }
 
-impl SampleSlice<'_> {
+impl<'a> SampleSlice<'a> {
+    /// The run as one sample width, or `None` when it holds another.
+    ///
+    /// The nine-arm match written once, for a consumer that has already read
+    /// [`SampleSlice::format`] and wants the slice typed.
+    ///
+    /// ```
+    /// use astroframe::{SampleFormat, SampleSlice, Samples};
+    ///
+    /// let owned = Samples::zeroed(SampleFormat::U16, 3);
+    /// assert_eq!(owned.as_slice().try_as::<u16>().map(<[u16]>::len), Some(3));
+    /// assert_eq!(owned.as_slice().try_as::<f32>(), None);
+    /// ```
+    pub fn try_as<T: crate::normalize::Sample>(self) -> Option<&'a [T]> {
+        <T as crate::normalize::sealed::Sealed>::from_slice(self)
+    }
+
+    /// Every sample widened to `f64`, whatever width the run holds.
+    ///
+    /// The one operation a consumer summarizing native samples always ends up writing by
+    /// hand, and it is [`Sample::widen`](crate::Sample::widen) — the same widening step 1 of
+    /// the normalization performs — applied element by element, so no rounding enters that
+    /// was not already in the contract. For `U64` and `I64` it is lossy above 2⁵³, exactly as
+    /// `widen` is.
+    ///
+    /// ```
+    /// use astroframe::{SampleFormat, Samples};
+    ///
+    /// let owned = Samples::U16(vec![0, 32768, 65535]);
+    /// let widened: Vec<f64> = owned.as_slice().iter_f64().collect();
+    /// assert_eq!(widened, [0.0, 32768.0, 65535.0]);
+    /// ```
+    ///
+    /// The cursor is [`F64Iter`], a named type: its length is known before the first step and
+    /// it walks from either end, and an `impl Trait` return hides both.
+    pub fn iter_f64(self) -> F64Iter<'a> {
+        F64Iter {
+            slice: self,
+            at: 0,
+            end: self.len(),
+        }
+    }
+
     /// Which variant this is.
     pub fn format(&self) -> SampleFormat {
         match self {
@@ -219,6 +261,66 @@ impl SampleSlice<'_> {
         self.len() == 0
     }
 }
+
+/// What [`SampleSlice::iter_f64`] returns: a cursor over the borrowed run, widening each
+/// sample to `f64` as it goes.
+///
+/// A cursor rather than nine chained `map` iterators behind a `Box<dyn Iterator>`: the boxed
+/// spelling is shorter and costs one allocation per call, which a per-chunk caller pays once
+/// per chunk for no gain.
+///
+/// Named, for the reason [`KeywordIter`](crate::KeywordIter) is. Returning it as
+/// `impl Iterator<Item = f64>` would hide the traits it carries — a consumer sizing a
+/// destination from `len()` before the walk, or reading a run backwards, would be told the
+/// method does not exist.
+#[derive(Clone, Debug)]
+pub struct F64Iter<'a> {
+    slice: SampleSlice<'a>,
+    /// The next index from the front.
+    at: usize,
+    /// One past the next index from the back, so the two ends meet at `at == end`.
+    end: usize,
+}
+
+impl Iterator for F64Iter<'_> {
+    type Item = f64;
+
+    fn next(&mut self) -> Option<f64> {
+        use crate::normalize::Sample;
+
+        let at = self.at;
+        if at >= self.end {
+            return None;
+        }
+        let widened =
+            samples_dispatch!(SampleSlice, self.slice, v => v.get(at).map(|s| Sample::widen(*s)))?;
+        self.at = at + 1;
+        Some(widened)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.end - self.at;
+        (left, Some(left))
+    }
+}
+
+impl DoubleEndedIterator for F64Iter<'_> {
+    fn next_back(&mut self) -> Option<f64> {
+        use crate::normalize::Sample;
+
+        if self.at >= self.end {
+            return None;
+        }
+        let last = self.end - 1;
+        let widened = samples_dispatch!(SampleSlice, self.slice, v => v.get(last).map(|s| Sample::widen(*s)))?;
+        self.end = last;
+        Some(widened)
+    }
+}
+
+impl ExactSizeIterator for F64Iter<'_> {}
+
+impl std::iter::FusedIterator for F64Iter<'_> {}
 
 /// One row's samples, sliced to the caller's declared chunk length.
 ///

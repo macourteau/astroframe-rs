@@ -12,7 +12,7 @@
 //! cargo run --example 04_metadata -- frame.xisf DATE-OBS EXPTIME
 //! ```
 
-use astroframe::{PropertyValue, Reader};
+use astroframe::Reader;
 
 fn main() -> astroframe::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -27,7 +27,7 @@ fn main() -> astroframe::Result<()> {
         println!("no image positions in {path}");
         return Ok(());
     }
-    let header = reader.header().expect("an advanced reader has a header");
+    let header = reader.current_header()?;
 
     if wanted.is_empty() {
         // Keywords are reported in file order, duplicates and all — a FITS header may carry
@@ -56,9 +56,12 @@ fn main() -> astroframe::Result<()> {
         // XISF properties are typed, unlike FITS keywords which are all text.
         println!("properties ({}):", header.properties().len());
         for property in header.properties().iter().take(20) {
-            let rendered = match property.value() {
-                PropertyValue::Text(t) => format!("{t:?}"),
-                other => format!("{other:?}"),
+            // `as_str()` is a projection of the stored text, not a parse: turning it into a
+            // number or a timestamp means picking a grammar, and that is your step. `None`
+            // means the value lives in a data block this version does not read.
+            let rendered = match property.value().as_str() {
+                Some(text) => format!("{text:?}"),
+                None => "(in a data block this version does not read)".to_owned(),
             };
             println!("  {:<34} {rendered}", property.id());
         }
@@ -68,10 +71,19 @@ fn main() -> astroframe::Result<()> {
     } else {
         // Lookup is exact and does **not** case-fold: FITS keyword names are upper-case by
         // convention and this crate does not repair a file that disagrees.
+        // Both surfaces answer the same shape of question, and both take the **first** match
+        // in file order — a name may repeat, and every occurrence stays reachable through
+        // `keywords()`/`properties()`.
         for name in &wanted {
-            match header.get(name) {
-                Some(keyword) => println!("{name} = {}", keyword.value()),
-                None => println!("{name} is not present"),
+            if let Some(keyword) = header.keyword(name) {
+                println!("{name} = {}", keyword.value());
+            } else if let Some(property) = header.property(name) {
+                println!(
+                    "{name} = {}",
+                    property.value().as_str().unwrap_or("(unavailable)")
+                );
+            } else {
+                println!("{name} is not present");
             }
         }
     }

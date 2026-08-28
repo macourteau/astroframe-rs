@@ -30,23 +30,26 @@ fn survey(path: &str) -> astroframe::Result<()> {
     // A file holds one or more image *positions*: FITS calls them HDUs, XISF calls them
     // <Image> elements. `next_image` walks both and returns false at the end.
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        // Past a successful advance a header always exists, so this is a `Result` rather
+        // than an `Option`.
+        let header = reader.current_header()?;
 
         // A position this version will not decode says so, in a class and a sentence, rather
         // than by erroring — and the rest of the file still walks.
         if let Some(decline) = header.decline_reason() {
-            println!("declined ({:?}): {}", decline.class(), decline.reason());
+            println!("declined: {decline}");
             continue;
         }
 
-        if let (Some(w), Some(h), Some(c)) = (header.width(), header.height(), header.channels()) {
-            println!("{w} x {h} x {c}");
+        // The three axes move as a unit, so they are read as one value.
+        if let Some(g) = header.geometry() {
+            println!("{} x {} x {}", g.width, g.height, g.channels);
         }
 
         // Where the normalization range came from is reported, never guessed at.
         match header.bounds() {
-            Bounds::Declared(lo, hi) => println!("bounds {lo}..{hi} (declared by the file)"),
-            Bounds::FormatDefault(lo, hi) => println!("bounds {lo}..{hi} (format default)"),
+            Bounds::Declared(r) => println!("bounds {}..{} (declared by the file)", r.lo(), r.hi()),
+            Bounds::FormatDefault(r) => println!("bounds {}..{} (format default)", r.lo(), r.hi()),
             other => println!("bounds {other:?}"),
         }
     }

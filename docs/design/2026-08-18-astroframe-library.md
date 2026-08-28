@@ -152,6 +152,7 @@ One rule generates most of this design:
 | XISF `offset="0.01"` | Subtract it | Report it; subtract nothing. §11.5.2 calls it "also known as *pedestal*" and places the subtraction in calibration and integration processes — i.e. in a consumer |
 | A keyword the consumer cares about (`EGAIN`, `RA`, `SITELAT`) | Parse and interpret it | Report the value as text, verbatim |
 | A frame outside some consumer's validated envelope | Mark it "unvalidated" | Report the facts (sample format, bounds provenance, scaling) the consumer's predicate needs |
+| Which container the file is | Leave the caller to infer it from an accessor reported for something else | Report it: `Format::Fits` or `Format::Xisf`, from `Reader::format()` and `Header::format()` |
 
 The one transformation it does apply is normalization, because without it there is no
 defined pixel value at all — and even that is reachable un-applied, through the
@@ -319,7 +320,7 @@ ranges the endpoints are exact and that is pinned. For an arbitrary declared `bo
 the width's mantissa, so the answer is exhaustive rather than sampled — over all 2²³
 mantissas, **84.6533%** land exactly on `1.0` and **15.3467%** land one ULP low
 (`0x3F7FFFFF`). None land high, so the saturating clamp cannot repair it. Every XISF
-float frame and every `with_bounds` call is in that regime. This is inherent to
+float frame and every `set_bounds` call is in that regime. This is inherent to
 computing a reciprocal and multiplying, which is the form the contract requires; it is
 recorded rather than fixed, and it is why the endpoint-exactness claim is scoped to
 default integer ranges wherever it appears.
@@ -359,7 +360,7 @@ matching no row is one this version declines (§ Format support matrix).
 | FITS integer `BITPIX`, scaled by the FITS unsigned convention | `0`, `2ⁿ − 1` | FITS unsigned-integer convention |
 | FITS integer `BITPIX`, any other `BSCALE`/`BZERO` | **none — no normalized output** | The physical values do not land in `[0, 2ⁿ − 1]`, so there is no range to normalize against without inventing one |
 | FITS float `BITPIX` (−32, −64) | **none — no normalized output** | FITS defines no *representable* range for floats. `DATAMIN`/`DATAMAX` are reported as ordinary keywords, not consumed: they describe the range the data *occupies*, not the range it is *displayed against*, and conflating the two would rescale every frame by its own content |
-| Any source, caller override | whatever the caller supplies | `Reader::with_bounds(lo, hi)` |
+| Any source, caller override | whatever the caller supplies | `Reader::set_bounds(lo, hi)` |
 
 **One validity rule governs every range, however it arrives — and it is a rule about
 `k`, not about the endpoints.** Checking the endpoints is the obvious formulation and it
@@ -372,7 +373,7 @@ is not sufficient:
 | `-1e308`, `1e308` | yes | `+Inf` (already in `f64`) | `+0.0` | `+0.0` at `lo`, `NaN` everywhere else |
 
 All three are reachable from a file-declared `bounds` — §8.3.3 admits any float spelling
-— and from `Reader::with_bounds`, and all three produce a frame that looks like a decode
+— and from `Reader::set_bounds`, and all three produce a frame that looks like a decode
 rather than a failure. So the rule is stated on the computed value:
 
 > A range is valid when `k = 1.0f32 / ((hi - lo) as f32)` is **finite, positive and
@@ -392,13 +393,13 @@ rather than excluded, because such a range is not a plausible image and the rule
 is to catch the frames that come out uniformly black, white or NaN. Rejecting non-finite
 or reversed endpoints falls out of the same rule.
 
-**The rule applies identically to a file-declared `bounds` and to `with_bounds`, but not
+**The rule applies identically to a file-declared `bounds` and to `set_bounds`, but not
 at the same phase and not with the same blast radius.** `bounds` affects only
 normalization, so an invalid declared pair does not condemn the file: the header parses,
 `bounds()` reports `Unavailable(InvalidDeclared)`, native samples decode as always, and
-only `read_image_into` refuses — with `with_bounds` as the same escape hatch the
+only `read_image_into` refuses — with `set_bounds` as the same escape hatch the
 FITS-float row uses. Rejecting the whole source would contradict the layering.
-`with_bounds` returns `Result`, refuses the same values as `InvalidRequest`, and may be
+`set_bounds` returns `Result`, refuses the same values as `InvalidRequest`, and may be
 called only before the pixel phase begins. **Its operands are physical values** —
 post-`BSCALE`/`BZERO`, the units step 2 works in — so on a `BITPIX = 16`, `BZERO = 32768`
 frame the pair that reproduces the default range is `(0, 65535)`, and `(-32768, 32767)`
@@ -416,7 +417,7 @@ storage type onto its unsigned range — `0` for `BITPIX = 8`, `32768` for 16,
 occupy `[0, 2ⁿ − 1]`. Any other pairing is refused rather than normalized: a genuinely
 signed frame (`BITPIX = 16`, `BZERO = 0`) would otherwise have half its levels saturate
 to black, and a rescaled frame (`BSCALE = 0.001`) would normalize to a sliver near zero.
-Both would *look* like images and be wrong. Refusing costs the caller one `with_bounds`
+Both would *look* like images and be wrong. Refusing costs the caller one `set_bounds`
 call and tells them a decision is needed.
 
 A decoder that enforced `BSCALE = 1` while placing no constraint on `BZERO` would admit a
@@ -438,20 +439,29 @@ bytes have been turned into.
         ┌──────────────────────────────────────────────────┐
         │  Reader<S>                                       │
         │                                                  │
+        │  known from construction                         │
+        │    · format() -> Format                          │
+        │    · is_seekable() -> bool                       │
+        │    · limits() -> &Limits                         │
+        │                                                  │
         │  header phase — parsed at construction           │
         │    · header() -> Option<Header>         [tier 1] │
+        │    · current_header() -> Result<Header> [tier 1] │
         │        · geometry · keywords · properties        │
         │        · row_order() · granularity()             │
         │    · next_image()                                │
         │                                                  │
         │  configuration — before the pixel phase          │
-        │    · with_bounds(lo, hi)                         │
+        │    · set_bounds(lo, hi)                          │
         │    · select_channel(k)                           │
         │                                                  │
         │  pixel phase — on demand                         │
+        │    · destination_len() -> Result<usize>          │
+        │    · normalizer() -> Result<Normalizer>          │
         │    · chunks() -> Chunks                 [tier 3] │
         │    · for_each_chunk(|chunk| ..)         [tier 3] │
         │    · read_samples_into(&mut Samples)    [tier 2] │
+        │    · read_samples() -> Samples          [tier 2] │
         │    · read_image_into(&mut [f32])        [tier 2] │
         │    · read_image() -> Image              [tier 2] │
         └──────────────────────────────────────────────────┘
@@ -489,8 +499,10 @@ diverge: the range is always the destination's, the channel index always the fil
 extent is the reader's choice and is independent of `Granularity` — a `WholeImage` source
 still delivers chunks, it simply had to read everything before the first one. Callers
 wanting normalized `f32` use tier 2, or normalize a chunk themselves with the same public
-primitive, which is what makes the *Streaming equals whole-buffer* criterion's bit-identity
-assertion meaningful rather than tautological.
+primitive — `reader.normalizer()` once for the image, `chunk.normalize_into(&n, dst)` per
+chunk — which is what makes the *Streaming equals whole-buffer* criterion's bit-identity
+assertion meaningful rather than tautological: the assembled buffer is compared against
+`read_image_into`, and both ran the same primitive rather than two copies of it.
 
 Two spellings, one of them a wrapper over the other:
 
@@ -508,7 +520,9 @@ Two spellings, one of them a wrapper over the other:
 The pull form is primary because it composes: a caller can stop early, interleave work,
 or keep the reader alive across calls.
 
-**The public type surface.** Three data types carry the payload. `Header` is everything
+**The public type surface.** `Format` says which container a source is — reported for the
+reason everything else is, and reported *as a fact* rather than left to be reconstructed from
+`scaling().is_some()`. Three data types carry the payload. `Header` is everything
 parsed before pixels. `Image` is a decoded frame — a `Header` plus normalized `f32`,
 with `channel(k)` slicing one channel out. `Samples` is the native-sample counterpart:
 an enum over exactly the scalar widths the two formats can store — `U8`, `U16`, `U32`,
@@ -518,9 +532,10 @@ variants exist for FITS, where `BITPIX` 16, 32 and 64 store *signed* integers;
 `BITPIX = 8` is unsigned and XISF has no signed formats at all, so no source can produce
 an `I8`. Native samples are what the file holds, so the FITS unsigned convention stays
 entirely in layer 2 where `BSCALE`/`BZERO` live. Alongside them the crate exposes
-`Error`, `Limits`, the enums the accessor table names, the `Chunks` cursor, and — reachable
-independently of any format, which is what lets a features-off build still be useful —
-the normalization primitive itself.
+`Error`, `Limits`, the enums the accessor table names, the `Chunks` cursor, the three named
+iterator types (`KeywordIter`, `PropertyIter`, `IterF64`), and — reachable independently of
+any format, which is what lets a features-off build still be useful — the normalization
+primitive itself, with the `SampleRange` it maps against.
 
 **One output type, format-specific machinery, no public trait.** `Header` and `Image`
 are shared by both formats — that is the point, since the output is normalized and
@@ -536,6 +551,7 @@ exposes them as typed accessors, format-independent where the two formats agree:
 
 | Group | Accessors | Notes |
 | --- | --- | --- |
+| Container | `format()` | `Fits` or `Xisf`. A fact about the file, so § The organizing principle puts it here rather than leaving a caller to infer it from an accessor reported for another purpose — `scaling().is_some()` was that inference. `Reader::format()` answers the same question before any advance |
 | Geometry | `width`, `height`, `channels`, `sample_format` | Typed fields, never keyword lookups — an XISF frame need not carry `NAXIS1` at all. All four are `Option`, and the three geometry accessors are reported **as a unit** — all `Some` or all `None`, since a partial geometry is not a state this crate produces. The rule over all four is that `Header` reports `None` for any geometry or sample-format fact whose declared value has no representable form in this crate's model; that is the whole of the collision between a closed output type and `header()` still reporting what it can, and the `None` set is enumerated below |
 | Provenance | `bounds()`, `scaling()` | The range actually in force and where it came from; enumerated below |
 | Orientation | `row_order()`, `orientation()` | FITS `ROWORDER` and XISF `orientation`, reported, applied to nothing |
@@ -544,7 +560,7 @@ exposes them as typed accessors, format-independent where the two formats agree:
 | Identity | `image_id()`, `image_uuid()`, `image_type()`, `channel_index()` | XISF `id`, `uuid`, `imageType`. Without these a caller stepping through a multi-image file cannot tell which image it holds |
 | Delivery | `granularity()` | § Streaming |
 | Decodability | `decline_reason()` | `None` for an image this version will decode; `Some` on a declined position, carrying the class and the reason. Without it a batch consumer would have to size a buffer and call `read_image_into` speculatively just to learn a frame is undecodable |
-| Metadata | `keywords()`, `properties()` | The two text surfaces |
+| Metadata | `keywords()`, `properties()`, `keyword(name)`, `property(id)` | The two text surfaces, and one exact-match lookup into each. Both lookups are named for the surface they search: two text surfaces on one type cannot share a `get`, since nothing in the name would say which is reached. Both take the first match in stored order |
 | Mosaic and display | `cfa()`, `resolution()`, `display_function()` | Reported, never applied; each resolved through `Reference`. All three return `Option`, and all three are `None` on a FITS frame, which defines none of the concepts. On an XISF image `resolution()` and `display_function()` report their specification-defined defaults when the element is absent — 72.0 ppi (§11.11), the identity display function (§11.9) — while `cfa()` has no default, because absence there means the image is not mosaiced. Those defaults answer an **absent** element; an element the file carries and this crate cannot read declines the position instead (§ Errors → Validation order). Where an image carries several of one element, the first in document order is reported and the rest ignored — selection among well-formed elements, not a fault |
 
 **Where the four `Option` geometry accessors report `None`.** All four are `Some` at every
@@ -576,15 +592,15 @@ for the declined one.
 | State | Meaning |
 | --- | --- |
 | `Unavailable(reason)` | No usable range exists, and it **carries which** — `NoFormatDefault` for a FITS float frame or FITS integer scaling outside the unsigned convention, `InvalidDeclared` for any image whose declared `bounds` is missing or fails the validity rule. The two raise different classes from `read_image_into` (`Unsupported` and `Malformed`), so a caller holding an `Unavailable` must be able to tell them apart. `InvalidDeclared` applies to **integer** images too |
-| `FormatDefault(lo,hi)` | The format's own default applied. It carries the pair, so a tier-3 caller normalizing chunks with the public primitive reads the range directly instead of re-deriving it from the sample width |
-| `Declared(lo,hi)` | The file stated this range |
-| `CallerSupplied { effective, declared }` | `with_bounds` overrode whatever the file said. `declared` still reports what the file stated — the file's own text verbatim whenever it declared a `bounds` at all, usable or not, and `None` only when it declared none — so an override never erases the evidence |
+| `FormatDefault(SampleRange)` | The format's own default applied. It carries the **validated `SampleRange`**, not a pair of `f64`, so a tier-3 caller normalizing chunks with the public primitive builds a `Normalizer` from it directly instead of re-deriving the range from the sample width and re-validating what this crate has already checked. `range.lo()` and `range.hi()` are the endpoints |
+| `Declared(SampleRange)` | The file stated this range |
+| `CallerSupplied { effective: SampleRange, declared }` | `set_bounds` overrode whatever the file said. `declared` still reports what the file stated — the file's own text verbatim whenever it declared a `bounds` at all, usable or not, and `None` only when it declared none — so an override never erases the evidence. The variant is itself `#[non_exhaustive]`, since the attribute on the enum says nothing about a struct variant's fields, and a caller matches `{ effective, .. }` |
 
 `scaling()` reports `None` or `Fits { bscale, bzero }`. FITS **always** reports `Fits`,
-materializing the `BSCALE = 1`, `BZERO = 0` defaults when the keywords are absent, so
-`None` unambiguously means XISF. An accessor whose format does not define the concept
-returns `None` rather than a fabricated value — `orientation()` on a FITS frame,
-`scaling()` on an XISF one.
+materializing the `BSCALE = 1`, `BZERO = 0` defaults when the keywords are absent. An
+accessor whose format does not define the concept returns `None` rather than a fabricated
+value — `orientation()` on a FITS frame, `scaling()` on an XISF one — and `format()` is what
+a caller asks which format it is holding, rather than reading that off one of these `None`s.
 
 **`header()` returns an owned `Option<Header>`, not a borrow.** A borrow would hold
 `Reader` immutably while every pixel-phase method needs `&mut self`, so the obvious
@@ -635,9 +651,9 @@ with a redundant clause.
 **Phases, and what resets.** The pixel phase begins at the first call that reads pixel
 bytes — `chunks()`, `for_each_chunk`, or any `read_*`. Constructing a `Chunks` cursor is
 enough; the boundary is not deferred to the first `next_chunk()`, because a caller
-holding a cursor has already committed the reader. `with_bounds` and `select_channel`
+holding a cursor has already committed the reader. `set_bounds` and `select_channel`
 are rejected from that point with `InvalidRequest`. Reader state is **per-image**:
-`with_bounds` and `select_channel` apply to the currently selected image and are cleared
+`set_bounds` and `select_channel` apply to the currently selected image and are cleared
 on `next_image()` — the alternative silently carries a `Float32` image's bounds onto the
 `UInt16` image after it, which a multi-image XISF file makes reachable.
 
@@ -709,7 +725,10 @@ seekable source; on a sequential one it is `Unsupported`.
   not an error.
 - Every public enum except `Samples` and the borrowed chunk-sample mirror is
   `#[non_exhaustive]`; those two are deliberately closed, for the reason § Deferred and
-  out of scope gives.
+  out of scope gives. The attribute on an enum says nothing about a **struct variant's
+  fields**, so the two struct variants — `Bounds::CallerSupplied` and `Granularity::Block` —
+  carry it themselves as well. A caller matches them with a trailing `..`, and adding a field
+  to either is then an addition rather than a break.
 - `Reader` is `Send` when its source is, and `Sync` when its source is. That every useful
   method takes `&mut self` does not bear on it: `Sync` is about whether sharing a `&T` across
   threads is *sound*, not about whether `&T`'s API does anything useful. `Reader` holds no
@@ -723,7 +742,7 @@ seekable source; on a sequential one it is `Unsupported`.
   produced in its own captured state, which is also how it returns an error of its own.
 - `select_channel` may be called again before the pixel phase begins, and the last call
   wins; it narrows from the *file's* channels each time, not from the previous narrowing.
-- `with_bounds` may likewise be called again before the pixel phase begins, and the last
+- `set_bounds` may likewise be called again before the pixel phase begins, and the last
   call wins. A second call is **not** `InvalidRequest`. It sets per-image state that
   `next_image()` clears, per *Phases, and what resets* above — not a builder step — and a
   Rust setter overwrites. Erroring would make a caller track whether it had already called,
@@ -736,6 +755,65 @@ seekable source; on a sequential one it is `Unsupported`.
 - `offset()` reports §11.5.2's `0` default when the attribute is absent, in the same way
   `resolution()` and `display_function()` report theirs. All three defaults belong to XISF,
   so all three accessors report `None` on a FITS frame rather than the number.
+- `current_header()` is `header()` as a `Result`. `header()` keeps its `Option`, which is a
+  fact about a reader *before* its first advance; inside the documented
+  `while next_image()? { … }` loop that `None` is unreachable, and a library whose headline
+  snippet opens with an `expect` on its own invariant teaches callers to panic on one. The
+  error is the `InvalidRequest` the pixel-phase entry points already produce for the same
+  mistake. A borrow-guard typestate was considered and rejected: every misuse — reading
+  before the first advance, reading after the walk ends, a stale header across
+  `select_channel`, retrying a failed decode, rewinding a sequential source — already returns
+  a precise `InvalidRequest` rather than misbehaving, and `next_image()` returning
+  `Ok(false)` cannot hand back a differently-typed reader without wrecking the loop.
+- `destination_len()` and `normalizer()` are the two numbers a tier-3 caller needs and would
+  otherwise reconstruct. Both read the reader's **current** header rather than taking one, so
+  both fold `select_channel` and `set_bounds` in; a caller-supplied header could be a stale
+  one, and a stale one sizes the wrong buffer or normalizes against the wrong range. The
+  pixel-phase rule is the same one `channels()` states: configure, then ask.
+- `Chunk::normalize_into(&normalizer, dst)` is what tier 2 calls per chunk. It is what makes
+  "normalize a chunk yourself with the same public primitive" a call rather than a
+  reimplementation of the nine-arm sample dispatch, and it is what the *Streaming equals
+  whole-buffer* criterion grades — the test assembles through this and compares against
+  `read_image_into`, so the two paths cannot agree by both being wrong in a copy.
+- `read_samples()` is to `read_samples_into` what `read_image()` is to `read_image_into`: it
+  sizes and types the buffer from the header itself, so the two ways a hand-built destination
+  is rejected cannot arise.
+- The nine modules are private and the root re-exports them, so every public item has exactly
+  one stable path. Publishing both `astroframe::Error` and `astroframe::error::Error` would
+  document each type twice and semver-lock nine module paths a caller never writes.
+- `Source` is a bare marker. Its operations are the decoders' interface to the bytes, and the
+  trait is sealed and its implementations unconstructable from outside, so rendering them as
+  public methods would advertise an extension point the trait's own first line denies. The one
+  operation a *caller* needs is answered on the reader instead: `Reader::is_seekable()`, since
+  the documented moves depend on it — re-decoding an image needs a fresh `chunks()` cursor,
+  which a seekable source allows and a sequential one refuses, and an XISF block behind the
+  cursor is `Unsupported` on one and not the other. Generic code written to the bound
+  `fn run<S: Source>(..)` has no other way to ask.
+- **Prefixes carry contracts.** `with_` is the builder prefix and belongs to `Limits`, whose
+  setters consume and return `Self` so a caller chains them. `set_bounds` and `select_channel`
+  are imperative configuration on a live reader: `&mut self`, `Result<()>`, no chaining. One
+  prefix over both contracts is what makes `reader.set_bounds(..).select_channel(..)` look
+  like it should compile.
+- **The type is `SampleRange`, not `Range`.** `Chunk::range()` returns `std::ops::Range<usize>`
+  — destination offsets — and `Normalizer::range()` returns the representable bounds; the two
+  are unrelated concepts in the same tier-3 loop, and one name over both forces `src/reader.rs`,
+  which holds the pair, to alias one of them. The accessor names stay: `range()` is right on
+  both, and it is the *type* that says which range it is.
+- **Every fallible item carries an `# Errors` section**, listing its classes rather than
+  leaving them in the surrounding prose — a reader scanning docs.rs looks for that heading, and
+  thorough prose under no heading reads as no answer.
+- **The `as_str` family, and where an `Option` is honest.** `Orientation`, `ImageType`,
+  `ColorSpace`, `PixelStorage` and `ResolutionUnit` return `&str`: every value of each has a
+  wire spelling, so there is nothing for an `Option` to report. `RowOrder::as_str` returns
+  `Option<&str>`, `None` for `Unspecified`, because that variant is the *absence* of a card and
+  `""` is a spelling a file can write — `classify` trims, so a `ROWORDER` holding only spaces is
+  `Other("")`. The signatures differ because the facts differ. `Display` is one line for all of
+  them, `RowOrder::Unspecified` rendering empty. Each `Other`-bearing enum pairs `as_str` with a
+  public `classify`, which is what lets a consumer reclassify text it holds.
+- **`SampleSlice::iter_f64` returns the named `IterF64`**, not `impl Iterator<Item = f64>`. The
+  cursor is `ExactSizeIterator` and `DoubleEndedIterator`; an opaque return hides both, and
+  `KeywordIter` and `PropertyIter` are named types for the same reason. It is not boxed: nine
+  chained `map`s behind a `Box<dyn Iterator>` costs an allocation per chunk for nothing.
 
 ### Streaming
 
@@ -1113,11 +1191,15 @@ classification, not a type hierarchy:
 Every variant except `Io` carries a human-readable reason string naming what was expected
 and what was found, and where in the file when that is known. For a consumer whose
 documented move on `Unsupported` is "skip", the log line *is* the error's value.
-`Error::is_io()` expresses the split in one call. Truncation is classified `Malformed`,
-not `Io` — a short file is bad data, not a failing disk.
+The table has **three** moves, not two, so it takes two predicates to express: `is_io()` is
+the abort edge and `is_invalid_request()` is the caller-bug edge, and everything left over is
+the skip. A batch loop written on `is_io()` alone swallows the one class meaning the calling
+program is wrong. `decline_class()` reports the middle row as the same `DeclineClass`
+`decline_reason()` carries, so one skip path serves both surfaces. Truncation is classified
+`Malformed`, not `Io` — a short file is bad data, not a failing disk.
 
 `InvalidRequest` exists deliberately: a wrong-sized destination slice, `select_channel(k)`
-beyond the channel count, or `with_bounds` after the pixel phase has begun are caller
+beyond the channel count, or `set_bounds` after the pixel phase has begun are caller
 errors, not file errors. Without a variant for them the library's only options are a
 panic — which the no-panic contract does not cover, since that contract is about
 malformed *input* — or misreporting a caller bug as a bad file. Calling either
@@ -2068,9 +2150,9 @@ report, a pasted header.
    `is_nan()` for the NaN case on `wasm32`). A sample below `lo` decodes to `+0.0` with the
    sign bit clear, never `-0.0`.
 6. **Range validity is one rule about `k`, enforced at both entry points.** Rejected
-   whether they arrive from a file-declared `bounds` or from `Reader::with_bounds` — the
+   whether they arrive from a file-declared `bounds` or from `Reader::set_bounds` — the
    same *rule*, deliberately not the same error class: a file-declared bad `bounds` is
-   `Malformed` and a bad `with_bounds` is `InvalidRequest`. The cases: `lo == hi`;
+   `Malformed` and a bad `set_bounds` is `InvalidRequest`. The cases: `lo == hi`;
    `lo > hi`; non-finite endpoints; and — the cases endpoint checks miss — finite ordered
    endpoints whose width underflows to zero or a subnormal in `f32` (`0`, `1e-46`), or
    overflows it (`-1e308`, `1e308`). The test asserts on `k`, not on the endpoints.
@@ -2110,7 +2192,7 @@ report, a pasted header.
 12. **`PEDESTAL` and XISF `offset` change no pixel.** Two otherwise-identical fixtures
     differing only in the presence of the keyword decode to identical buffers, and the
     keyword is retrievable.
-13. **Keyword lookup does not case-fold.** `get("SITELAT")` and `get("sitelat")` do not both
+13. **Keyword lookup does not case-fold.** `keyword("SITELAT")` and `keyword("sitelat")` do not both
     resolve; names are stored and matched exactly as they appear in the file. Duplicate
     keywords (`HISTORY`, `COMMENT`) are all retrievable, in document order.
 14. **Header-only decode reads no pixel bytes.** With a source that records its reads,
@@ -2124,7 +2206,7 @@ report, a pasted header.
     source rejects a bad offset when the block is reached; this criterion asserts that the
     check does not fire early.
 16. **FITS float frames decode natively and refuse normalized output.** `read_samples_into`
-    succeeds; `read_image_into` returns `Unsupported`; after `with_bounds(lo, hi)` it
+    succeeds; `read_image_into` returns `Unsupported`; after `set_bounds(lo, hi)` it
     succeeds.
 17. **Declining is catchable, and distinguishable from failing.** A `Complex32` XISF frame
     yields `Unsupported`; a truncated file yields `Malformed`; a source whose reads fail
@@ -2175,7 +2257,7 @@ report, a pasted header.
     `Image` element. On a sequential source the second such occurrence is `Unsupported` (its
     block lies behind the cursor) while the same file decodes fully through `Reader::open`.
     Reading the same fixture via `open`, `sequential` and `seekable` yields
-    `to_bits()`-identical buffers. `with_bounds` and `select_channel` reset across
+    `to_bits()`-identical buffers. `set_bounds` and `select_channel` reset across
     `next_image()`, and a per-image attribute fault declines that image without failing the
     source.
 25. **`select_channel` decodes the same bits as slicing a full decode.** For a multi-channel
@@ -2309,11 +2391,11 @@ report, a pasted header.
     sequential source. Cases beyond these are welcome; dropping one the ported suite covers
     is a regression.
 31. **Caller misuse is an error, not a panic.** A wrong-sized destination slice,
-    `select_channel` beyond the channel count, and `with_bounds` after the pixel phase each
+    `select_channel` beyond the channel count, and `set_bounds` after the pixel phase each
     return `InvalidRequest`. The last-wins pair is graded the other way, since the boundary
-    is what an implementer gets wrong: a second `with_bounds` and a second `select_channel`
+    is what an implementer gets wrong: a second `set_bounds` and a second `select_channel`
     *before* the pixel phase each succeed, and the frame decodes against the later value.
-    A second `with_bounds` carrying an invalid range returns `InvalidRequest` and leaves the
+    A second `set_bounds` carrying an invalid range returns `InvalidRequest` and leaves the
     first range in force.
 32. **Every cap has a test that trips it**, and each returns `LimitExceeded`: every row of
     the caps table. The stored-block cap is the one that closes I4's remaining hole, so it is
@@ -2518,7 +2600,7 @@ FITS decision* criterion.
 | **FITS is a multi-image format here, like XISF.** `next_image()` starts at the primary when it holds an image and otherwise advances to the first `XTENSION = 'IMAGE'` that holds one; each call advances to the next | A file may legitimately interleave tables between images, so non-image extensions are **skipped**, not errors — refusing the source over one would reject ordinary MEF files. An `IMAGE` extension declaring `NAXIS = 0` is skipped with them, since it holds no image either; § Errors → Where a decline surfaces settles that against the `NAXIS = 0` primary and against `NAXISn = 0` |
 | **Data units are skipped using the full size formula**, `\|BITPIX\|/8 × GCOUNT × (PCOUNT + Π NAXISᵢ)`, rounded up to the 2880-byte block boundary, taking `PCOUNT = 0`, `GCOUNT = 1` in the primary | Named because the naive `BITPIX × NAXIS*` form lands mid-file on any heap-carrying `BINTABLE` and misparses everything after it. `PCOUNT` is mandatory in every extension header and carries a `BINTABLE`'s heap size. This is also the prerequisite for recognizing a tile-compressed file at all. The primary's `PCOUNT = 0`, `GCOUNT = 1` holds everywhere except under `GROUPS = T`, where §6.1.1 makes both mandatory and runs the axis product over `NAXIS2`…`NAXISn` — `NAXIS1` is fixed at 0 there, so the ordinary product is zero and the ordinary reading sizes the random-groups data unit at nothing. That position is declined, but the walk still steps over it to reach what follows, and a zero-sized step lands inside the group data |
 | **A `BINTABLE` with `ZIMAGE = T` is a declined position, not an aborted source.** `header()` reports the geometry the `Z*` keywords declare, `granularity()` reports `WholeImage`, any pixel call is `Unsupported` | Commits v1 to lexing `ZIMAGE`, `ZBITPIX`, `ZNAXIS` and `ZNAXISn` — a small contained cost, accepted so the second-pass dispatch point in § The extension path has somewhere to attach. A real tile-compressed file is the ordinary shape of this: primary `NAXIS = 0`, no image extension, one such `BINTABLE` |
-| **Signed `BITPIX` is handled entirely by the `BSCALE`/`BZERO` step**; there is no separate signed path, and the unsigned convention is not special-cased — it falls out | Its mirror image, the signed-byte convention (`BITPIX = 8`, `BZERO = -128`), is *not* the unsigned convention and so gets no normalized output; native samples decode normally and `with_bounds` covers the rest. Named because it is the one adjacent convention a reader will look for |
+| **Signed `BITPIX` is handled entirely by the `BSCALE`/`BZERO` step**; there is no separate signed path, and the unsigned convention is not special-cased — it falls out | Its mirror image, the signed-byte convention (`BITPIX = 8`, `BZERO = -128`), is *not* the unsigned convention and so gets no normalized output; native samples decode normally and `set_bounds` covers the rest. Named because it is the one adjacent convention a reader will look for |
 | **FITS pixel data is big-endian two's-complement, always** | The format carries no attribute to read and no default to infer, so it is pinned here for the same reason XISF's little-endian default is: getting it wrong corrupts every sample silently rather than raising an error |
 | **`ROWORDER` is read into `{TopDown, BottomUp, Unspecified, Other(Arc<str>)}` and applied to nothing.** Recognition is case-insensitive and trims surrounding whitespace | `ROWORDER` is a convention, not part of FITS 4.0, so unrecognized values are expected and `Other` reports them verbatim; `Unspecified` means the keyword was absent, which is a different fact. The spelling normalization is a correctness rule, not a convenience: it is what stops the consumer's envelope predicate from admitting a flipped frame through a spelling variant |
 | **`NAXIS = 3` is read as channels**, under the same caps as everything else | A spectral or temporal cube is structurally indistinguishable from a colour image in FITS, so `NAXIS3 = 4000` would otherwise become a 4000-channel image; the caps bound it and a cube exceeding them is `LimitExceeded`. Deliberately more permissive than the XISF side, where higher-dimensional geometry is `Unsupported` outright: XISF states its dimensionality explicitly and can be refused precisely, whereas refusing all FITS `NAXIS = 3` would reject ordinary RGB frames |

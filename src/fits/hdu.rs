@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use crate::fits::cards::{BLOCK, lex_integer, lex_logical, lex_number};
 use crate::header::{
-    Bounds, BoundsUnavailable, DeclineClass, DeclineReason, Geometry, Granularity, Header,
+    Bounds, BoundsUnavailable, DeclineClass, DeclineReason, Format, Geometry, Granularity, Header,
     PixelStorage, RowOrder,
 };
 use crate::metadata::{Keyword, KeywordSet, PropertySet, ValueKind};
-use crate::normalize::Scaling;
+use crate::normalize::{SampleRange, Scaling};
 use crate::samples::SampleFormat;
 
 /// The value text of the card named `name`, verbatim.
@@ -541,6 +541,7 @@ pub(crate) fn build_header(
     let bounds = fits_bounds(sample_format, bscale, bzero, decline_reason.is_some());
 
     Header {
+        format: Format::Fits,
         geometry,
         sample_format,
         bounds,
@@ -597,17 +598,22 @@ fn fits_bounds(format: Option<SampleFormat>, bscale: f64, bzero: f64, declined: 
     // 0 for BITPIX = 8, 32768 for 16, 2147483648 for 32, 2^63 for 64. The 64-bit value
     // exceeds i64::MAX and can only be parsed as a float, which is why the lexer must not
     // assume an integer-valued keyword fits an i64.
-    let (expected_bzero, hi) = match format {
-        SampleFormat::U8 => (0.0, f64::from(u8::MAX)),
-        SampleFormat::I16 => (32768.0, f64::from(u16::MAX)),
-        SampleFormat::I32 => (2_147_483_648.0, f64::from(u32::MAX)),
-        SampleFormat::I64 => ((1u128 << 63) as f64, u64::MAX as f64),
+    let expected_bzero = match format {
+        SampleFormat::U8 => 0.0,
+        SampleFormat::I16 => 32768.0,
+        SampleFormat::I32 => 2_147_483_648.0,
+        SampleFormat::I64 => (1u128 << 63) as f64,
         _ => return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault),
     };
-    if bzero == expected_bzero {
-        Bounds::FormatDefault(0.0, hi)
-    } else {
-        Bounds::Unavailable(BoundsUnavailable::NoFormatDefault)
+    if bzero != expected_bzero {
+        return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault);
+    }
+    // The `[0, 2ⁿ − 1]` range for the width the physical values occupy, built through the one
+    // constructor that computes it — the same call the XISF default takes, so the two formats
+    // cannot state the same range in two spellings.
+    match SampleRange::unsigned_default(format.bytes() * 8) {
+        Some(range) => Bounds::FormatDefault(range),
+        None => Bounds::Unavailable(BoundsUnavailable::NoFormatDefault),
     }
 }
 
@@ -960,10 +966,10 @@ mod tests {
 
     #[test]
     fn only_the_unsigned_convention_gets_a_format_default_range() {
-        assert_eq!(
+        assert!(matches!(
             fits_bounds(Some(SampleFormat::I16), 1.0, 32768.0, false),
-            Bounds::FormatDefault(0.0, 65535.0)
-        );
+            Bounds::FormatDefault(range) if range.lo() == 0.0 && range.hi() == 65535.0
+        ));
         // The signed-byte convention is its mirror image and is not it.
         assert!(matches!(
             fits_bounds(Some(SampleFormat::U8), 1.0, -128.0, false),

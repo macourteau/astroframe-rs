@@ -26,7 +26,18 @@ fn main() {
 
     // Start from the defaults and tighten; `Limits` is `#[non_exhaustive]`, so it is always
     // built this way and a cap added in a later version is an addition rather than a break.
-    let mut limits = Limits::default();
+    // The caps a caller commonly moves have chainable setters; the rest are public fields.
+    let mut limits = Limits::default()
+        // Refuse a mosaic rather than walk 256 positions. Raise it if you have real MEFs.
+        .with_images_per_source(8)
+        // Bound the decode itself to something a request handler can afford. These are
+        // genuinely tight: over a 1242-frame corpus of real astronomical data they refuse
+        // about 8% of it, almost all of that XISF masters whose compressed block must be held
+        // whole. That is the trade this example exists to make visible — a cap you never feel
+        // is a cap that is not doing anything.
+        .with_total_samples(64 << 20) // 64 megapixels
+        .with_decoded_output_bytes(256 << 20) // the f32 destination
+        .with_materialized_bytes(256 << 20); // scratch this crate allocates for itself
 
     // The single most effective knob against the cap-product figure above: the ceiling is
     // linear in it, so 64 KiB takes ~1 GB to ~64 MB. The long strings the FITS `CONTINUE`
@@ -34,18 +45,6 @@ fn main() {
     // nothing real.
     limits.keyword_value_bytes = 64 << 10;
     limits.attribute_value_bytes = 64 << 10;
-
-    // Bound the decode itself to something a request handler can afford. These are genuinely
-    // tight: over a 1242-frame corpus of real astronomical data they refuse about 8% of it,
-    // almost all of that XISF masters whose compressed block must be held whole. That is the
-    // trade this example exists to make visible — a cap you never feel is a cap that is not
-    // doing anything.
-    limits.total_samples = 64 << 20; // 64 megapixels
-    limits.decoded_output_bytes = 256 << 20; // the f32 destination
-    limits.materialized_bytes = 256 << 20; // scratch this crate allocates for itself
-
-    // Refuse a mosaic rather than walk 256 positions. Raise it if you have real MEFs.
-    limits.images_per_source = 8;
 
     match decode(&path, limits) {
         Ok(images) => println!("decoded {images} image(s) from {path}"),
@@ -88,21 +87,20 @@ fn decode(path: &str, limits: Limits) -> astroframe::Result<usize> {
     let mut buffer: Vec<f32> = Vec::new();
 
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        let header = reader.current_header()?;
 
         // A decline is not an error: this position is valid and unreadable by this version,
         // and the rest of the file still walks. Treating it as a failure throws away the
         // images that *do* decode — see the multi-image case in 01_header.
         if let Some(decline) = header.decline_reason() {
-            eprintln!("  skipping a position: {}", decline.reason());
+            eprintln!("  skipping a position: {decline}");
             continue;
         }
-        let (Some(w), Some(h), Some(c)) = (header.width(), header.height(), header.channels())
-        else {
+        if header.geometry().is_none() {
             continue;
-        };
+        }
         buffer.clear();
-        buffer.resize(w as usize * h as usize * c as usize, 0.0);
+        buffer.resize(reader.destination_len()?, 0.0);
 
         // `Unsupported` gets the same treatment as a decline, for the same reason and against
         // this program's own table below: it means "valid, but this version does not read it",

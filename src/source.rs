@@ -13,46 +13,64 @@ use crate::limits::Limits;
 
 /// A byte source the reader walks forward through.
 ///
-/// Implemented by [`Sequential`] and [`Seekable`]; not an extension point.
-pub trait Source: sealed::Sealed {
-    /// The current byte offset from the start of the source.
-    fn position(&self) -> u64;
+/// Implemented by [`Sequential`] and [`Seekable`]; **not an extension point**. It is sealed,
+/// so nothing outside this crate can implement it, and both implementations are constructed
+/// through [`Reader`](crate::Reader)'s own constructors, so nothing outside this crate holds
+/// a value of one either.
+///
+/// A bare marker for that reason: its operations — position, length, seekability, the two
+/// reads and the two cursor moves — are the decoders' interface to the bytes, not a caller's,
+/// and rendering them here would advertise an extension point the first line denies. They
+/// live on the private supertrait, where their documentation is of use to the only code that
+/// can call them.
+///
+/// What a caller writes is the bound: `fn decode<S: Source>(reader: &mut Reader<S>)`.
+pub trait Source: sealed::Sealed {}
 
-    /// The total length, when the source knows it. `None` for a sequential source, which is
-    /// what makes the caps the floor rather than a backstop there.
-    fn length(&self) -> Option<u64>;
+impl<T: sealed::Sealed> Source for T {}
 
-    /// Whether the cursor can move backwards.
-    fn is_seekable(&self) -> bool;
+pub(crate) mod sealed {
+    use super::{Limits, Result};
 
-    /// Fill `buf` entirely.
-    ///
-    /// A short read is [`Error::Malformed`], not [`Error::Io`]: a short file is bad data, not
-    /// a failing disk.
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+    /// What the decoders ask of a byte source. Private, for the reason [`Source`](super::Source)
+    /// gives.
+    pub trait Sealed {
+        /// The current byte offset from the start of the source.
+        fn position(&self) -> u64;
 
-    /// Read up to `buf.len()` bytes, returning how many. `0` means end of source.
-    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize>;
+        /// The total length, when the source knows it. `None` for a sequential source, which
+        /// is what makes the caps the floor rather than a backstop there.
+        fn length(&self) -> Option<u64>;
 
-    /// Move the cursor forward by `n` bytes.
-    ///
-    /// On a **sequential** source this is a read-and-discard, so it is bounded by
-    /// [`Limits::skipped_block_bytes`] — over a pipe there is no end of file to terminate an
-    /// enormous declared skip, and an unbounded read is the hang invariant I5 names. On a
-    /// **seekable** source the cursor moves without transferring bytes and the cap is not
-    /// consulted, so an ordinary MEF whose `BINTABLE` heap exceeds it is walked past rather
-    /// than declined.
-    fn skip(&mut self, n: u64, limits: &Limits) -> Result<()>;
+        /// Whether the cursor can move backwards.
+        fn is_seekable(&self) -> bool;
 
-    /// Move the cursor to an absolute position.
-    ///
-    /// Backwards on a sequential source is [`Error::Unsupported`] — the same file decodes
-    /// through `Reader::open`.
-    fn seek_to(&mut self, pos: u64, limits: &Limits) -> Result<()>;
-}
+        /// Fill `buf` entirely.
+        ///
+        /// A short read is [`Error::Malformed`](crate::Error::Malformed), not
+        /// [`Error::Io`](crate::Error::Io): a short file is bad data, not a failing disk.
+        fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
 
-mod sealed {
-    pub trait Sealed {}
+        /// Read up to `buf.len()` bytes, returning how many. `0` means end of source.
+        fn read_some(&mut self, buf: &mut [u8]) -> Result<usize>;
+
+        /// Move the cursor forward by `n` bytes.
+        ///
+        /// On a **sequential** source this is a read-and-discard, so it is bounded by
+        /// [`Limits::skipped_block_bytes`] — over a pipe there is no end of file to terminate
+        /// an enormous declared skip, and an unbounded read is the hang invariant I5 names.
+        /// On a **seekable** source the cursor moves without transferring bytes and the cap
+        /// is not consulted, so an ordinary MEF whose `BINTABLE` heap exceeds it is walked
+        /// past rather than declined.
+        fn skip(&mut self, n: u64, limits: &Limits) -> Result<()>;
+
+        /// Move the cursor to an absolute position.
+        ///
+        /// Backwards on a sequential source is
+        /// [`Error::Unsupported`](crate::Error::Unsupported) — the same file decodes through
+        /// `Reader::open`.
+        fn seek_to(&mut self, pos: u64, limits: &Limits) -> Result<()>;
+    }
 }
 
 /// The discard buffer size for a sequential skip. Fixed, so a declared skip length never
@@ -78,9 +96,7 @@ impl<R: Read> Sequential<R> {
     }
 }
 
-impl<R> sealed::Sealed for Sequential<R> {}
-
-impl<R: Read> Source for Sequential<R> {
+impl<R: Read> sealed::Sealed for Sequential<R> {
     fn position(&self) -> u64 {
         self.pos
     }
@@ -156,9 +172,7 @@ impl<R: Read + Seek> Seekable<R> {
     }
 }
 
-impl<R> sealed::Sealed for Seekable<R> {}
-
-impl<R: Read + Seek> Source for Seekable<R> {
+impl<R: Read + Seek> sealed::Sealed for Seekable<R> {
     fn position(&self) -> u64 {
         self.pos
     }

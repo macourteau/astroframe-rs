@@ -201,11 +201,11 @@ fn subblocked_lz4_row() {
 
     let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
     assert!(reader.next_image().expect("advance"));
-    assert_eq!(
-        reader.header().expect("a header").granularity(),
-        astroframe::Granularity::Block {
-            subblocks: PARTS as u32
-        },
+    assert!(
+        matches!(
+            reader.header().expect("a header").granularity(),
+            astroframe::Granularity::Block { subblocks, .. } if subblocks == PARTS as u32
+        ),
         "the fixture must actually reach the Block floor for the bound below to mean anything"
     );
 

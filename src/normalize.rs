@@ -50,13 +50,27 @@ pub trait Sample: Copy + sealed::Sealed {
     fn widen(self) -> f64;
 }
 
-mod sealed {
-    pub trait Sealed {}
+pub(crate) mod sealed {
+    pub trait Sealed: Sized {
+        /// The borrowed run of this width a [`SampleSlice`](crate::SampleSlice) holds, or
+        /// `None` when it holds another. Backs
+        /// [`SampleSlice::try_as`](crate::SampleSlice::try_as), and lives on the sealed trait
+        /// so the projection cannot be implemented for a type the formats cannot store.
+        fn from_slice(slice: crate::samples::SampleSlice<'_>) -> Option<&[Self]>;
+    }
 }
 
 macro_rules! impl_sample {
-    ($($t:ty),* $(,)?) => {$(
-        impl sealed::Sealed for $t {}
+    ($($t:ty => $variant:ident),* $(,)?) => {$(
+        impl sealed::Sealed for $t {
+            #[inline]
+            fn from_slice(slice: crate::samples::SampleSlice<'_>) -> Option<&[Self]> {
+                match slice {
+                    crate::samples::SampleSlice::$variant(s) => Some(s),
+                    _ => None,
+                }
+            }
+        }
         impl Sample for $t {
             #[inline]
             fn widen(self) -> f64 {
@@ -66,7 +80,17 @@ macro_rules! impl_sample {
     )*};
 }
 
-impl_sample!(u8, u16, u32, u64, i16, i32, i64, f32, f64);
+impl_sample!(
+    u8 => U8,
+    u16 => U16,
+    u32 => U32,
+    u64 => U64,
+    i16 => I16,
+    i32 => I32,
+    i64 => I64,
+    f32 => F32,
+    f64 => F64,
+);
 
 /// The scaling a container applies before the range map.
 ///
@@ -88,15 +112,15 @@ pub enum Scaling {
 /// A validated representable range: the `lo` and `hi` physical values that map to 0.0 and 1.0.
 ///
 /// Construction enforces the one validity rule, and that rule is about the *reciprocal*
-/// rather than about the endpoints — see [`Range::new`].
+/// rather than about the endpoints — see [`SampleRange::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Range {
+pub struct SampleRange {
     lo: f64,
     hi: f64,
     k: f32,
 }
 
-impl Range {
+impl SampleRange {
     /// Build a range, or reject it.
     ///
     /// > A range is valid when `k = 1.0f32 / ((hi - lo) as f32)` is **finite, positive and
@@ -108,7 +132,7 @@ impl Range {
     /// subnormal and decodes uniformly white. `(-1e308, 1e308)` overflows in `f64` before
     /// the cast and decodes to `+0.0` at `lo` and NaN everywhere else. All three are
     /// reachable from a file-declared `bounds` (XISF §8.3.3 admits any float spelling) and
-    /// from `with_bounds`, and all three look like a decode rather than a failure.
+    /// from `set_bounds`, and all three look like a decode rather than a failure.
     ///
     /// The rule is knowingly asymmetric the other way: a subnormal *width* whose reciprocal
     /// is normal passes, costing one to three mantissa bits. Such a range is not a
@@ -116,7 +140,7 @@ impl Range {
     /// black, white or NaN.
     ///
     /// Returns `None` rather than an error so the caller picks the class: a file-declared
-    /// `bounds` failing this rule is `Malformed`, the same values from `with_bounds` are
+    /// `bounds` failing this rule is `Malformed`, the same values from `set_bounds` are
     /// `InvalidRequest`.
     #[inline]
     pub fn new(lo: f64, hi: f64) -> Option<Self> {
@@ -126,7 +150,7 @@ impl Range {
         // roughly a quarter of widths.
         let k = 1.0f32 / ((hi - lo) as f32);
         if k.is_finite() && k > 0.0 && k.is_normal() {
-            Some(Range { lo, hi, k })
+            Some(SampleRange { lo, hi, k })
         } else {
             None
         }
@@ -143,7 +167,7 @@ impl Range {
             64 => u64::MAX as f64,
             _ => return None,
         };
-        Range::new(0.0, hi)
+        SampleRange::new(0.0, hi)
     }
 
     /// The low endpoint — the physical value that maps to `0.0`.
@@ -181,22 +205,51 @@ impl Range {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Normalizer {
     scaling: Option<Scaling>,
-    range: Range,
+    range: SampleRange,
 }
 
 impl Normalizer {
     /// Build the primitive for one image.
-    pub fn new(scaling: Option<Scaling>, range: Range) -> Self {
+    pub fn new(scaling: Option<Scaling>, range: SampleRange) -> Self {
         Normalizer { scaling, range }
     }
 
     /// The range in force.
+    ///
+    /// A tier-3 caller holding the primitive [`Reader::normalizer`](crate::Reader::normalizer)
+    /// built for it reads the endpoints back here rather than re-deriving them from
+    /// [`Header::bounds`](crate::Header::bounds) — which is the point, since the reader folds
+    /// `set_bounds` in and the header a caller happens to be holding may predate that.
+    ///
+    /// ```
+    /// use astroframe::{Normalizer, SampleRange};
+    ///
+    /// let n = Normalizer::new(None, SampleRange::unsigned_default(16).expect("a 16-bit range"));
+    /// assert_eq!(n.range().lo(), 0.0);
+    /// assert_eq!(n.range().hi(), 65535.0);
+    /// ```
     #[inline]
-    pub fn range(&self) -> Range {
+    pub fn range(&self) -> SampleRange {
         self.range
     }
 
     /// The scaling in force.
+    ///
+    /// `None` for XISF, which defines no such concept, and always `Some` for FITS — so a
+    /// caller reporting what the normalization actually did reads it from here rather than
+    /// inferring it from the container.
+    ///
+    /// ```
+    /// use astroframe::{Normalizer, SampleRange, Scaling};
+    ///
+    /// let range = SampleRange::unsigned_default(16).expect("a 16-bit range");
+    /// let fits = Normalizer::new(
+    ///     Some(Scaling::Fits { bscale: 1.0, bzero: 32768.0 }),
+    ///     range,
+    /// );
+    /// assert!(matches!(fits.scaling(), Some(Scaling::Fits { bzero, .. }) if bzero == 32768.0));
+    /// assert_eq!(Normalizer::new(None, range).scaling(), None);
+    /// ```
     #[inline]
     pub fn scaling(&self) -> Option<Scaling> {
         self.scaling

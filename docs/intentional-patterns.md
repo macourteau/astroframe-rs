@@ -218,7 +218,7 @@ So the rule is structural rather than per-field:
 
 One reported text is deliberately still owned, and it is not an oversight.
 `Bounds::CallerSupplied::declared` is built by `Reader::header()` when the caller has set
-`with_bounds`, so it is one allocation per call the caller made, not one per occurrence the file
+`set_bounds`, so it is one allocation per call the caller made, not one per occurrence the file
 declares; it is also a public field, which `Arc<str>` would change for no gain.
 
 `RowOrder::Other` **was** the second, on the reasoning that FITS has no element reachable twice

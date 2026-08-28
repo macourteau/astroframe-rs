@@ -769,8 +769,8 @@ fn a_second_occurrence_of_one_block_is_unsupported_on_a_sequential_source_only()
     assert!(!reader.next_image().expect("the walk ends"));
 }
 
-// The per-image reset of `with_bounds` and `select_channel` is graded in
-// `pipeline::with_bounds_and_select_channel_reset_across_next_image`, over the same multi-image
+// The per-image reset of `set_bounds` and `select_channel` is graded in
+// `pipeline::set_bounds_and_select_channel_reset_across_next_image`, over the same multi-image
 // XISF shape and with the assertion that decides it: the cleared override changes the decoded
 // pixels rather than only the reported range.
 

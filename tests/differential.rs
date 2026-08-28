@@ -85,7 +85,7 @@ fn astroframe_natives<S: Source>(
     let mut out = Vec::new();
     let mut declined = 0usize;
     while reader.next_image()? {
-        let header = reader.header().expect("an advanced reader has a header");
+        let header = reader.current_header().expect("the advanced position");
         if header.decline_reason().is_some() {
             declined += 1;
             continue;

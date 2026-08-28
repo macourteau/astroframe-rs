@@ -222,7 +222,7 @@ mod keyword_layout {
 ///
 /// It splits far more simply than the property merge does: the two pieces never interleave, so
 /// there is no split index, only `own` then `inherited`. That order is the reported one and it
-/// is load-bearing — [`crate::Header::get`] returns the first match in stored order, which is
+/// is load-bearing — [`crate::Header::keyword`] returns the first match in stored order, which is
 /// what makes an extension's own `EXPTIME` win over the primary's.
 ///
 /// An XISF image and a FITS primary both leave `inherited` empty: an XISF image's keywords are
@@ -298,13 +298,51 @@ impl<'a> Keywords<'a> {
 
     /// The keywords, in stored order.
     pub fn iter(self) -> KeywordIter<'a> {
-        self.own.iter().chain(self.inherited)
+        KeywordIter {
+            inner: self.own.iter().chain(self.inherited),
+            left: self.len(),
+        }
     }
 }
 
 /// What [`Keywords::iter`] returns: the two pieces, back to back.
-pub type KeywordIter<'a> =
-    std::iter::Chain<std::slice::Iter<'a, Keyword>, std::slice::Iter<'a, Keyword>>;
+///
+/// A named type rather than an alias for the `Chain` that implements it. The alias made the
+/// *number of internal pieces* part of the public contract — a `KeywordSet` that split three
+/// ways instead of two would be a breaking change to a type callers can name — and `Chain`
+/// carries no [`ExactSizeIterator`], although [`Keywords::len`] is O(1) and the length is
+/// known before the first step.
+#[derive(Clone, Debug)]
+pub struct KeywordIter<'a> {
+    inner: std::iter::Chain<std::slice::Iter<'a, Keyword>, std::slice::Iter<'a, Keyword>>,
+    left: usize,
+}
+
+impl<'a> Iterator for KeywordIter<'a> {
+    type Item = &'a Keyword;
+
+    fn next(&mut self) -> Option<&'a Keyword> {
+        let next = self.inner.next()?;
+        self.left -= 1;
+        Some(next)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for KeywordIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let next = self.inner.next_back()?;
+        self.left -= 1;
+        Some(next)
+    }
+}
+
+impl ExactSizeIterator for KeywordIter<'_> {}
+
+impl std::iter::FusedIterator for KeywordIter<'_> {}
 
 impl<'a> IntoIterator for Keywords<'a> {
     type Item = &'a Keyword;
@@ -462,6 +500,7 @@ impl PropertyType {
     ///
     /// Both a primary specification name and its alternate spelling resolve to the same
     /// variant; anything else is preserved verbatim in [`PropertyType::Other`].
+    #[must_use]
     pub fn classify(name: &str) -> PropertyType {
         use PropertyType as P;
         match name {
@@ -548,6 +587,25 @@ pub enum PropertyValue {
     /// `Processing:History`" from "it does and this version cannot read it". On real
     /// PixInsight output these carry the entire astrometric solution.
     Unavailable,
+}
+
+impl PropertyValue {
+    /// The stored text, or `None` when the value lives in a data block this version does not
+    /// read.
+    ///
+    /// A **projection**, not a parse: it hands back the characters the file wrote, which is
+    /// the same thing [`PropertyValue::Text`] carries. Turning those characters into a number
+    /// or a timestamp means choosing a grammar, and choosing one is the consumer's job — so
+    /// there is deliberately no `as_f64` beside this.
+    ///
+    /// It exists because the alternative at every call site is a match on a
+    /// `#[non_exhaustive]` enum with a mandatory wildcard arm, written to reach a `&str`.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyValue::Text(text) => Some(text),
+            PropertyValue::Unavailable => None,
+        }
+    }
 }
 
 /// One XISF `Property`, reported as a tuple rather than as a bare string.
@@ -728,15 +786,52 @@ impl<'a> Properties<'a> {
 
     /// The properties, in document order.
     pub fn iter(self) -> PropertyIter<'a> {
-        self.before.iter().chain(self.own).chain(self.after)
+        PropertyIter {
+            inner: self.before.iter().chain(self.own).chain(self.after),
+            left: self.len(),
+        }
     }
 }
 
 /// What [`Properties::iter`] returns: the three pieces, back to back.
-pub type PropertyIter<'a> = std::iter::Chain<
-    std::iter::Chain<std::slice::Iter<'a, Property>, std::slice::Iter<'a, Property>>,
-    std::slice::Iter<'a, Property>,
->;
+///
+/// A named type rather than an alias for the `Chain` that implements it, for the reason
+/// [`KeywordIter`] is one — and the three-way split this one carries is exactly the internal
+/// detail an alias would have published.
+#[derive(Clone, Debug)]
+pub struct PropertyIter<'a> {
+    inner: std::iter::Chain<
+        std::iter::Chain<std::slice::Iter<'a, Property>, std::slice::Iter<'a, Property>>,
+        std::slice::Iter<'a, Property>,
+    >,
+    left: usize,
+}
+
+impl<'a> Iterator for PropertyIter<'a> {
+    type Item = &'a Property;
+
+    fn next(&mut self) -> Option<&'a Property> {
+        let next = self.inner.next()?;
+        self.left -= 1;
+        Some(next)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for PropertyIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let next = self.inner.next_back()?;
+        self.left -= 1;
+        Some(next)
+    }
+}
+
+impl ExactSizeIterator for PropertyIter<'_> {}
+
+impl std::iter::FusedIterator for PropertyIter<'_> {}
 
 impl<'a> IntoIterator for Properties<'a> {
     type Item = &'a Property;
@@ -828,6 +923,51 @@ pub enum ResolutionUnit {
     /// [`Orientation::Other`]: crate::Orientation::Other
     /// [`ImageType::Other`]: crate::ImageType::Other
     Other(std::sync::Arc<str>),
+}
+
+impl ResolutionUnit {
+    /// Classify a `unit` attribute's value.
+    ///
+    /// The attribute's **absence** is [`ResolutionUnit::Inch`] and is the caller's to supply,
+    /// there being no text to classify: §11.11.2 states what absence means, so a decoder
+    /// reporting the default is reporting the specification rather than inventing a value.
+    ///
+    /// ```
+    /// use astroframe::ResolutionUnit;
+    ///
+    /// assert_eq!(ResolutionUnit::classify("cm"), ResolutionUnit::Centimetre);
+    /// ```
+    #[must_use]
+    pub fn classify(value: &str) -> ResolutionUnit {
+        match value {
+            "inch" => ResolutionUnit::Inch,
+            "cm" => ResolutionUnit::Centimetre,
+            other => ResolutionUnit::Other(std::sync::Arc::from(other)),
+        }
+    }
+
+    /// The §11.11.2 spelling a file writes. [`ResolutionUnit::Other`] reports its payload
+    /// verbatim.
+    ///
+    /// A bare `&str` rather than the `Option` [`RowOrder::as_str`] returns: every value here
+    /// has a spelling, [`ResolutionUnit::Inch`] included. That variant does double duty as
+    /// the absent-attribute answer, but §11.11.2 defines absence to *mean* pixels per inch,
+    /// so `inch` is what the file said — unlike an absent `ROWORDER`, which says nothing.
+    ///
+    /// [`RowOrder::as_str`]: crate::RowOrder::as_str
+    pub fn as_str(&self) -> &str {
+        match self {
+            ResolutionUnit::Inch => "inch",
+            ResolutionUnit::Centimetre => "cm",
+            ResolutionUnit::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for ResolutionUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// An XISF `Resolution` (§11.11), reported and never applied.

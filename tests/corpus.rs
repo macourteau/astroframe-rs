@@ -393,9 +393,9 @@ fn the_masters_walk_their_images() {
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 shapes.push(format!("{w}x{ht}x{c}/{:?}", h.sample_format()));
             }
-            if let Bounds::Declared(lo, hi) = h.bounds()
-                && *lo == 0.0
-                && *hi == 1.0
+            if let Bounds::Declared(range) = h.bounds()
+                && range.lo() == 0.0
+                && range.hi() == 1.0
             {
                 unit_bounds += 1;
             }
