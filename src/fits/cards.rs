@@ -343,7 +343,7 @@ fn continuable(state: &Chain) -> bool {
     // An un-continued chain has no accumulated value yet; it was opened because the card's own
     // value ends in `&`, which is the condition, so it is continuable. `index` needs no check:
     // `push` sets it to `out.len()` immediately before pushing, so it always addresses a
-    // keyword — an assertion the old shape carried as a live test and this one does not need.
+    // keyword.
     match &state.value {
         Some(v) => v.ends_with('&'),
         None => true,
