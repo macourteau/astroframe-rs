@@ -825,7 +825,7 @@ mod tests {
             size(&kw, true),
             UnitSize::Unsizable("a NAXISn is missing or is not an integer value")
         );
-        // And the decline table calls the same header out of scope, in its own words.
+        // And the decline table faults on the same missing card, in its own words.
         let reason = fault(&kw, None).expect("a header declaring 1000 axes is declined");
         assert_eq!(reason.class(), DeclineClass::Malformed);
         assert!(reason.reason().contains("NAXIS2"), "{reason:?}");
