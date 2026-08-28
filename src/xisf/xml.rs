@@ -528,7 +528,11 @@ impl Namespaces {
                     // all, so `xmlns:xmlns="…"` declares nothing and the document carrying it
                     // is namespace-ill-formed. Recording it would bind a prefix that a name
                     // beginning `xmlns:` could then resolve *through*, which is the one way an
-                    // `xmlns:` name has a namespace to be in.
+                    // `xmlns:` name has a namespace to be in. This end of the rule is what
+                    // covers **element** names, which carry no `xmlns` check of their own:
+                    // with `xmlns:xmlns` recorded against XISF's namespace, `<xmlns:Image>`
+                    // resolves into it and interns as a bare `Image`. `read_attributes` takes
+                    // the other end for attribute names, and §3 is one rule needing both.
                     Some(b"xmlns") => continue,
                     Some(pfx) => Some(Box::from(String::from_utf8_lossy(pfx).as_ref())),
                     None => continue,
@@ -690,7 +694,11 @@ fn read_attributes(
         // reserves `xmlns`, binds it to no namespace name, and forbids declaring it, so
         // `xmlns` and every `xmlns:`-prefixed name is stored exactly as written. Resolving one
         // is not merely futile, it is the only way an in-scope binding could rewrite the name
-        // of the attribute that declares a namespace.
+        // of the attribute that declares a namespace. `Namespaces::open` is the other end of
+        // the same sentence of §3: it refuses to record an `xmlns:xmlns` declaration at all.
+        // It refuses that one spelling, which is why the check here is stated over every
+        // `xmlns:`-prefixed key — `xmlns:xmlns:a="…"` does bind the prefix `xmlns:a`, and the
+        // attribute `xmlns:a:b` would otherwise be resolved through it.
         let raw_key = attr.key.as_ref();
         let key = if raw_key == b"xmlns" || raw_key.starts_with(b"xmlns:") {
             xml_name(raw_key)?
