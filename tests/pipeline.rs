@@ -16,7 +16,7 @@ use std::io::Cursor;
 use std::ops::ControlFlow;
 
 use astroframe::{
-    Bounds, Format, Header, IterF64, Orientation, PixelStorage, Reader, RowOrder, Samples, Source,
+    Bounds, F64Iter, Format, Header, Orientation, PixelStorage, Reader, RowOrder, Samples, Source,
 };
 
 use common::xisf::{self, Unit};
@@ -566,7 +566,7 @@ fn the_reader_reports_whether_its_source_can_seek() {
 #[test]
 fn iter_f64_is_a_named_exact_size_double_ended_cursor() {
     let owned = Samples::U16(vec![0, 32768, 65535]);
-    let mut cursor: IterF64<'_> = owned.as_slice().iter_f64();
+    let mut cursor: F64Iter<'_> = owned.as_slice().iter_f64();
 
     assert_eq!(cursor.len(), 3, "the length is known before the first step");
     assert_eq!(cursor.next(), Some(0.0));

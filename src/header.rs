@@ -344,9 +344,10 @@ impl std::fmt::Display for ImageType {
 /// accessor's `Option` — `scaling().is_some()` is the usual one — which is an inference from
 /// a fact reported for another purpose.
 ///
-/// Neither variant is constructible in a build with both format features disabled, because
-/// no source is decoded there at all. The type is still present, so code matching on it
-/// compiles across the whole feature powerset.
+/// Neither variant is ever *produced* in a build with both format features disabled, because
+/// no source is decoded there at all — every constructor returns `Unsupported` first. The
+/// variants remain constructible by a caller, and the type is present across the whole
+/// feature powerset, so code matching on it compiles in every configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Format {

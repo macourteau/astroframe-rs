@@ -140,5 +140,5 @@ pub use metadata::{
 };
 pub use normalize::{Normalizer, Sample, SampleRange, Scaling};
 pub use reader::{Chunk, Chunks, Reader};
-pub use samples::{IterF64, SampleFormat, SampleSlice, Samples};
+pub use samples::{F64Iter, SampleFormat, SampleSlice, Samples};
 pub use source::{Seekable, Sequential, Source};

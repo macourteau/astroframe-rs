@@ -226,10 +226,10 @@ impl<'a> SampleSlice<'a> {
     /// assert_eq!(widened, [0.0, 32768.0, 65535.0]);
     /// ```
     ///
-    /// The cursor is [`IterF64`], a named type: its length is known before the first step and
+    /// The cursor is [`F64Iter`], a named type: its length is known before the first step and
     /// it walks from either end, and an `impl Trait` return hides both.
-    pub fn iter_f64(self) -> IterF64<'a> {
-        IterF64 {
+    pub fn iter_f64(self) -> F64Iter<'a> {
+        F64Iter {
             slice: self,
             at: 0,
             end: self.len(),
@@ -274,7 +274,7 @@ impl<'a> SampleSlice<'a> {
 /// destination from `len()` before the walk, or reading a run backwards, would be told the
 /// method does not exist.
 #[derive(Clone, Debug)]
-pub struct IterF64<'a> {
+pub struct F64Iter<'a> {
     slice: SampleSlice<'a>,
     /// The next index from the front.
     at: usize,
@@ -282,7 +282,7 @@ pub struct IterF64<'a> {
     end: usize,
 }
 
-impl Iterator for IterF64<'_> {
+impl Iterator for F64Iter<'_> {
     type Item = f64;
 
     fn next(&mut self) -> Option<f64> {
@@ -304,7 +304,7 @@ impl Iterator for IterF64<'_> {
     }
 }
 
-impl DoubleEndedIterator for IterF64<'_> {
+impl DoubleEndedIterator for F64Iter<'_> {
     fn next_back(&mut self) -> Option<f64> {
         use crate::normalize::Sample;
 
@@ -318,9 +318,9 @@ impl DoubleEndedIterator for IterF64<'_> {
     }
 }
 
-impl ExactSizeIterator for IterF64<'_> {}
+impl ExactSizeIterator for F64Iter<'_> {}
 
-impl std::iter::FusedIterator for IterF64<'_> {}
+impl std::iter::FusedIterator for F64Iter<'_> {}
 
 /// One row's samples, sliced to the caller's declared chunk length.
 ///
