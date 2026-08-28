@@ -188,6 +188,15 @@ fn build_occurrence(
     let (offset, offset_fault) = read_offset(doc.attr(image, "offset"));
     let (checksum, checksum_fault) = read_checksum(doc.attr(image, "checksum"));
 
+    let collected = collect_children(doc, image, cache);
+    // The specification's own defaults, which `unwrap_or_default` materializes for the image
+    // that carries no such element: no CFA, 72.0 ppi (§11.11), the identity display function
+    // (§11.9). An element that *is* carried and cannot be read reports the same default
+    // beside a fault, rather than in place of one.
+    let (cfa, cfa_fault) = collected.cfa.unwrap_or_default();
+    let (resolution, resolution_fault) = collected.resolution.unwrap_or_default();
+    let (display_function, display_function_fault) = collected.display_function.unwrap_or_default();
+
     // The XISF header-phase validation order, first error wins. It is load-bearing: several
     // adversarial fixtures carry an unsupported *attribute* and no `location` at all, and
     // they yield `Unsupported` only because the location check runs last.
@@ -199,11 +208,16 @@ fn build_occurrence(
         .or(site.fault)
         .or(compression_fault)
         .or(offset_fault)
-        // `checksum` is not one of the eight positions the order names, so a fault in it is
-        // taken last rather than allowed to preempt one that is.
+        // The three ancillary elements take the last three positions, after every attribute
+        // and among themselves by element name rather than by document position: the
+        // specification leaves the order of an image's children free, and classifying by
+        // whichever came first in the file would make the reported class a function of that.
+        .or(cfa_fault)
+        .or(resolution_fault)
+        .or(display_function_fault)
+        // `checksum` is not one of the positions the order names, so a fault in it is taken
+        // last rather than allowed to preempt one that is.
         .or(checksum_fault);
-
-    let collected = collect_children(doc, image, cache);
 
     // The caps and `bounds` sit deliberately outside that order: `bounds` is evaluated at
     // parse and raised at normalize, so an invalid one is not a decline.
@@ -298,11 +312,11 @@ fn build_occurrence(
             Arc::default(),
         ),
         properties,
-        cfa: collected.cfa,
+        cfa,
         // XISF does define both, so absence is the specification's default rather than
         // absence of the concept: 72.0 ppi (§11.11) and the identity display function (§11.9).
-        resolution: Some(collected.resolution.unwrap_or_default()),
-        display_function: Some(collected.display_function.unwrap_or_default()),
+        resolution: Some(resolution),
+        display_function: Some(display_function),
     };
 
     Ok(Occurrence {
@@ -540,14 +554,29 @@ fn granularity(
 
 // ------------------------------------------------------------------ the child elements
 
+/// One ancillary element read: what to report, and the fault that declines the position when
+/// the element is there and cannot be read.
+///
+/// The three elements it covers — `ColorFilterArray`, `Resolution`, `DisplayFunction` — are
+/// reported and applied to nothing, and every one of them has a shape the specification makes
+/// mandatory. Between reporting a value the file never stated and declining the position, § The
+/// organizing principle settles it: the crate never silently repairs a file, and a repair is
+/// no less a repair for being documented. It is the treatment a present-but-unparseable
+/// `offset` already gets, which is likewise applied to nothing.
+type Ancillary<T> = (T, Option<DeclineReason>);
+
 /// What one image's children contribute, in document order.
+///
+/// The three ancillary elements are `Some` once one has been read, which is what the first-wins
+/// rule turns on — the inner value can itself be a decline, and a second element must not
+/// overwrite the first either way.
 #[derive(Default)]
 struct Collected<'a> {
     keywords: Vec<RawKeyword<'a>>,
     properties: Vec<(usize, Property)>,
-    cfa: Option<Cfa>,
-    resolution: Option<Resolution>,
-    display_function: Option<DisplayFunction>,
+    cfa: Option<Ancillary<Option<Cfa>>>,
+    resolution: Option<Ancillary<Resolution>>,
+    display_function: Option<Ancillary<DisplayFunction>>,
 }
 
 /// Walk one image's children, resolving each `Reference` exactly one hop.
@@ -597,9 +626,15 @@ fn collect_children<'a>(doc: &'a Doc, image: usize, cache: &mut Cache) -> Collec
                     out.properties.push((child, property));
                 }
             }
+            // The first of each of the three wins, and the rest are ignored: §11.10, §11.11
+            // and §11.9 each associate one element with one image, and choosing among
+            // well-formed elements states nothing the file does not — so unlike an element
+            // that cannot be read, a discarded second one is not a decline.
             "ColorFilterArray" => {
                 if out.cfa.is_none() {
-                    out.cfa = memoized(&mut cache.cfa, node, referenced, || read_cfa(doc, node));
+                    out.cfa = Some(memoized(&mut cache.cfa, node, referenced, || {
+                        read_cfa(doc, node)
+                    }));
                 }
             }
             "Resolution" => {
@@ -624,7 +659,9 @@ fn collect_children<'a>(doc: &'a Doc, image: usize, cache: &mut Cache) -> Collec
                     ));
                 }
             }
-            // Declined silently: an element never fails a frame it does not prevent decoding.
+            // Declined silently: an element *this crate does not read* never fails a frame it
+            // does not prevent decoding. The three it does read answer the other way — they
+            // report what the file states, and decline rather than invent a value.
             // `RGBWorkingSpace` appears in §11.13's own worked example and PixInsight writes it
             // routinely, so treating it as frame-level would refuse a large share of real RGB
             // files. `Data` is the embedded block, read at the location step; an `Image`
@@ -642,43 +679,129 @@ fn collect_children<'a>(doc: &'a Doc, image: usize, cache: &mut Cache) -> Collec
 
 /// An XISF `ColorFilterArray` (§11.10). It is the one mosaic-and-display accessor with no
 /// default: absence means the image is not mosaiced.
-fn read_cfa(doc: &Doc, node: usize) -> Option<Cfa> {
-    Some(Cfa {
-        pattern: Arc::from(doc.attr(node, "pattern")?),
-        width: doc.attr(node, "width").and_then(parse_u32)?,
-        height: doc.attr(node, "height").and_then(parse_u32)?,
+///
+/// Which is why an unreadable one declines rather than being dropped. `cfa()` reporting `None`
+/// is the statement *this image is not mosaiced*, and a file carrying a `<ColorFilterArray>`
+/// says the opposite; a consumer branching on it to decide whether to debayer would get the
+/// wrong answer on a one-shot-colour frame.
+fn read_cfa(doc: &Doc, node: usize) -> Ancillary<Option<Cfa>> {
+    match built_cfa(doc, node) {
+        Ok(cfa) => (Some(cfa), None),
+        Err(fault) => (None, Some(fault)),
+    }
+}
+
+fn built_cfa(doc: &Doc, node: usize) -> std::result::Result<Cfa, DeclineReason> {
+    let mandatory = |name: &str| {
+        doc.attr(node, name).ok_or_else(|| {
+            malformed(format!(
+                "ColorFilterArray without a {name} attribute: §11.10.1 requires it, and \
+                 absence of the element is what reports an image as not mosaiced"
+            ))
+        })
+    };
+    let dimension = |name: &str| {
+        let text = mandatory(name)?;
+        parse_u32(text).ok_or_else(|| {
+            malformed(format!(
+                "ColorFilterArray {name}={text:?} is not a §8.3.1 unsigned integer"
+            ))
+        })
+    };
+    Ok(Cfa {
+        pattern: Arc::from(mandatory("pattern")?),
+        width: dimension("width")?,
+        height: dimension("height")?,
+        // §11.10.2 makes `name` optional, so its absence is the file's answer rather than a
+        // fault.
         name: doc.attr(node, "name").map(Arc::from),
     })
 }
 
 /// An XISF `Resolution` (§11.11), whose 72.0 ppi default [`Resolution::default`] carries.
-fn read_resolution(doc: &Doc, node: usize) -> Resolution {
-    let axis = |name: &str| {
-        doc.attr(node, name)
-            .and_then(parse_float)
-            .filter(|v| *v > 0.0)
-            .unwrap_or(72.0)
+///
+/// That default belongs to an **absent** element. §11.11.1 makes both axes mandatory and
+/// requires each to be greater than zero, so an element that states one and not the other, or
+/// states one this crate cannot read, is declined: substituting 72.0 for the axis and
+/// reporting it beside the axis the file did state attributes a number to a file that never
+/// wrote it.
+fn read_resolution(doc: &Doc, node: usize) -> Ancillary<Resolution> {
+    let axis = |name: &str| -> Ancillary<f64> {
+        let Some(text) = doc.attr(node, name) else {
+            return (
+                72.0,
+                Some(malformed(format!(
+                    "Resolution without a {name} attribute: §11.11.1 requires it"
+                ))),
+            );
+        };
+        let Some(value) = parse_float(text) else {
+            return (
+                72.0,
+                Some(malformed(format!(
+                    "Resolution {name}={text:?} is not a §8.3.3 floating point scalar"
+                ))),
+            );
+        };
+        // A parseable value is reported verbatim beside its decline, exactly as `read_offset`
+        // reports an out-of-range `offset`: the file did state this number, and the default
+        // stands in only where there is no number to state. `NaN` is named rather than left
+        // to a comparison it would pass, §8.3.3 admitting the spelling.
+        if value.is_nan() || value <= 0.0 {
+            return (
+                value,
+                Some(malformed(format!(
+                    "Resolution {name}={text:?}: §11.11.1 requires a value greater than zero"
+                ))),
+            );
+        }
+        (value, None)
     };
-    Resolution {
-        horizontal: axis("horizontal"),
-        vertical: axis("vertical"),
-        unit: match doc.attr(node, "unit") {
-            Some("cm") => ResolutionUnit::Centimetre,
-            _ => ResolutionUnit::Inch,
+    let (horizontal, horizontal_fault) = axis("horizontal");
+    let (vertical, vertical_fault) = axis("vertical");
+    (
+        Resolution {
+            horizontal,
+            vertical,
+            unit: match doc.attr(node, "unit") {
+                // §11.11.2 defines two spellings and makes the attribute optional, its absence
+                // meaning pixels per inch. An unrecognized spelling is a different answer and
+                // is reported as one, verbatim, rather than folded into that default.
+                None | Some("inch") => ResolutionUnit::Inch,
+                Some("cm") => ResolutionUnit::Centimetre,
+                Some(other) => ResolutionUnit::Other(Arc::from(other)),
+            },
         },
-    }
+        horizontal_fault.or(vertical_fault),
+    )
 }
 
 /// An XISF `DisplayFunction` (§11.9), reported and applied to nothing.
-fn read_display_function(doc: &Doc, node: usize) -> DisplayFunction {
+///
+/// The identity function is what an absent element reports. §11.9.1 makes all five parameters
+/// required, so a present element missing one, or writing one in some shape other than the
+/// four fields `v_RK:v_G:v_B:v_L`, declines for the reason [`read_resolution`] does.
+fn read_display_function(doc: &Doc, node: usize) -> Ancillary<DisplayFunction> {
     let identity = DisplayFunction::default();
-    let channels = |name: &str, fallback: DisplayChannels| -> DisplayChannels {
+    let channels = |name: &str, fallback: DisplayChannels| -> Ancillary<DisplayChannels> {
         let Some(text) = doc.attr(node, name) else {
-            return fallback;
+            return (
+                fallback,
+                Some(malformed(format!(
+                    "DisplayFunction without a {name} attribute: §11.9.1 requires all five of \
+                     m, s, h, l and r"
+                ))),
+            );
         };
         let fields = split_fields(text);
         let [red_gray, green, blue, lightness] = fields[..] else {
-            return fallback;
+            return (
+                fallback,
+                Some(malformed(format!(
+                    "DisplayFunction {name}={text:?}: §11.9.1 writes each parameter as the four \
+                     fields v_RK:v_G:v_B:v_L"
+                ))),
+            );
         };
         match (
             parse_float(red_gray),
@@ -686,25 +809,54 @@ fn read_display_function(doc: &Doc, node: usize) -> DisplayFunction {
             parse_float(blue),
             parse_float(lightness),
         ) {
-            (Some(red_gray), Some(green), Some(blue), Some(lightness)) => DisplayChannels {
-                red_gray,
-                green,
-                blue,
-                lightness,
-            },
-            _ => fallback,
+            (Some(red_gray), Some(green), Some(blue), Some(lightness)) => (
+                DisplayChannels {
+                    red_gray,
+                    green,
+                    blue,
+                    lightness,
+                },
+                None,
+            ),
+            _ => (
+                fallback,
+                Some(malformed(format!(
+                    "DisplayFunction {name}={text:?}: a field is not a §8.3.3 floating point \
+                     scalar"
+                ))),
+            ),
         }
     };
-    DisplayFunction {
-        midtones: channels("m", identity.midtones()),
-        shadows: channels("s", identity.shadows()),
-        highlights: channels("h", identity.highlights()),
-        low_range: channels("l", identity.low_range()),
-        high_range: channels("r", identity.high_range()),
-    }
+    let (midtones, midtones_fault) = channels("m", identity.midtones());
+    let (shadows, shadows_fault) = channels("s", identity.shadows());
+    let (highlights, highlights_fault) = channels("h", identity.highlights());
+    let (low_range, low_range_fault) = channels("l", identity.low_range());
+    let (high_range, high_range_fault) = channels("r", identity.high_range());
+    (
+        DisplayFunction {
+            midtones,
+            shadows,
+            highlights,
+            low_range,
+            high_range,
+        },
+        // §11.9.1's own order, so a file carrying two faults classifies determinately.
+        midtones_fault
+            .or(shadows_fault)
+            .or(highlights_fault)
+            .or(low_range_fault)
+            .or(high_range_fault),
+    )
 }
 
 /// One XISF `Property` (§11.1), reported as a tuple and never parsed per its declared type.
+///
+/// `None` for a property missing either of §11.1.1's two mandatory attributes: `id`, without
+/// which nothing identifies what is being reported, and `type`, without which the reported
+/// type would be `PropertyType::Other("")` — one value standing for both "the file declared no
+/// type" and "the file declared the empty type". A property is dropped rather than declining
+/// the frame because it prevents nothing: unlike a `<ColorFilterArray>`, absence of a property
+/// is not a claim about the image.
 fn read_property(doc: &Doc, node: usize, scope: PropertyScope) -> Option<Property> {
     let value = if let Some(text) = doc.attr(node, "value") {
         PropertyValue::Text(Arc::from(text))
@@ -723,7 +875,7 @@ fn read_property(doc: &Doc, node: usize, scope: PropertyScope) -> Option<Propert
         // Verbatim and never validated as a token: a space-bearing id such as
         // `"Instrument: colorFlag"` has been reported in the wild.
         id: Arc::from(doc.attr(node, "id")?),
-        property_type: PropertyType::classify(doc.attr(node, "type").unwrap_or("")),
+        property_type: PropertyType::classify(doc.attr(node, "type")?),
         value,
         format: doc.attr(node, "format").map(Arc::from),
         comment: doc.attr(node, "comment").map(Arc::from),
@@ -1159,7 +1311,7 @@ pub(super) mod tests {
 
         let resolution = o.header.resolution().expect("XISF states a resolution");
         assert_eq!(resolution.horizontal(), 120.0);
-        assert_eq!(resolution.unit(), ResolutionUnit::Centimetre);
+        assert_eq!(resolution.unit(), &ResolutionUnit::Centimetre);
 
         let df = o
             .header

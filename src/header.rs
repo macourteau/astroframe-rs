@@ -603,6 +603,17 @@ impl Header {
     /// frame because the format defines no such concept, and on an XISF image because absence
     /// of the element means the image is not mosaiced. Unlike the other two mosaic-and-display
     /// accessors, `cfa()` has no specification default to report in the second case.
+    ///
+    /// That makes `None` on an XISF image a positive claim about the file — a consumer
+    /// branching on it decides whether to debayer — so an element this crate cannot read is
+    /// never reported that way. A `<ColorFilterArray>` the file does carry whose §11.10.1
+    /// mandatory attributes are not all readable declines the position `Malformed`
+    /// (§ Errors → Validation order) instead of reporting the image as un-mosaiced.
+    ///
+    /// **First wins.** §11.10 associates one CFA with one image, and an image carrying several
+    /// `<ColorFilterArray>` children — its own, or ones reached through `<Reference>` — is
+    /// reported from the first in document order, the rest ignored. Selection among
+    /// well-formed elements states nothing the file does not, so it is not a decline.
     pub fn cfa(&self) -> Option<&Cfa> {
         self.cfa.as_ref()
     }
@@ -613,13 +624,24 @@ impl Header {
     /// FITS defines no resolution, and reporting 72.0 ppi for it would be an XISF number
     /// attributed to a format that never stated one. That is the fabricated value § The API
     /// rules out; the default belongs to XISF and is reported only there.
-    pub fn resolution(&self) -> Option<Resolution> {
-        self.resolution
+    ///
+    /// The default answers an **absent** element only. A `<Resolution>` the file does carry
+    /// whose `horizontal` or `vertical` is unreadable — unparseable, or the zero-or-negative
+    /// §11.11.1 forbids — declines the position `Malformed`, because the alternative is 72.0
+    /// reported beside a figure the file did state, with both attributed to the file.
+    ///
+    /// **First wins**, exactly as [`Header::cfa`] describes it.
+    pub fn resolution(&self) -> Option<&Resolution> {
+        self.resolution.as_ref()
     }
 
     /// The XISF `DisplayFunction` — the identity display function when the element is absent
     /// (§11.9), and `None` on a FITS frame, for the same reason [`Header::resolution`] is.
     /// Reported; applied to nothing.
+    ///
+    /// A present element whose §11.9.1 mandatory attributes are not all readable declines the
+    /// position, and the first of several wins — both exactly as [`Header::resolution`]
+    /// describes them.
     pub fn display_function(&self) -> Option<DisplayFunction> {
         self.display_function
     }

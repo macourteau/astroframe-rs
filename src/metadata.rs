@@ -553,7 +553,13 @@ impl Property {
         &self.id
     }
 
-    /// The declared type.
+    /// The declared type, always a type the file itself declared.
+    ///
+    /// §11.1.1 makes `type` mandatory, so a `<Property>` carrying none is not reported at all
+    /// — the treatment `id`, the other mandatory attribute, already gets. Reporting one as
+    /// [`PropertyType::Other`] with an empty text would make "the file declared no type" and
+    /// "the file declared the empty type" the same value, and neither of those is a type this
+    /// crate can attribute to the file.
     pub fn property_type(&self) -> &PropertyType {
         &self.property_type
     }
@@ -771,21 +777,43 @@ impl Cfa {
 }
 
 /// The unit an XISF `Resolution` is expressed in (§11.11.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ResolutionUnit {
-    /// Pixels per inch — the specification's default when the attribute is absent.
+    /// Pixels per inch — wire spelling `inch`, and §11.11.2's default when the attribute is
+    /// absent.
     #[default]
     Inch,
-    /// Pixels per centimetre.
+    /// Pixels per centimetre — wire spelling `cm`.
     Centimetre,
+    /// A value this crate does not recognize, verbatim. `unit` is a closed enumeration of two
+    /// spellings, but nothing is applied from it, so an unknown value degrades to "unknown"
+    /// and is reported rather than declining the position — the rule
+    /// [`Orientation::Other`] and [`ImageType::Other`] follow.
+    ///
+    /// Absence and an unrecognized spelling are different answers and are reported
+    /// differently: absence is [`ResolutionUnit::Inch`], which is what §11.11.2 states it
+    /// means, while a `unit` the file does state and this crate does not know lands here
+    /// carrying that text.
+    ///
+    /// Shared rather than owned, for the reason [`Orientation::Other`] is.
+    ///
+    /// [`Orientation::Other`]: crate::Orientation::Other
+    /// [`ImageType::Other`]: crate::ImageType::Other
+    Other(std::sync::Arc<str>),
 }
 
 /// An XISF `Resolution` (§11.11), reported and never applied.
 ///
 /// [`Resolution::default()`] is the specification's own default for an image carrying no
 /// such element: 72.0 pixels per inch in both directions.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Not `Copy`, because [`ResolutionUnit::Other`] carries the file's own text — the trade
+/// [`Orientation`] and [`ImageType`] already make.
+///
+/// [`Orientation`]: crate::Orientation
+/// [`ImageType`]: crate::ImageType
+#[derive(Clone, Debug, PartialEq)]
 pub struct Resolution {
     pub(crate) horizontal: f64,
     pub(crate) vertical: f64,
@@ -814,8 +842,8 @@ impl Resolution {
     }
 
     /// The unit both figures are expressed in.
-    pub fn unit(&self) -> ResolutionUnit {
-        self.unit
+    pub fn unit(&self) -> &ResolutionUnit {
+        &self.unit
     }
 }
 

@@ -545,7 +545,7 @@ exposes them as typed accessors, format-independent where the two formats agree:
 | Delivery | `granularity()` | § Streaming |
 | Decodability | `decline_reason()` | `None` for an image this version will decode; `Some` on a declined position, carrying the class and the reason. Without it a batch consumer would have to size a buffer and call `read_image_into` speculatively just to learn a frame is undecodable |
 | Metadata | `keywords()`, `properties()` | The two text surfaces |
-| Mosaic and display | `cfa()`, `resolution()`, `display_function()` | Reported, never applied; each resolved through `Reference`. All three return `Option`, and all three are `None` on a FITS frame, which defines none of the concepts. On an XISF image `resolution()` and `display_function()` report their specification-defined defaults when the element is absent — 72.0 ppi (§11.11), the identity display function (§11.9) — while `cfa()` has no default, because absence there means the image is not mosaiced |
+| Mosaic and display | `cfa()`, `resolution()`, `display_function()` | Reported, never applied; each resolved through `Reference`. All three return `Option`, and all three are `None` on a FITS frame, which defines none of the concepts. On an XISF image `resolution()` and `display_function()` report their specification-defined defaults when the element is absent — 72.0 ppi (§11.11), the identity display function (§11.9) — while `cfa()` has no default, because absence there means the image is not mosaiced. Those defaults answer an **absent** element; an element the file carries and this crate cannot read declines the position instead (§ Errors → Validation order). Where an image carries several of one element, the first in document order is reported and the rest ignored — selection among well-formed elements, not a fault |
 
 **Where the four `Option` geometry accessors report `None`.** All four are `Some` at every
 position this version will decode — that is, wherever `decline_reason()` is `None`. `None`
@@ -1148,7 +1148,39 @@ as `Malformed`.
 XISF header phase, first error wins:
 
 > geometry → `colorSpace` → `sampleFormat` → `byteOrder` → `pixelStorage` → `location`
-> → `compression` → `offset`
+> → `compression` → `offset` → `ColorFilterArray` → `Resolution` → `DisplayFunction`
+
+The last three positions are **elements** rather than attributes, and they sit after every
+attribute because every attribute is read from the `<Image>` element itself: putting the
+children after all of them keeps the order a property of the schema. Among themselves the
+three are ordered **by element name, not by document position** — §11.5 leaves the order of
+an image's children free, so classifying by whichever child came first would make a file's
+reported class a function of an ordering nothing requires it to fix.
+
+**Why an element applied to nothing declines at all.** The alternative is not silence, it is
+fabrication. `<Resolution horizontal="not-a-number" vertical="300"/>` has to be reported
+somehow, and reporting 72.0 beside the 300.0 states a figure the file never wrote — the
+silent repair § The organizing principle rules out, which documenting it would not stop it
+from being. Dropping the element instead is worse for a `<ColorFilterArray>`: `cfa()`
+reporting `None` is the positive claim *this image is not mosaiced* (§ The API), so a
+consumer deciding whether to debayer is told the opposite of what the file says. "Applied to
+nothing" is not what makes a fault silent, and never was — `offset` is applied to nothing
+either, and a present-but-unparseable one has always declined this way.
+
+So the rule is `offset`'s, per attribute: a mandatory attribute the file **states** and this
+crate cannot read declines the position `Malformed`; a mandatory attribute the file **omits**
+declines it too, the specification requiring the element to define one; and an **absent
+element** reports the specification's default, which is what §11.11's 72.0 ppi and §11.9's
+identity function are defaults of. Unreadable covers both halves — a value that does not
+parse, and one that parses and is still not a value of that attribute: §11.11.1 requires each
+resolution axis to be greater than zero, so `horizontal="-5"` is a `Malformed` decline rather
+than a 72.0. A parseable one is reported verbatim beside its decline, exactly as an
+out-of-range `offset` is, since the file did state it.
+
+Choosing among **well-formed** elements is neither, and is not a decline: an image carrying
+two conforming `<Resolution>` children reports the first and ignores the rest (§ The API).
+Nothing is invented by the choice, and each of §11.9, §11.10 and §11.11 associates one
+element with one image.
 
 FITS, per HDU, first error wins — needed for the same reason, since a header can carry two
 faults of different classes and the decline table would otherwise not determine which one
@@ -1216,7 +1248,7 @@ the `None` set, and a row landing on either side of it is a different observable
 | `NAXISn = 0` (legal FITS, no data) | `Unsupported` | Declined position | Full |
 | `GROUPS = T` (random groups, with `NAXIS1 = 0`) | `Unsupported` | Declined position | Full |
 | `BINTABLE` with `ZIMAGE = T` (tile-compressed) | `Unsupported` | Declined position | Full, from the `Z*` keywords |
-| Any XISF per-`<Image>` attribute fault | per the class rules | Declined position on that image | Full whenever `geometry` reads as a width, a height and a channel count — a zero-length axis included; `None` when it does not |
+| Any XISF per-`<Image>` attribute fault, or an unreadable `ColorFilterArray`, `Resolution` or `DisplayFunction` child | per the class rules | Declined position on that image | Full whenever `geometry` reads as a width, a height and a channel count — a zero-length axis included; `None` when it does not |
 | Primary `NAXIS = 0`, no image extension found | — | **Neither**: no image is found, `header()` is `None`, and the walk ends normally | — no `Header` |
 | `XTENSION = 'IMAGE'` with `NAXIS = 0` | — | **Neither**: not an image position, so it is skipped inside `next_image()` exactly as a non-image extension is | — no `Header` |
 | XISF unit whose walk finds no image occurrence | — | **Neither**: the same as a `NAXIS = 0` primary, for the same reason | — no `Header` |
@@ -2571,9 +2603,9 @@ criterion.
 | **`FITSKeyword` must be a child of an `Image` or of the root** (§11.6); one inside `Metadata` is ignored rather than reported. Its `comment` attribute is mandatory (§11.6.1), so the comment field is always present for XISF-sourced keywords and absent only for FITS cards carrying none | A non-conforming placement is attached to no image, and reporting it against an arbitrary one would invent an association the file does not make |
 | **Property identifiers are reported verbatim and never validated as tokens** | An implementer who validates ids against a well-formed `Namespace:Path` grammar will reject real files: a space-bearing id such as `"Instrument: colorFlag"` has been reported in the wild, though it appears nowhere in this corpus, whose masters' 368 properties across 112 distinct ids are all well-formed |
 | **`Thumbnail` elements are skipped and their data blocks stepped over**, bounded by the **`Skipped block bytes`** cap rather than by the stored-block cap | §11.12 gives a `Thumbnail` the shape of an `Image` with extra restrictions, and it may sit under an `Image` or at the root. It is not an image this crate reports, so `next_image()` never yields one — but a sequential source still has to skip its attached block to reach what follows. The stored-block cap is the wrong instrument, being phrased against the *current image's* geometry, while a thumbnail has its own geometry and may sit at the root with no current image at all. The skip is all of it: **a thumbnail's declared block is not validated**, and that is a consequence of § Hardening's rule that a declared block offset is never validated during the header phase, not an omission. A thumbnail is never an image occurrence, so nothing in the pixel phase opens its block and there is no later place to check it either — and checking it at construction was tried and reverted: every XISF file in the corpus carries a `Thumbnail`, so as a size-capped prefix every one of them became `Malformed`, which is tier 1's whole purpose defeated. On a known-length source the skip is a seek that transfers nothing, so an over-large declaration costs nothing; on a **length-unknown** source the cap is what terminates the skip — without it a declared 2⁶³-byte thumbnail on a pipe is an unbounded read, which is the hang invariant I5 names |
-| **"Declined" means two different things, and the difference is observable.** For a *frame-level* capability — a sample format, a colour space, a geometry, a location — declining is an `Unsupported` **error**. For an *element* this crate does not read, declining is **silent non-reporting**: the element is skipped, the frame decodes, nothing is raised | The rule is that an element never fails a frame it does not prevent decoding. It is load-bearing for two cases the specification makes common: `RGBWorkingSpace` appears in §11.13's own worked example and PixInsight writes it routinely, so treating it as frame-level would refuse a large share of real RGB files for a colour-management element that has nothing to do with pixels; and a block-valued `String` property is skipped rather than fatal, which is the honest cost of that deferral |
+| **"Declined" means two different things, and the difference is observable.** For a *frame-level* capability — a sample format, a colour space, a geometry, a location — declining is an `Unsupported` **error**. For an *element* this crate does not read, declining is **silent non-reporting**: the element is skipped, the frame decodes, nothing is raised | The rule is that an element **this crate does not read** never fails a frame it does not prevent decoding. An element it *does* read is the other case, and is settled in § Errors → Validation order: it reports what the file states, and one it cannot read declines rather than inventing a value. The silent half is load-bearing for two cases the specification makes common: `RGBWorkingSpace` appears in §11.13's own worked example and PixInsight writes it routinely, so treating it as frame-level would refuse a large share of real RGB files for a colour-management element that has nothing to do with pixels; and a block-valued `String` property is skipped rather than fatal, which is the honest cost of that deferral |
 | **The core elements this crate meets and does not read are dispositioned explicitly** rather than left to fall through the ignore-unknown rule: `Resolution` (§11.11) and `DisplayFunction` (§11.9) are **reported** as attribute-valued metadata; `ICCProfile` (§11.7) and `RGBWorkingSpace` (§11.8) are **declined**; `Table` (§11.3) is declined with its properties; `Structure` (§11.2) is declined and, carrying no metadata a consumer reads, is not reported | The two colour elements exist to drive colour conversion, which is out of scope, and `ICCProfile` additionally carries a data block whose bytes are always big-endian and which §10.4 forbids from carrying `byteOrder` — a special case worth not inheriting. `DisplayFunction` is reported on report-don't-interpret grounds alone: it is metadata the file states and no consumer can recover otherwise |
-| **Unknown elements and attributes are ignored — this crate's decision, not a citation.** Unknown values of the enumerations decoding *depends on* (`sampleFormat`, `pixelStorage`, `colorSpace`) are hard errors; unknown values of `imageType` and `orientation` degrade to "unknown" and are reported as text | The specification states no forward-compatibility rule anywhere, and ignoring unknowns is the only reading under which a 1.0 decoder survives a later revision adding elements. `imageType` and `orientation` are closed enumerations too (§11.5.1 Table 12, §11.5.2), so the criterion is what decoding depends on, not whether the enumeration is closed |
+| **Unknown elements and attributes are ignored — this crate's decision, not a citation.** Unknown values of the enumerations decoding *depends on* (`sampleFormat`, `pixelStorage`, `colorSpace`) are hard errors; unknown values of `imageType`, `orientation` and a `Resolution`'s `unit` degrade to "unknown" and are reported as text | The specification states no forward-compatibility rule anywhere, and ignoring unknowns is the only reading under which a 1.0 decoder survives a later revision adding elements. All three of the degrading ones are closed enumerations too (§11.5.1 Table 12, §11.5.2, §11.11.2), so the criterion is what decoding depends on, not whether the enumeration is closed. Each keeps absence distinct from an unrecognized spelling, `unit` most sharply: absent is §11.11.2's pixels-per-inch default, and folding an unrecognized spelling into it would report a unit the file never named |
 | **`pixelStorage` absent means `Planar`, `colorSpace` absent means `Gray`** — never inferred from channel count. **Channel count is never validated against the colour space**: channels beyond its nominal count are alpha channels and are delivered as ordinary channels | §8.5.1 adds that for images with a visual representation role the first alpha channel *should* define transparency; this crate has no visual role and assigns them none. The second half is the load-bearing one — a decoder that defaults correctly and then checks "`Gray` implies one channel" rejects three legal combinations, which is exactly what prior art does (§ Deliberate divergences from prior art) |
 
 ### Local corpus validation

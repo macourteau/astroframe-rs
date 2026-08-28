@@ -87,10 +87,11 @@ stray sign bit is a test failure a `==` comparison would have hidden.
 Every text a header parser lifts out of a file and puts in a reported value is shared, not
 owned: `Keyword`'s packed buffer, `Header::image_id` and `image_uuid`, `Cfa::pattern` and
 `name`, `Property`'s `id`/`format`/`comment`, `PropertyValue::Text`, `PropertyType::Other`,
-`Orientation::Other`, `ImageType::Other`, `DeclineReason::reason`, `Occurrence::declared_bounds`
-and `BlockPlan::subblocks`. The accessors return `&str` and `&[T]`, so most of it is invisible
-from outside; `PropertyValue::Text`, `PropertyType::Other`, `Orientation::Other` and
-`ImageType::Other` are the four that a pattern match can see.
+`Orientation::Other`, `ImageType::Other`, `ResolutionUnit::Other`, `DeclineReason::reason`,
+`Occurrence::declared_bounds` and `BlockPlan::subblocks`. The accessors return `&str` and
+`&[T]`, so most of it is invisible from outside; `PropertyValue::Text`, `PropertyType::Other`,
+`Orientation::Other`, `ImageType::Other` and `ResolutionUnit::Other` are the five that a
+pattern match can see.
 
 **The reason is that a header lets one piece of text be reached many times, and the caps that
 bound it do not multiply.** The reachability is most obvious in XISF, and for a long time the

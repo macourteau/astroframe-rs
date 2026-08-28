@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(o.header.row_order(), None);
         assert_eq!(o.header.scaling(), None);
         assert_eq!(o.header.offset(), Some(0.0));
-        assert_eq!(o.header.resolution(), Some(Resolution::default()));
+        assert_eq!(o.header.resolution(), Some(&Resolution::default()));
         assert_eq!(
             o.header.display_function(),
             Some(DisplayFunction::default())

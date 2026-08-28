@@ -50,8 +50,8 @@ fixes is evaluated on the first `next_chunk()`, and a caller that calls `chunks(
 
 The rule itself is stated twice and consistently: § XISF decisions gives the criterion ("unknown
 values of the enumerations decoding *depends on* — `sampleFormat`, `pixelStorage`, `colorSpace`
-— are hard errors; unknown values of `imageType` and `orientation` degrade to unknown and are
-reported as text") and § Deliberate divergences from prior art gives the class ("malformed enumerations are
+— are hard errors; unknown values of `imageType`, `orientation` and a `Resolution`'s `unit`
+degrade to unknown and are reported as text") and § Deliberate divergences from prior art gives the class ("malformed enumerations are
 `Malformed`, declined-but-valid features are `Unsupported`"). § Errors is the doc's named home
 for classes and carries neither.
 
