@@ -161,6 +161,31 @@ plane by plane — that is a structural fact of the format rather than an attrib
 invented, and reporting it saves every caller a format special-case. `color_space()` is the
 opposite and reports `None` for FITS, which genuinely declares no colour space.
 
+### `Samples` derives `PartialEq`, and the bit discipline is enforced in the tests
+
+`Samples` derives `PartialEq`, so `==` on `Samples::F32` compares eight `f32` values the way
+Rust compares floats: `0.0 == -0.0` is true and `NaN == NaN` is false. That is the opposite of
+this crate's own comparison rule, which is `f32::to_bits()` precisely because a sign-of-zero
+difference is a real difference in a decoded frame.
+
+The derive stays anyway, and the rule is enforced where it is violated — in the tests. Two
+reasons, and the second decides it:
+
+1. A public container of floats whose `==` means bitwise identity is surprising in a way the
+   type system cannot warn about. It would report `NaN == NaN` as true, which no Rust reader
+   expects from a type that is not `Eq`, and it would make two buffers a caller considers equal
+   compare unequal. Removing the derive instead trades that surprise for a missing impl on a
+   public type, which is a breaking API change for every downstream `assert_eq!`.
+2. `to_bits()` comparison is a **test** discipline: it exists so an endpoint test cannot pass
+   while the decoder moves a bit. Callers are free to compare decoded samples however their
+   application means to. Enforcing it through the public API's `==` puts the rule in the wrong
+   place, and — because the decoded bits are part of this crate's API surface — changes what a
+   released version does for an input that already worked.
+
+So the discipline is mechanical rather than remembered: `tests/common/mod.rs::assert_same_bits`
+is the one copy every suite grades with, and the `greps` job in `.github/workflows/ci.yml`
+fails the build on an `assert_eq!` over a float sample buffer anywhere under `tests/`.
+
 ## Dependency policy: one reviewed exception
 
 § Dependencies of the design assumes the runtime graph is clean of the banned numeric helpers.

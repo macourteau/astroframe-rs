@@ -120,6 +120,68 @@ fn replay(data: &[u8]) {
     decode_sequential_lane(data);
 }
 
+/// The prefix `fits_header` prepends to its input, byte for byte.
+const FITS_PREFIX: &[u8] = b"SIMPLE  ";
+
+/// The signature `xisf_header` prepends, and the length of the whole preamble it writes:
+/// signature, declared header length, reserved.
+const XISF_SIGNATURE: &[u8] = b"XISF0100";
+const XISF_PREAMBLE: usize = 16;
+
+/// What `fits_header` and `xisf_header` actually hand to the parser: their own prefix, then
+/// the corpus file.
+///
+/// Both targets prepend the format's signature so the fuzzer spends its budget on card and
+/// XML parsing rather than on rediscovering a signature `decode_any` already explores. Their
+/// corpora therefore hold what the target adds *to*: a seed carrying the signature itself is
+/// parsed doubled — the FITS card grid shifted eight bytes out of alignment for the whole
+/// file, the XISF header region opening with a second literal signature so the XML parse
+/// fails at byte zero. [`seed_the_fuzz_corpus`] strips the prefix on the way in, and these
+/// put it back so the replay lane sees the bytes the fuzz target sees.
+///
+/// The sibling case is `xisf_block`, whose corpus is raw units although its target takes a
+/// tuple; that mismatch is deliberate and is reasoned about where the seeds are written.
+fn wrap_as_fits_header(seed: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(seed.len() + FITS_PREFIX.len());
+    input.extend_from_slice(FITS_PREFIX);
+    input.extend_from_slice(seed);
+    input
+}
+
+/// See [`wrap_as_fits_header`].
+fn wrap_as_xisf_header(seed: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(seed.len() + XISF_PREAMBLE);
+    input.extend_from_slice(XISF_SIGNATURE);
+    input.extend_from_slice(&(seed.len() as u32).to_le_bytes());
+    input.extend_from_slice(&[0u8; 4]);
+    input.extend_from_slice(seed);
+    input
+}
+
+/// The inverse of [`wrap_as_fits_header`], and a no-op on a seed that never carried the
+/// prefix — the degenerate inputs are seeded as they are.
+fn strip_fits_header(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(FITS_PREFIX).unwrap_or(bytes)
+}
+
+/// The inverse of [`wrap_as_xisf_header`], which drops any data unit along with the preamble.
+///
+/// The target declares a header length covering its whole input, so a block beyond the XML
+/// would be declared as part of the header rather than as the block it is. Keeping the header
+/// region alone is what makes the wrap exact: `xisf_header` rebuilds the same unit the seed
+/// described, header-only, which is the whole of what that target parses.
+fn strip_xisf_header(bytes: &[u8]) -> &[u8] {
+    let Some(rest) = bytes.strip_prefix(XISF_SIGNATURE) else {
+        return bytes;
+    };
+    let Some(declared) = rest.get(..4) else {
+        return bytes;
+    };
+    let declared = u32::from_le_bytes(declared.try_into().expect("a four-byte slice")) as usize;
+    let region = &bytes[XISF_PREAMBLE.min(bytes.len())..];
+    &region[..declared.min(region.len())]
+}
+
 /// `fits_header` / `xisf_header`: the walk with no pixel read at all, which is where every
 /// header-multiplication seed here does its work and the cheapest place to catch one.
 fn header_lane(data: &[u8]) {
@@ -463,11 +525,19 @@ fn seed_the_fuzz_corpus() {
         let dir = root.join(target);
         std::fs::create_dir_all(&dir).expect("create the corpus directory");
         for (name, bytes) in &seeds {
-            // `xisf_block` takes a (header, body) tuple through `Arbitrary`, so a bare unit is
-            // not a valid input for it; its seeds are the tuple encoding, which libFuzzer
-            // derives from these bytes well enough to start from.
+            let seed: &[u8] = match target {
+                // `fits_header` and `xisf_header` prepend the format's signature themselves,
+                // so their corpora hold the seed with that prefix taken off — written whole,
+                // every seed here would be parsed doubled. See `wrap_as_fits_header`.
+                "fits_header" => strip_fits_header(bytes),
+                "xisf_header" => strip_xisf_header(bytes),
+                // `xisf_block` takes a (header, body) tuple through `Arbitrary`, so a bare
+                // unit is not a valid input for it; its seeds are the tuple encoding, which
+                // libFuzzer derives from these bytes well enough to start from.
+                _ => bytes,
+            };
             let file = dir.join(name.replace('/', "-"));
-            std::fs::write(&file, bytes).expect("write a seed");
+            std::fs::write(&file, seed).expect("write a seed");
         }
     }
     println!(
@@ -479,15 +549,31 @@ fn seed_the_fuzz_corpus() {
 
 /// Every file under `fuzz/corpus/` and `fuzz/artifacts/`, which is the committed seeds plus
 /// whatever a local fuzzing run has left beside them.
+///
+/// Each file is replayed as **its own target** would see it: a file under a directory named
+/// for a target that wraps its input is wrapped the same way, so the shape the fuzzer
+/// actually parses is the shape this lane asserts on.
+///
+/// **Deduplicated by content**, because the six corpora largely hold the same seeds and
+/// replaying each of them once per target is six passes over one input. The alternative —
+/// one shared directory the raw-bytes targets are pointed at with an extra command-line
+/// argument — saves the duplicated bytes on disk as well, and is rejected for it: a corpus
+/// reached only by remembering an argument is a corpus that silently stops feeding the
+/// fuzzer, which is the same class of defect the wrapping above exists to rule out. The set
+/// holds what is handed to [`replay`], after wrapping, so a `fits_header` seed collapses
+/// onto the `decode_any` copy it is stripped from while a wrapped XISF header region stays
+/// distinct from the full unit it comes from.
 fn committed_corpus_and_crash_artifacts() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
     let mut replayed = 0usize;
+    let mut duplicates = 0usize;
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for dir in ["corpus", "artifacts"] {
         let base = root.join(dir);
         if !base.is_dir() {
             continue;
         }
-        let mut stack = vec![base];
+        let mut stack = vec![base.clone()];
         while let Some(path) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
@@ -496,12 +582,39 @@ fn committed_corpus_and_crash_artifacts() {
                 let p = entry.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if let Ok(bytes) = std::fs::read(&p) {
-                    replay(&bytes);
-                    replayed += 1;
+                    continue;
                 }
+                let Ok(bytes) = std::fs::read(&p) else {
+                    continue;
+                };
+                let input = match target_directory(&base, &p) {
+                    "fits_header" => wrap_as_fits_header(&bytes),
+                    "xisf_header" => wrap_as_xisf_header(&bytes),
+                    _ => bytes,
+                };
+                if seen.contains(&input) {
+                    duplicates += 1;
+                    continue;
+                }
+                replay(&input);
+                seen.insert(input);
+                replayed += 1;
             }
         }
     }
-    println!("replayed {replayed} committed corpus and artifact files");
+    println!(
+        "replayed {replayed} distinct corpus and artifact files, {duplicates} duplicates skipped"
+    );
+}
+
+/// The target a corpus or artifact file belongs to: the first path component under
+/// `fuzz/corpus/` or `fuzz/artifacts/`. A file sitting directly in either directory belongs
+/// to no target and is replayed raw.
+fn target_directory<'a>(base: &std::path::Path, file: &'a std::path::Path) -> &'a str {
+    file.strip_prefix(base)
+        .ok()
+        .filter(|relative| relative.components().count() > 1)
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+        .unwrap_or("")
 }

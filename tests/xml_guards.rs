@@ -29,22 +29,10 @@ use std::io::Cursor;
 
 use astroframe::{Error, Limits, Reader};
 
-use common::CountingRead;
 use common::xisf::{PREAMBLE, Unit, le_u16, lz4, raw_unit, repeating_u16};
+use common::{CountingRead, kind};
 
 // ------------------------------------------------------------------ helpers
-
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
 
 fn assert_names(case: &str, e: &Error, fragment: &str) {
     let text = e.to_string();
