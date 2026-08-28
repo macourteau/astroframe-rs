@@ -297,7 +297,7 @@ impl Decoder {
             if let Some(c) = &block.compression {
                 // zstd parses its frame header here, which is also where the declared window
                 // is checked -- before the window is allocated.
-                stream = Stream::new(
+                stream.open(
                     c.codec,
                     src,
                     &mut stored_left,
@@ -573,13 +573,13 @@ fn open_next_subblock<S: Source>(p: &mut PixelState, src: &mut S, limits: &Limit
         stored_at,
         ..
     } = p;
-    // Drop the outgoing subblock's stored and decompressed buffers *before* building the
-    // next one's: `*stream = Stream::new(...)?` alone evaluates the right-hand side — which
-    // allocates the next subblock's buffers — while `*stream` still holds the previous
-    // subblock's, so the two are briefly resident together. § Streaming promises one
-    // subblock, compressed and decompressed, not two.
-    *stream = Stream::Plain;
-    *stream = Stream::new(codec, src, stored_left, stored_at, uncompressed, limits)?;
+    // `Stream::open` owns both halves of the boundary. It reuses the codec state a framed
+    // codec carries across the whole block — constructing one per subblock multiplies a fixed
+    // cost by `Subblock count`, which is a cap — and it drops the outgoing subblock's buffers
+    // before sizing the incoming one's, so the two whole-subblock LZ4 buffers are never
+    // resident together. § Streaming promises one subblock, compressed and decompressed, not
+    // two.
+    stream.open(codec, src, stored_left, stored_at, uncompressed, limits)?;
     Ok(())
 }
 

@@ -243,12 +243,33 @@ question is not whether the buffer is large but what number multiplies it — if
 cap, the line is the defect however small the buffer is today, because a cap is what an input
 gets to choose freely.
 
+**The occurrence is not always an image, and the allocation is not always text.** Every shape
+above is a header shape, and reading the rule as a rule about header text is how the same
+family reaches the pixel path unchallenged. §10.6's `subblocks` is a second per-occurrence
+walk with a cap of its own — `Subblock count`, 4096 — and it restarts the codec at every
+boundary, so a *decoder state* built there multiplies exactly as a copied string does. Both
+framed codecs were built per subblock, and zlib's input window was a flat 256 KiB whatever the
+subblock held: 4096 subblocks of a 262 KB block allocated 1.25 GB from a 156 KB input, 8027×,
+and the zstd half of the same shape 39.8 MB, 123×. Neither held anything live — the boundary
+released each piece before building the next, so the *peak* was flat at 305 KB across the whole
+range. **A flat peak is not evidence.** § Fuzzing's oracle counts every allocation rather than
+the high-water mark, which is the measure this invariant is stated against.
+
 ### How it is enforced
 
 `tests/header_alloc.rs` is where the rule is enforced. Its shapes assert the fuzz oracle's
 bound **and** a ratio ceiling, because the bound carries a fixed 8 MiB term that hides a
 multiple on any input smaller than a few megabytes: the `subblocks` instance sat at 676× its
 input while passing the bound comfortably.
+
+That file bounds the header alone — both its drivers read no pixels — so the decode path's half
+of the rule is enforced beside the peak-memory shapes it belongs with, in
+`tests/peak_memory.rs`. `a_subblock_costs_the_subblock_and_not_the_cap` runs for both framed
+codecs and asserts the **cumulative** total rather than the peak, against the oracle's bound
+and against the same block split 512 times more ways. The second assertion is the discriminating
+one, for the reason the grid section below gives about one-dimensional slices: a shape at one
+subblock count passes any single-point bound loose enough to hold at all, however linear in the
+split the allocation behind it is.
 
 **A fixture that exercises the code's memo-hit shape measures the memo, not the code.** Every
 reader here memoizes, and byte-identical inputs are the one shape every key hits however wrongly

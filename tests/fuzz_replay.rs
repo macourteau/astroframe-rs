@@ -34,7 +34,7 @@ mod common;
 
 use astroframe::{Limits, Reader, Samples};
 use common::Hdu;
-use common::xisf::{Unit, raw_unit, repeating_u16};
+use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib};
 use std::io::Cursor;
 
 #[global_allocator]
@@ -319,6 +319,34 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
     seeds.push((
         "xisf/uncompressed".into(),
         Unit::new().image_u16(8, 8, 1, &data).build(),
+    ));
+    // **A block split into subblocks**, which no other seed carries. §10.6 restarts the codec
+    // at every boundary, so the whole per-subblock cost — the input window and the codec state
+    // both — runs a number of times bounded by `Subblock count` rather than by the input, and a
+    // mutator that never assembles a `subblocks` attribute never reaches that loop at all.
+    // Eight is small on purpose: what the seed buys is the shape, a `c,u` pair list agreeing
+    // with the stored bytes behind it, and the count is the part a mutator can raise.
+    let (subblocked, list) = {
+        let raw = le_u16(&repeating_u16(64));
+        let mut stored = Vec::new();
+        let mut list = Vec::new();
+        for chunk in raw.chunks(raw.len() / 8) {
+            let c = zlib(chunk);
+            list.push(format!("{},{}", c.len(), chunk.len()));
+            stored.extend_from_slice(&c);
+        }
+        (stored, list.join(":"))
+    };
+    seeds.push((
+        "xisf/subblocked-zlib".into(),
+        Unit::new()
+            .attached(
+                &format!(
+                    r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zlib:128" subblocks="{list}" {{loc}}/>"#
+                ),
+                subblocked,
+            )
+            .build(),
     ));
     seeds.push((
         "xisf/header-only".into(),

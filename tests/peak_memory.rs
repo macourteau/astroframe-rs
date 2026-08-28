@@ -10,6 +10,13 @@
 //! decode allocates *on top of* it — which is the interesting quantity and the one that
 //! separates a streaming decode from one that materializes the file.
 //!
+//! **The peak is not the only quantity, and the last shape in the file measures the other
+//! one.** § Fuzzing's oracle counts every allocation rather than the high-water mark, so a
+//! buffer released at each subblock boundary and built again at the next is free to the peak
+//! and charged in full to the oracle. That shape is bounded against the **input** rather than
+//! against the destination, since what it asserts is `docs/intentional-patterns.md`'s rule
+//! about allocations sized by a cap.
+//!
 //! Without this, an implementation that buffers the whole file passes every other criterion
 //! while missing the entire point of tier 2.
 //!
@@ -26,7 +33,7 @@ mod common;
 
 use astroframe::Reader;
 use common::Hdu;
-use common::xisf::{Unit, lz4, repeating_u16};
+use common::xisf::{Unit, lz4, repeating_u16, zlib};
 use std::io::Cursor;
 
 #[global_allocator]
@@ -72,6 +79,9 @@ fn peak_decode_memory_meets_the_stated_target() {
     fits_row();
     compressed_xisf_row();
     subblocked_lz4_row();
+    // Both framed codecs, because each carries a codec state of its own across the split.
+    a_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib);
+    a_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw);
 }
 
 fn fits_row() {
@@ -218,5 +228,124 @@ fn subblocked_lz4_row() {
         "subblocked LZ4 decode allocated {used} bytes above a {destination_bytes}-byte \
          destination; holding one of {PARTS} subblocks at a time allows {allowed}. A decode \
          that holds the outgoing subblock's buffers alongside the incoming one's lands here."
+    );
+}
+
+/// A zstd frame built from **raw** (stored) blocks, with a four-byte content size.
+///
+/// `zstd` appears nowhere in XISF 1.0 and this crate's support for it is corpus-derived, so
+/// the fixture is a frame written here byte by byte rather than one produced by an encoder the
+/// crate does not depend on. `Single_Segment_flag` makes the declared window the content size,
+/// which keeps every split below the `zstd_window_bytes` cap.
+fn zstd_raw(input: &[u8]) -> Vec<u8> {
+    assert!(input.len() < 128 * 1024, "one Raw_Block's maximum size");
+    let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
+    out.push(0xa0); // Single_Segment_flag, and a four-byte Frame_Content_Size
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    let block_header: u32 = ((input.len() as u32) << 3) | 1; // last block, Raw_Block
+    out.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    out.extend_from_slice(input);
+    out
+}
+
+/// The **cumulative** half of the same criterion, on the subblock axis: what a decode
+/// allocates over a block must be sized by that block's stored bytes, never by
+/// `Subblock count`.
+///
+/// The two measures come apart exactly here, which is why this shape exists beside
+/// `subblocked_lz4_row`. §10.6 restarts the codec at every subblock boundary, so anything a
+/// boundary builds runs `subblocks` times — and a decode that releases each piece before
+/// building the next has a flat *peak* however many pieces there are. § Fuzzing's oracle counts
+/// every allocation rather than the peak, and `docs/intentional-patterns.md` states the rule
+/// that count enforces: **no per-occurrence allocation may be sized by a cap**. A per-subblock
+/// input window of a fixed 256 KiB satisfies the peak bound above and violates that one, at
+/// 4096 × 256 KiB from a hundred kilobytes of input.
+///
+/// So the assertion is made twice over, and the second is the discriminating one:
+///
+/// * against the fuzz oracle's own bound, `32 × input + 8 MiB`, which is what a fuzz run
+///   would report; and
+/// * against the **same block split more ways** — the subblock count rises by 512× while the
+///   pixels and the geometry stay as they were, so an honest decode's total barely moves. A
+///   shape at one subblock count cannot say this: allocation linear in the split passes any
+///   single-point bound loose enough to hold at all.
+///
+/// Run for both framed codecs. Each carries a codec state across the split — a
+/// `flate2::Decompress` is about 43 KB to construct and a `ruzstd::FrameDecoder` about 9.5 KB
+/// — so "one state per subblock" is a separate way to reach the same defect on each, and one
+/// codec's shape does not hold the other's. LZ4 is not here: its buffers are sized from the
+/// subblock already, which is what `subblocked_lz4_row` measures.
+fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(&[u8]) -> Vec<u8>) {
+    // 4096 is the `Subblock count` cap, so the wide point is the worst a file may ask for.
+    const SPLITS: [usize; 2] = [8, 4096];
+    const PER_SUBBLOCK: usize = 64;
+
+    let samples = SPLITS[1] * PER_SUBBLOCK / 2;
+    let width = PER_SUBBLOCK as u32 / 2;
+    let height = SPLITS[1] as u32;
+    let raw = common::xisf::le_u16(&repeating_u16(samples));
+
+    let mut totals = Vec::new();
+    for parts in SPLITS {
+        // Split over the *compression*, per §10.6: each piece is compressed on its own.
+        let part = raw.len() / parts;
+        let mut stored = Vec::new();
+        let mut list = Vec::new();
+        for chunk in raw.chunks(part) {
+            let c = compress(chunk);
+            list.push(format!("{},{}", c.len(), chunk.len()));
+            stored.extend_from_slice(&c);
+        }
+        let list = list.join(":");
+
+        let template = format!(
+            r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" compression="{codec}:{}" subblocks="{list}" {{loc}}/>"#,
+            raw.len()
+        );
+        let unit = Unit::new().attached(&template, stored).build();
+        let input_bytes = unit.len();
+
+        let mut dst = vec![0.0f32; samples];
+        let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+        assert!(reader.next_image().expect("advance"));
+        assert_eq!(
+            reader.header().expect("a header").granularity(),
+            astroframe::Granularity::Rows,
+            "§ Streaming puts a framed codec plus subblocks at `Rows`; a fixture reporting \
+             anything else is not on the streaming subblock path this measures"
+        );
+
+        alloc::reset();
+        reader.read_image_into(&mut dst).expect("decode");
+        // The cumulative total, not the peak: a buffer released at each boundary and built
+        // again at the next is invisible to `peak()` and is the whole subject here.
+        let used = alloc::total();
+
+        // The fuzz oracle's own bound, restated so the two cannot drift — `32 × input_length
+        // + xml_header_bytes`, at § Fuzzing's `ALLOC_MULTIPLE` and the shipped 8 MiB cap.
+        let allowed = 32 * input_bytes + (8 << 20);
+        assert!(
+            used <= allowed,
+            "a {codec} block split {parts} ways allocated {used} bytes from a \
+             {input_bytes}-byte input, above the fuzz oracle's {allowed}. A per-subblock \
+             input window or codec state sized by `Subblock count` rather than by the \
+             subblock lands here."
+        );
+        totals.push(used);
+    }
+
+    let (narrow, wide) = (totals[0], totals[1]);
+    // Twice the narrow split's total: far under the 512× the split itself rises by, and far
+    // over the variation between one codec state and the same one reset. A per-subblock cost
+    // sized by anything but the subblock cannot fit under it.
+    let allowed = narrow * 2;
+    assert!(
+        wide <= allowed,
+        "splitting the same {codec} block from {} into {} subblocks took allocation from \
+         {narrow} to {wide} bytes, above the {allowed} a flat per-subblock cost allows. \
+         Allocation that grows with the split is sized by the cap rather than by the \
+         subblock.",
+        SPLITS[0],
+        SPLITS[1]
     );
 }
