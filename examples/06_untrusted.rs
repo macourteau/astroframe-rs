@@ -51,30 +51,25 @@ fn main() {
         Err(e) => {
             // The class is the actionable part, and each means something different for what a
             // caller should do next. Matching on it beats matching on the message.
-            let (class, action) = match &e {
-                Error::Io(_) => ("Io", "the source could not be read — retry or report"),
-                Error::Malformed(_) => ("Malformed", "the file is not valid — reject it"),
-                Error::Unsupported(_) => (
-                    "Unsupported",
-                    "valid, but this version does not read it — keep the file",
-                ),
-                Error::ChecksumMismatch(_) => (
-                    "ChecksumMismatch",
-                    "the file says its own bytes are wrong — reject it",
-                ),
-                Error::LimitExceeded(_) => (
-                    "LimitExceeded",
-                    "a cap tripped — raise it deliberately, or refuse",
-                ),
-                Error::InvalidRequest(_) => (
-                    "InvalidRequest",
-                    "this program asked for something impossible — a bug here",
-                ),
+            //
+            // The class itself is not repeated here: every variant's `Display` already opens
+            // with it, so a hand-written label beside `{e}` would be the enum spelled twice,
+            // and the copy that drifts is always the hand-written one.
+            let action = match &e {
+                Error::Io(_) => "the source could not be read — retry or report",
+                Error::Malformed(_) => "the file is not valid — reject it",
+                Error::Unsupported(_) => "valid, but this version does not read it — keep the file",
+                Error::ChecksumMismatch(_) => "the file says its own bytes are wrong — reject it",
+                Error::LimitExceeded(_) => "a cap tripped — raise it deliberately, or refuse",
+                Error::InvalidRequest(_) => {
+                    "this program asked for something impossible — a bug here"
+                }
                 // `Error` is `#[non_exhaustive]`: a class added later lands here rather than
-                // failing to compile.
-                _ => ("other", "unrecognized class"),
+                // failing to compile. Refusing is the safe default for a class this program
+                // has never seen.
+                _ => "unrecognized class — refuse the source",
             };
-            eprintln!("{class}: {e}");
+            eprintln!("{e}");
             eprintln!("  -> {action}");
             std::process::exit(1);
         }

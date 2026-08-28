@@ -70,6 +70,14 @@ rustup toolchain install 1.88 --profile minimal
 RT=~/.rustup/toolchains/1.88-$(rustc -vV | sed -n 's/^host: //p')/bin
 RUSTC=$RT/rustc $RT/cargo check --locked --all-features --all-targets
 
+# `cargo fuzz` loses the same fight, and needs nightly for `-Zsanitizer`. Neither
+# `rustup run nightly cargo fuzz` nor `RUSTUP_TOOLCHAIN=nightly cargo fuzz` survives a
+# Homebrew Rust earlier on PATH: both run stable, and stable rejects the sanitizer flag, so
+# this one costs an hour of reading the wrong error rather than passing falsely. Put the
+# toolchain's own directory ahead of PATH instead.
+NT=~/.rustup/toolchains/nightly-$(rustc -vV | sed -n 's/^host: //p')/bin
+PATH=$NT:$PATH cargo fuzz run <target>
+
 cargo deny --all-features check licenses
 cargo package --locked --all-features
 
@@ -90,6 +98,11 @@ The 84 GB local corpus lives outside the repository, is reached only through
 
 ```sh
 ASTROFRAME_CORPUS=/path/to/corpus cargo test --release -- --ignored
+
+# The examples, which CI compiles with `-D warnings` and never runs — running one needs a
+# frame. This is the other half of that contract: it sweeps every example over a spread of
+# corpus frames and grades the exit status. Unset variable, and it skips and exits 0.
+ASTROFRAME_CORPUS=/path/to/corpus tools/run-examples.sh
 ```
 
 No CI lane may set that variable — the `build-test` job fails if it is set. The corpus carries

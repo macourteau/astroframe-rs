@@ -44,6 +44,15 @@ fn main() -> astroframe::Result<()> {
 /// image a second time is the reader's own answer — `is_seekable()` — rather than something the
 /// caller has to thread down from wherever the reader was built.
 fn run<S: Source>(mut reader: Reader<S>) -> astroframe::Result<()> {
+    // Both facts come from the reader rather than from whoever built it, which is what makes
+    // this function's signature enough to write against.
+    let cursor = if reader.is_seekable() {
+        "seekable"
+    } else {
+        "forward-only"
+    };
+    println!("{} frame, {cursor} source", reader.format());
+
     while reader.next_image()? {
         let header = reader.current_header()?;
         if header.decline_reason().is_some() {
@@ -85,12 +94,12 @@ fn run<S: Source>(mut reader: Reader<S>) -> astroframe::Result<()> {
         reader.for_each_chunk(|chunk| {
             chunks += 1;
             // `range()` is in **destination** coordinates — offsets into the buffer you are
-            // filling — so this is a write at the stated offset with no recalculation.
-            // `channel()` is the **file's** channel index. The two numbering schemes diverge
-            // under `select_channel` and neither derives from the other.
+            // filling — so this is a write at the stated offset with no recalculation. Do not
+            // reach for `chunk.channel()` to compute it: that one is the *file's* channel
+            // index, the two numbering schemes diverge under `select_channel`, and neither
+            // derives from the other.
             let range = chunk.range();
             peak_chunk = peak_chunk.max(range.len());
-            let _ = chunk.channel();
             chunk.normalize_into(&normalizer, &mut assembled[range]);
             ControlFlow::Continue(())
         })?;

@@ -12,7 +12,7 @@ slowly enough to be misleading about this crate's speed.
 
 | | What it shows |
 | --- | --- |
-| `01_header` | **Start here.** Tier 1: geometry, sample format, bounds, streaming granularity — reading no pixel byte. Walks every image position and reports declined ones instead of failing. |
+| `01_header` | **Start here.** Tier 1: format, geometry, sample format, bounds, streaming granularity, and the facts the file spelled out — reading no pixel byte. Walks every image position and reports declined ones instead of failing. |
 | `02_read_image` | Tier 2: a whole image as normalized `f32`, reusing one buffer across frames. Handles the frame that has no representable range rather than dying on it. |
 | `03_native_samples` | The file's own integers, no normalization. This is the path that reads *every* file, including the ones tier 2 refuses. |
 | `04_metadata` | Keywords and properties, and the exact-match lookup that does not case-fold. |
@@ -23,8 +23,9 @@ slowly enough to be misleading about this crate's speed.
 ## What they are trying to teach
 
 - **Report, don't interpret.** The crate hands back what the file said, in the file's spelling.
-  A `DATE-OBS` is the text on the card. Policy — autostretching, blank masking, choosing a
-  range for a frame that declares none — lives in your code, which is why `07` implements the
+  A `DATE-OBS` is the text on the card, and a `RowOrder` prints as `BOTTOM-UP` because that is
+  what a consumer re-emitting the fact writes. Policy — autostretching, blank masking, choosing
+  a range for a frame that declares none — lives in your code, which is why `07` implements the
   autostretch itself rather than asking the crate for one.
 - **A decline is not an error.** A position this version will not read reports a class and a
   sentence, and the rest of the file still walks. Treating it as a failure throws away the
@@ -32,7 +33,8 @@ slowly enough to be misleading about this crate's speed.
 - **The `Option`s are real.** Past `decline_reason()` the geometry is present; before it it may
   not be. None of them is an `unwrap` waiting to happen — `current_header()` is a `Result` for
   the one case a walk cannot reach, and `geometry()` is one `Option` because the three axes
-  move as a unit.
+  move as a unit. Where an `Option` means "the file was silent", `01` prints nothing rather
+  than printing `None`: a FITS frame has no `orientation` to report, and that is not a defect.
 - **Ask before you decode.** `granularity()` says how much of the input must be held before any
   sample comes out, and `bounds()` says whether normalized output exists at all — both before a
   pixel is read.
@@ -47,12 +49,20 @@ demonstrates gets renamed, because `cargo test` does not build examples and a do
 cannot call a method.
 
 CI does not *run* them, because running them needs a frame, and real frames are not in the
-repository. Running them against real files is a local step:
+repository. So an example can compile and still be wrong the moment it meets a file, and the
+half of the contract that catches that is maintainer-local:
 
 ```sh
-for e in examples/*.rs; do
-  n="$(basename "$e" .rs)"
-  echo "=== $n ==="
-  cargo run --release --quiet --example "$n" -- "$ASTROFRAME_CORPUS/some/frame.fits"
-done
+ASTROFRAME_CORPUS=/path/to/corpus tools/run-examples.sh
 ```
+
+It builds the examples, picks a spread of frames from the corpus, runs every example over all
+of them, and grades the exit status. With the variable unset it skips and exits 0, which is the
+same arrangement the `#[ignore]`d tests in `tests/corpus.rs` use — and, for the same reason, no
+CI lane may set it.
+
+The bar is a clean exit rather than the printed text. Pinning the output would mean committing
+fixtures that encode real frame metadata, which is what the corpus rule exists to prevent. A
+refusal is not a failure either: a corpus of real files contains frames that are *supposed* to
+be refused, so the runner counts and prints those, fails on a panic or an abort, and fails an
+example that never once succeeded.
