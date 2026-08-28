@@ -1,5 +1,7 @@
 # astroframe
 
+[![crates.io](https://img.shields.io/crates/v/astroframe.svg)](https://crates.io/crates/astroframe) [![docs.rs](https://img.shields.io/docsrs/astroframe?label=docs.rs)](https://docs.rs/astroframe) [![CI](https://img.shields.io/github/actions/workflow/status/macourteau/astroframe-rs/ci.yml?branch=main&label=CI)](https://github.com/macourteau/astroframe-rs/actions/workflows/ci.yml) ![MSRV](https://img.shields.io/crates/msrv/astroframe.svg)
+
 A decode-only Rust library for **FITS** and **XISF** astronomical image frames.
 
 It reads a frame and produces two things: the header metadata a tool needs — geometry,
@@ -60,6 +62,169 @@ fn survey(path: &str) -> astroframe::Result<()> {
 
 [`examples/`](examples/) walks the rest as a ladder: header-only, whole-image decode, native
 samples, metadata, streaming, untrusted input, and multi-channel bounds.
+
+## What it reads, and what has been tested
+
+Every row below is graded against the code and the test suite rather than against the
+specifications, and the **Tested** column names the evidence, because the tiers are different
+promises:
+
+- **CI** — covered by fixtures built byte by byte in the test source. These run on every push.
+- **corpus** — covered by a collection of frames from production applications that lives
+  outside the repository, is reached through `ASTROFRAME_CORPUS`, and backs `#[ignore]`d tests.
+  It is deliberately never a CI dependency, and building or testing the crate needs none of it.
+- **untested** — reachable and believed correct, exercised by neither.
+
+A **decline** is not an error: a position this version does not read reports a class and a
+reason, and the walk continues. The class is `Unsupported` where the file is valid and uses
+something out of scope, and `Malformed` where the file contradicts the format.
+
+### Containers
+
+| Container | Tested |
+| --- | --- |
+| FITS primary HDU and `IMAGE` extensions, `NAXIS` 2 or 3, including the `INHERIT` chain for `BSCALE`, `BZERO` and `ROWORDER` | CI + corpus |
+| XISF 1.0 monolithic units | CI + corpus |
+
+What the walk meets and does not read:
+
+| Not read | Outcome | Tested |
+| --- | --- | --- |
+| FITS tile-compressed images — `ZIMAGE = T` on a `BINTABLE`, as `fpack` writes | declined, `Unsupported` | CI + corpus |
+| FITS random groups — `GROUPS = T` | declined, `Unsupported` | CI |
+| FITS `NAXIS = 1`, `NAXIS > 3`, and any zero-length axis | declined, `Unsupported` | CI |
+| FITS `TABLE` and `BINTABLE` extensions carrying no `ZIMAGE` | stepped over, so not a declined position either | CI |
+| XISF external block locations, which is what a distributed unit's `<Image>` carries | declined, `Malformed` — §10.2 forbids one in a monolithic unit | CI |
+| XISF `Complex32` and `Complex64` | declined, `Unsupported` | CI |
+| XISF `colorSpace="CIELab"` | declined, `Unsupported` | CI |
+
+A `NAXIS = 0` primary is not a decline at all: it is the ordinary shape of a multi-extension
+file, and the walk advances past it to the extensions.
+
+### Sample formats
+
+`Header::sample_format` reports the **storage** type the container declares, and native samples
+come back in exactly that type. FITS `BITPIX` 16, 32 and 64 store *signed* integers, and XISF
+1.0 defines no signed sample format at all — so `I16`, `I32` and `I64` reach the API through
+FITS alone, and there is no `I8` because no source can produce one.
+
+| FITS `BITPIX` | `SampleFormat` | Tested |
+| --- | --- | --- |
+| `8` | `U8` | CI + corpus |
+| `16` | `I16` | CI + corpus |
+| `32` | `I32` | CI + corpus |
+| `64` | `I64` | CI |
+| `-32` | `F32` | CI + corpus |
+| `-64` | `F64` | CI + corpus |
+
+Every one of the six is compared sample for sample against an independent FITS decoder on each
+push. A `BITPIX` outside the set is `Malformed`, and the message names the set.
+
+| XISF `sampleFormat` | `SampleFormat` | Tested |
+| --- | --- | --- |
+| `UInt8` | `U8` | CI + corpus |
+| `UInt16` | `U16` | CI + corpus |
+| `UInt32` | `U32` | corpus |
+| `UInt64` | `U64` | **untested** |
+| `Float32` | `F32` | CI + corpus |
+| `Float64` | `F64` | corpus |
+
+`UInt64` is the one decode path neither tier exercises. The 64-bit arithmetic underneath it is
+pinned by the normalization tests, but no fixture and no corpus frame carries `UInt64` pixels
+through the container, so the claim rests on the code alone.
+
+### FITS integers and the unsigned convention
+
+`BITPIX` alone decides the reported `SampleFormat`, so a frame carrying the unsigned convention
+reports the signed storage type it is stored in — `BITPIX = 16` is `I16` whether `BZERO` is
+32768 or 0 — and native samples are the stored signed integers, unshifted. The convention shows
+up in two other places instead. `Header::scaling` reports `BSCALE` and `BZERO` verbatim, and
+`Header::bounds` supplies a format default only where the physical values provably occupy
+`[0, 2ⁿ − 1]`. Normalization then applies `BSCALE × raw + BZERO` before the range map, so a
+stored `-32768` reaches `0.0` and `32767` reaches `1.0`.
+
+| `BITPIX` | `BSCALE`, `BZERO` | `Header::bounds` | Normalized output |
+| --- | --- | --- | --- |
+| `8` | `1`, `0` | `FormatDefault(0, 255)` | yes |
+| `16` | `1`, `32768` | `FormatDefault(0, 65535)` | yes |
+| `32` | `1`, `2147483648` | `FormatDefault(0, 2³² − 1)` | yes |
+| `64` | `1`, `2⁶³` | `FormatDefault(0, 2⁶⁴ − 1)` | yes |
+| any integer `BITPIX` | any other `BSCALE`, `BZERO` pairing | `Unavailable(NoFormatDefault)` | only through `with_bounds` |
+| `-32`, `-64` | any | `Unavailable(NoFormatDefault)` | only through `with_bounds` |
+
+Any other pairing is refused rather than normalized: a genuinely signed frame would have half
+its levels saturate to black and a rescaled frame would normalize to a sliver near zero, and
+both would *look* like images. FITS defines no representable range for floats either, and
+`DATAMIN`/`DATAMAX` are reported as ordinary keywords rather than consumed — they describe the
+range the data occupies, not the range it is displayed against. XISF is the other way round:
+an integer image takes §8.5.5's `[0, 2ⁿ − 1]` default, and §11.5.1 makes `bounds` mandatory on
+a floating-point image, so one without it has no normalized output either.
+
+### XISF block codecs
+
+| `compression` | Tested |
+| --- | --- |
+| `zlib`, `zlib+sh` | CI + corpus |
+| `lz4`, `lz4+sh` | CI + corpus |
+| `lz4hc`, `lz4hc+sh` | CI + corpus |
+| `zstd`, `zstd+sh` | CI + corpus |
+| `subblocks`, beside any of the above | CI |
+| any other codec name | declined, `Unsupported` (CI) |
+
+`zstd` appears nowhere in XISF 1.0 and is read because production writers emit it. `+sh` is the
+byte-shuffling modifier, and the unshuffle is computed per byte on the way out rather than by
+materializing an unshuffled copy of the block.
+
+### XISF block checksums
+
+The `checksum` feature is on by default. §10.5 makes SHA-1 the only algorithm a decoder
+claiming checksum support must implement; all five are read, each under both of the spellings
+Table 9 gives it. A block that declares a checksum is verified before anything decompresses it,
+and with the feature off such a block is declined rather than trusted.
+
+| `checksum` algorithm | Tested |
+| --- | --- |
+| `sha-1`, `sha1` | CI + corpus |
+| `sha-256`, `sha256` | CI + corpus |
+| `sha-512`, `sha512` | CI + corpus |
+| `sha3-256` | CI |
+| `sha3-512` | CI |
+| any other algorithm name | declined, `Unsupported` (CI) |
+
+### XISF block locations
+
+| `location` | Outcome | Tested |
+| --- | --- | --- |
+| `attachment:<position>:<size>`, and the `attached:` spelling | read | CI + corpus |
+| `embedded`, with a child `<Data>` element in `base64` or `hex` | read | CI |
+| `inline:<encoding>` on an `<Image>` | declined, `Malformed` — §11.5 forbids it | CI |
+| an external file | declined, `Malformed` — §10.2 forbids it in a monolithic unit | CI |
+
+### Streaming granularity
+
+`Header::granularity` reports **how much of the input the decoder must hold before it can
+produce any sample**, per position and before a pixel is read. Each property of a block imposes
+a floor and the granularity is the worst of them, so `subblocks` lowers nothing once shuffling
+or a checksum spans the whole block. The row-by-row table is in
+[the crate documentation](https://docs.rs/astroframe), and both halves of every row — the
+reported granularity and the peak memory it promises — are graded on each push.
+
+### Where the corpus evidence comes from
+
+The corpus is a local collection of frames written by production applications, held outside the
+repository and never committed: it carries observatory coordinates at full precision, and not
+all of the frames are the maintainer's own. Its XISF half is a complete matrix of 5 sample
+formats × 9 codec and shuffling combinations × 4 checksum settings — 1080 frames — written by
+PixInsight from the FITS frames they came from, which is what makes the FITS decode an
+independent oracle for the XISF one: 41.8 billion pixels compared across the pair, three of the
+five sample formats bit-exact and the other two inside a derived tolerance. Its tile-compressed
+half is 120 `fpack`-written frames, every one of which must decline cleanly rather than merely
+fail. No CI lane may set `ASTROFRAME_CORPUS`, and the build-and-test job fails if it is set.
+
+Separately, a validation run of 0.1.1 over 163 public-archive frames — ESO, MAST, IRSA, SDSS
+and SkyView — walked 512 image positions: 410 decoded, 102 declined with a stated reason, none
+failed, and every decoded position was byte-identical to an independent decoder over the raw
+sample bytes. That run is a maintainer's record rather than a test in this repository.
 
 ## Report, don't interpret
 
