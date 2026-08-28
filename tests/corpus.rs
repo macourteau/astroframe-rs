@@ -60,11 +60,32 @@ fn is_frame(path: &std::path::Path) -> bool {
         .is_some_and(|e| FRAME_EXTENSIONS.contains(&e.as_str()))
 }
 
-/// Every frame under `family`, sorted, so a failure names a reproducible file.
-fn family(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
-    let dir = root.join(name);
+/// Directory names the walk does not descend into, matched at any depth.
+///
+/// One entry, and it is a *semantic* exclusion rather than a size one. The corpus uses
+/// `negative/` for files broken on purpose — a payload byte flipped under a checksum, two
+/// subblock lengths transposed, an `item-size` retagged — whose entire value is that the
+/// decoder **rejects** them. Sweeping them under "every file decodes or declines cleanly"
+/// would assert the opposite of what they were built to show, so they belong to whatever
+/// test states the rejection it expects, not to the sweep.
+const EXCLUDED_DIRECTORIES: [&str; 1] = ["negative"];
+
+/// Every frame under `dir`, at any depth, sorted, so a failure names a reproducible file.
+///
+/// Discovery is recursive and **allow-by-default**: a directory nobody has heard of is walked
+/// rather than ignored. That is the property that makes this stick. The corpus grows by
+/// someone dropping a spike directory beside the others, and a sweep that enumerates a
+/// hardcoded list of family names stops covering the corpus the moment it does — silently, and
+/// in the direction that looks like a pass. A body of test data outside such a list is graded
+/// once by whatever throwaway binary produced it and never again against a changed decoder,
+/// which is the failure this shape exists to prevent.
+///
+/// What keeps that from dragging in rubbish is [`is_frame`], not a directory list: the spikes
+/// hold build output, extracted raw blocks, decode dumps, generation logs and their PJSR
+/// sources beside the frames, and none of those carry a frame extension.
+fn frames_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![dir];
+    let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&path) else {
             continue;
@@ -72,7 +93,13 @@ fn family(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                stack.push(p);
+                let excluded = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| EXCLUDED_DIRECTORIES.contains(&n));
+                if !excluded {
+                    stack.push(p);
+                }
             } else if p.is_file() && is_frame(&p) {
                 out.push(p);
             }
@@ -80,6 +107,12 @@ fn family(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Every frame in one named family — for the tests whose subject *is* a family, and which
+/// would assert nothing if handed the whole corpus.
+fn family(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    frames_under(&root.join(name))
 }
 
 /// How many files to decode at once.
@@ -128,9 +161,29 @@ fn walk_all(files: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, Outcome)> 
     out.into_inner().expect("results lock")
 }
 
+/// The largest image, in decoded bytes, the sweep reads pixels for.
+///
+/// **The bound is on decoded bytes, not on file size**, because file size does not predict the
+/// work: a 67 MB `zstd` block in the corpus inflates to 4.5 GB of pixels, and the sweep holds
+/// that whole buffer per worker across every core at once. Bounding by the number the header
+/// states is what keeps a compressed monster from being mistaken for a small file.
+///
+/// Above the bound the header is still parsed, its decline reason still read and its geometry
+/// still checked — only the pixel read is skipped, and the count of skips is printed, so the
+/// run says what it did not decode rather than passing quietly over it. The frames it excludes
+/// are a codec-threshold probe whose blocks run 2.1 to 4.5 GB apiece and would take longer to
+/// decode than the rest of the corpus combined; the largest frame the sweep does read decodes
+/// to 467 MB, so the bound separates the two by a wide margin rather than sitting against
+/// either.
+const PIXEL_BUDGET: usize = 1 << 30;
+
 /// Walk one file and return what happened, without ever panicking on its contents.
 enum Outcome {
-    Decoded { images: usize },
+    /// `header_only` counts the images whose pixels were left unread under [`PIXEL_BUDGET`].
+    Decoded {
+        images: usize,
+        header_only: usize,
+    },
     Declined(String),
     Failed(Error),
 }
@@ -141,6 +194,7 @@ fn walk(path: &std::path::Path) -> Outcome {
         Err(e) => return Outcome::Failed(e),
     };
     let mut images = 0usize;
+    let mut header_only = 0usize;
     loop {
         match reader.next_image() {
             Ok(true) => {}
@@ -158,6 +212,10 @@ fn walk(path: &std::path::Path) -> Outcome {
             (Some(w), Some(h), Some(c)) => w as usize * h as usize * c as usize,
             _ => return Outcome::Declined("no geometry".into()),
         };
+        if len.saturating_mul(format.bytes() as usize) > PIXEL_BUDGET {
+            header_only += 1;
+            continue;
+        }
         // Native samples always decode, even where normalized output is refused, so this is
         // the entry point that exercises every file rather than only the normalizable ones.
         let mut samples = Samples::zeroed(format, len);
@@ -166,15 +224,23 @@ fn walk(path: &std::path::Path) -> Outcome {
         }
         images += 1;
     }
-    Outcome::Decoded { images }
+    Outcome::Decoded {
+        images,
+        header_only,
+    }
 }
 
 /// *Every file decodes or declines cleanly.*
 ///
-/// Every file in every family produces a decoded frame or a stated error class — never a
-/// panic, a hang, or a silent misread. `Io` is the only class that fails the run: it means the
-/// harness could not read the file, which is a problem with the corpus rather than with the
-/// decoder.
+/// Every frame **under the root**, at any depth, produces a decoded frame or a stated error
+/// class — never a panic, a hang, or a silent misread. `Io` is the only class that fails the
+/// run: it means the harness could not read the file, which is a problem with the corpus
+/// rather than with the decoder.
+///
+/// The enumeration is the whole root rather than a list of family names precisely because the
+/// list is what rots: a spike directory added beside the others is swept the day it lands.
+/// See [`frames_under`] for what that does and does not descend into, and [`PIXEL_BUDGET`] for
+/// the one thing it opens but does not decode.
 #[test]
 #[ignore = "needs ASTROFRAME_CORPUS"]
 fn every_corpus_file_decodes_or_declines_cleanly() {
@@ -182,10 +248,7 @@ fn every_corpus_file_decodes_or_declines_cleanly() {
         eprintln!("skipping: ASTROFRAME_CORPUS is unset");
         return;
     };
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for name in ["fits_variants", "xisf_variants", "masters"] {
-        files.extend(family(&root, name));
-    }
+    let files = frames_under(&root);
     println!(
         "decoding {} files across {} workers",
         files.len(),
@@ -194,15 +257,20 @@ fn every_corpus_file_decodes_or_declines_cleanly() {
 
     let mut decoded = 0usize;
     let mut images = 0usize;
+    let mut over_budget = 0usize;
     let mut declined = 0usize;
     let mut reasons: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
 
     for (path, outcome) in walk_all(&files) {
         match outcome {
-            Outcome::Decoded { images: n } => {
+            Outcome::Decoded {
+                images: n,
+                header_only,
+            } => {
                 decoded += 1;
                 images += n;
+                over_budget += header_only;
             }
             Outcome::Declined(reason) => {
                 declined += 1;
@@ -223,6 +291,14 @@ fn every_corpus_file_decodes_or_declines_cleanly() {
     // this test while proving nothing, so the reasons are printed rather than merely counted.
     for (reason, count) in &reasons {
         println!("  {count:>5} x {reason}");
+    }
+    // Stated rather than silent. A skipped image is coverage this run does not have, and a
+    // count that climbs is the signal that the bound has stopped separating a probe from the
+    // corpus and has started eating it.
+    if over_budget > 0 {
+        println!(
+            "  {over_budget:>5} image(s) read header-only, above the {PIXEL_BUDGET}-byte decode bound"
+        );
     }
     assert!(
         failures.is_empty(),

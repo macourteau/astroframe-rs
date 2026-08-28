@@ -159,6 +159,13 @@ impl SampleRange {
     /// The default representable range for an `n`-bit unsigned integer image: `0`, `2ⁿ − 1`.
     ///
     /// `bits` is 8, 16, 32 or 64; anything else returns `None`.
+    ///
+    /// At 64 bits the returned `hi` is `2⁶⁴`, not `2⁶⁴ − 1`, and that is a property of the
+    /// endpoint type rather than a rounding slip to correct: the endpoints are `f64`,
+    /// `2⁶⁴ − 1` has no `f64`, and `u64::MAX as f64` is the nearest one. It is the only width
+    /// where the reported `hi` differs from the literal `2ⁿ − 1`, and it costs nothing —
+    /// both endpoints are powers of two, so [`SampleRange::reciprocal`] is exactly `2⁻⁶⁴` and
+    /// `u64::MAX` still normalizes to exactly `1.0`.
     pub fn unsigned_default(bits: u32) -> Option<Self> {
         let hi = match bits {
             8 => f64::from(u8::MAX),
