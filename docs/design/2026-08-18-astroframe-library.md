@@ -331,8 +331,8 @@ normalization is lossless and reversible for those widths. It does **not** separ
 `UInt32` (4 294 967 296 levels) or `UInt64`, where distinct stored levels necessarily
 collide. Nor does it preserve a `Float64` source, which loses roughly 29 mantissa bits
 at step 2's narrowing cast — the *common* lossy case rather than the exotic one: it
-covers 216 corpus variants and every `Float64` master, against zero `UInt64` files
-anywhere. Endpoints stay exact at every integer width — level 0 gives `+0.0` and full
+covers 216 corpus variants and every `Float64` master, an order of magnitude more files
+than the corpus's 19 `UInt64` frames. Endpoints stay exact at every integer width — level 0 gives `+0.0` and full
 scale exactly `1.0`, checked for 8, 16, 32 and 64 bits — but a consumer needing exact
 levels from a `UInt32` or `UInt64` image must take native samples.
 
@@ -361,6 +361,15 @@ matching no row is one this version declines (§ Format support matrix).
 | FITS integer `BITPIX`, any other `BSCALE`/`BZERO` | **none — no normalized output** | The physical values do not land in `[0, 2ⁿ − 1]`, so there is no range to normalize against without inventing one |
 | FITS float `BITPIX` (−32, −64) | **none — no normalized output** | FITS defines no *representable* range for floats. `DATAMIN`/`DATAMAX` are reported as ordinary keywords, not consumed: they describe the range the data *occupies*, not the range it is *displayed against*, and conflating the two would rescale every frame by its own content |
 | Any source, caller override | whatever the caller supplies | `Reader::set_bounds(lo, hi)` |
+
+`2ⁿ − 1` is the rule; at `n = 64` it is not the number the table's `hi` can hold. The
+endpoints are `f64`, `2⁶⁴ − 1` has no `f64`, and the nearest one is `2⁶⁴` — so a 64-bit
+image, XISF `UInt64` or FITS `BITPIX = 64` under the unsigned convention, reports
+`hi = 2⁶⁴`, and 64 bits is the only width where the reported `hi` is not the literal
+`2ⁿ − 1`. Nothing downstream drifts, because both endpoints are powers of two: `k` is
+exactly `2⁻⁶⁴`, step 3 is an exact scaling, and `2⁶⁴ − 1` still reaches exactly `1.0`.
+Widening the endpoints past `f64` would buy nothing — the levels collide in the `f32`
+output long before the range does, which is the point § Normalization makes above.
 
 **One validity rule governs every range, however it arrives — and it is a rule about
 `k`, not about the endpoints.** Checking the endpoints is the obvious formulation and it
@@ -948,8 +957,10 @@ Two mitigations are real and are taken. XISF's `subblocks` attribute (§10.6) sp
 block into independently-decompressed pieces, which restores block-granularity streaming
 to LZ4 files that use it — `Block` granularity is reachable *only* that way, since `zlib`
 and `zstd` already stream by rows and shuffling or a checksum forces `WholeImage`. No
-file in the local corpus uses `subblocks` at all, so that row is graded by a hand-built
-fixture. And the **destination buffer is always the caller's**, stated in full under
+frame a production writer emits at ordinary sizes uses `subblocks` — the writer splits
+only above the codec's own multi-GB input ceiling — so that row is graded by hand-built
+fixtures and by 79 corpus frames assembled around streams the writer's own compressor
+split. And the **destination buffer is always the caller's**, stated in full under
 *`WholeImage` does not mean a second copy of the output* above.
 
 #### What streaming is actually worth

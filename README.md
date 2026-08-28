@@ -70,10 +70,13 @@ specifications, and the **Tested** column names the evidence, because the tiers 
 promises:
 
 - **CI** — covered by fixtures built byte by byte in the test source. These run on every push.
-- **corpus** — covered by a collection of frames from production applications that lives
-  outside the repository, is reached through `ASTROFRAME_CORPUS`, and backs `#[ignore]`d tests.
-  It is deliberately never a CI dependency, and building or testing the crate needs none of it.
-- **untested** — reachable and believed correct, exercised by neither.
+- **corpus** — covered by a collection of frames that lives outside the repository, is reached
+  through `ASTROFRAME_CORPUS`, and backs `#[ignore]`d tests. Most of it is production-application
+  output; where a production writer cannot emit an axis at all, the container is assembled from
+  streams that writer's own compressor produced. It is deliberately never a CI dependency, and
+  building or testing the crate needs none of it.
+- **untested** — reachable and believed correct, exercised by neither. No row carries it; the
+  tier is defined because a row that earns it must be able to say so.
 
 A **decline** is not an error: a position this version does not read reports a class and a
 reason, and the walk continues. The class is `Unsupported` where the file is valid and uses
@@ -113,7 +116,7 @@ FITS alone, and there is no `I8` because no source can produce one.
 | `8` | `U8` | CI + corpus |
 | `16` | `I16` | CI + corpus |
 | `32` | `I32` | CI + corpus |
-| `64` | `I64` | CI |
+| `64` | `I64` | CI + corpus |
 | `-32` | `F32` | CI + corpus |
 | `-64` | `F64` | CI + corpus |
 
@@ -125,13 +128,18 @@ push. A `BITPIX` outside the set is `Malformed`, and the message names the set.
 | `UInt8` | `U8` | CI + corpus |
 | `UInt16` | `U16` | CI + corpus |
 | `UInt32` | `U32` | corpus |
-| `UInt64` | `U64` | **untested** |
+| `UInt64` | `U64` | corpus |
 | `Float32` | `F32` | CI + corpus |
 | `Float64` | `F64` | corpus |
 
-`UInt64` is the one decode path neither tier exercises. The 64-bit arithmetic underneath it is
-pinned by the normalization tests, but no fixture and no corpus frame carries `UInt64` pixels
-through the container, so the claim rests on the code alone.
+`UInt64` is the one row the fixtures do not reach: they exercise 64-bit arithmetic through the
+normalization primitive and through the geometry caps, never through a container carrying
+64-bit pixels. Its evidence is 19 corpus frames spanning the four codecs with and without byte
+shuffling, the three block checksums, subblocked and unsubblocked blocks, both byte orders,
+both pixel storages, and a declared `bounds` against the format default — every one of them
+walked by the corpus sweep, native samples included. Most carry a value set chosen to stress
+the arithmetic rather than to look like an image: `2⁵³ ± 1`, `2⁶³`, an exact `f32` midpoint and
+its double-rounding neighbour, and `2⁶⁴ − 1`.
 
 ### FITS integers and the unsigned convention
 
@@ -148,9 +156,15 @@ stored `-32768` reaches `0.0` and `32767` reaches `1.0`.
 | `8` | `1`, `0` | `FormatDefault(0, 255)` | yes |
 | `16` | `1`, `32768` | `FormatDefault(0, 65535)` | yes |
 | `32` | `1`, `2147483648` | `FormatDefault(0, 2³² − 1)` | yes |
-| `64` | `1`, `2⁶³` | `FormatDefault(0, 2⁶⁴ − 1)` | yes |
-| any integer `BITPIX` | any other `BSCALE`, `BZERO` pairing | `Unavailable(NoFormatDefault)` | only through `with_bounds` |
-| `-32`, `-64` | any | `Unavailable(NoFormatDefault)` | only through `with_bounds` |
+| `64` | `1`, `2⁶³` | `FormatDefault(0, 2⁶⁴)` | yes |
+| any integer `BITPIX` | any other `BSCALE`, `BZERO` pairing | `Unavailable(NoFormatDefault)` | only through `set_bounds` |
+| `-32`, `-64` | any | `Unavailable(NoFormatDefault)` | only through `set_bounds` |
+
+Sixty-four bits is the one width where the reported `hi` is not the literal `2ⁿ − 1`, and it is
+a property of the type rather than a slip: `Bounds` carries `f64` endpoints, `2⁶⁴ − 1` has no
+`f64`, and the nearest one is `2⁶⁴`. The same holds for XISF `UInt64`. Nothing downstream
+drifts, because both endpoints are powers of two: `k = 1.0f32 / ((hi − lo) as f32)` is exactly
+`2⁻⁶⁴`, and `2⁶⁴ − 1` still normalizes to exactly `1.0`.
 
 Any other pairing is refused rather than normalized: a genuinely signed frame would have half
 its levels saturate to black and a rescaled frame would normalize to a sliver near zero, and
@@ -168,12 +182,16 @@ a floating-point image, so one without it has no normalized output either.
 | `lz4`, `lz4+sh` | CI + corpus |
 | `lz4hc`, `lz4hc+sh` | CI + corpus |
 | `zstd`, `zstd+sh` | CI + corpus |
-| `subblocks`, beside any of the above | CI |
+| `subblocks`, beside any of the above | CI + corpus |
 | any other codec name | declined, `Unsupported` (CI) |
 
 `zstd` appears nowhere in XISF 1.0 and is read because production writers emit it. `+sh` is the
 byte-shuffling modifier, and the unshuffle is computed per byte on the way out rather than by
 materializing an unshuffled copy of the block.
+
+The corpus half of the `subblocks` row is 79 frames carrying a genuine `subblocks` attribute;
+see § Where the corpus evidence comes from for what they span and where the streams inside them
+were produced.
 
 ### XISF block checksums
 
@@ -196,7 +214,8 @@ and with the feature off such a block is declined rather than trusted.
 | `location` | Outcome | Tested |
 | --- | --- | --- |
 | `attachment:<position>:<size>`, and the `attached:` spelling | read | CI + corpus |
-| `embedded`, with a child `<Data>` element in `base64` or `hex` | read | CI |
+| `embedded`, with a child `<Data>` element in `base64` | read | CI + corpus |
+| `embedded`, with a child `<Data>` element in `hex` | read | CI |
 | `inline:<encoding>` on an `<Image>` | declined, `Malformed` — §11.5 forbids it | CI |
 | an external file | declined, `Malformed` — §10.2 forbids it in a monolithic unit | CI |
 
@@ -211,15 +230,33 @@ reported granularity and the peak memory it promises — are graded on each push
 
 ### Where the corpus evidence comes from
 
-The corpus is a local collection of frames written by production applications, held outside the
-repository and never committed: it carries observatory coordinates at full precision, and not
-all of the frames are the maintainer's own. Its XISF half is a complete matrix of 5 sample
-formats × 9 codec and shuffling combinations × 4 checksum settings — 1080 frames — written by
-PixInsight from the FITS frames they came from, which is what makes the FITS decode an
-independent oracle for the XISF one: 41.8 billion pixels compared across the pair, three of the
-five sample formats bit-exact and the other two inside a derived tolerance. Its tile-compressed
-half is 120 `fpack`-written frames, every one of which must decline cleanly rather than merely
-fail. No CI lane may set `ASTROFRAME_CORPUS`, and the build-and-test job fails if it is set.
+The corpus is a local collection held outside the repository and never committed: it carries
+observatory coordinates at full precision, and not all of the frames are the maintainer's own.
+Its XISF half is a complete matrix of 5 sample formats × 9 codec and shuffling combinations ×
+4 checksum settings — 1080 frames — written by PixInsight from the FITS frames they came from,
+which is what makes the FITS decode an independent oracle for the XISF one: 41.8 billion pixels
+compared across the pair, three of the five sample formats bit-exact and the other two inside a
+derived tolerance. Its tile-compressed half is 120 `fpack`-written frames, every one of which
+must decline cleanly rather than merely fail. No CI lane may set `ASTROFRAME_CORPUS`, and the
+build-and-test job fails if it is set.
+
+The sweep enumerates the corpus root recursively rather than a list of family names, so an axis
+added to it is graded from the day it lands rather than the day someone remembers to widen a
+list. A run walks 1542 frames: 1422 decode, 120 decline as tile-compressed, none fail. Two
+exclusions are stated rather than silent — files broken on purpose, which belong to the tests
+that assert the rejection they expect, and 8 images whose blocks inflate to between 2.1 and
+4.5 GB, which are opened and header-checked but not decoded, because decoding them would cost
+more than the rest of the corpus combined.
+
+Two axes are out of reach of an ordinary export, and are covered by frames whose containers are
+assembled but whose compressed streams are not: 79 subblocked frames across 8 codec and
+shuffling combinations and subblock counts from 2 to 192, and 19 XISF `UInt64` frames beside
+3 FITS `BITPIX = 64` frames. PixInsight splits a block only when it exceeds the codec's own
+input ceiling — gigabytes, and no hint asks for one below that — and it refuses a 64-bit
+integer sample format outright. So every compressed stream among these comes from its
+compressor and is round-tripped byte for byte through its decompressor, and only the container
+around it is built here. The frames that do straddle the split threshold are the 8 the sweep
+reads header-only.
 
 Separately, a validation run of 0.1.1 over 163 public-archive frames — ESO, MAST, IRSA, SDSS
 and SkyView — walked 512 image positions: 410 decoded, 102 declined with a stated reason, none
