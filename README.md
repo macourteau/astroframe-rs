@@ -24,32 +24,38 @@ over a night's frames is the whole job — and it is the same code for both form
 ```rust
 use astroframe::{Bounds, Reader};
 
-let mut reader = Reader::open("frame.fits")?;
+fn main() -> astroframe::Result<()> {
+    for path in std::env::args().skip(1) {
+        let mut reader = Reader::open(&path)?;
 
-// A file holds one or more image *positions*: FITS calls them HDUs, XISF calls them
-// <Image> elements. `next_image` walks both and returns false at the end.
-while reader.next_image()? {
-    let header = reader.header().expect("an advanced reader has a header");
+        // A file holds one or more image *positions*: FITS calls them HDUs, XISF calls them
+        // <Image> elements. `next_image` walks both and returns false at the end.
+        while reader.next_image()? {
+            let header = reader.header().expect("an advanced reader has a header");
 
-    // A position this version will not decode says so, in a class and a sentence, rather
-    // than by erroring — and the rest of the file still walks.
-    if let Some(decline) = header.decline_reason() {
-        println!("declined ({:?}): {}", decline.class(), decline.reason());
-        continue;
+            // A position this version will not decode says so, in a class and a sentence,
+            // rather than by erroring — and the rest of the file still walks.
+            if let Some(decline) = header.decline_reason() {
+                println!("declined ({:?}): {}", decline.class(), decline.reason());
+                continue;
+            }
+
+            if let (Some(w), Some(h), Some(c)) =
+                (header.width(), header.height(), header.channels())
+            {
+                println!("{w} x {h} x {c}");
+            }
+
+            // Where the normalization range came from is reported, never guessed at.
+            match header.bounds() {
+                Bounds::Declared(lo, hi) => println!("bounds {lo}..{hi} (declared by the file)"),
+                Bounds::FormatDefault(lo, hi) => println!("bounds {lo}..{hi} (format default)"),
+                other => println!("bounds {other:?}"),
+            }
+        }
     }
-
-    if let (Some(w), Some(h), Some(c)) = (header.width(), header.height(), header.channels()) {
-        println!("{w} x {h} x {c}");
-    }
-
-    // Where the normalization range came from is reported, never guessed at.
-    match header.bounds() {
-        Bounds::Declared(lo, hi) => println!("bounds {lo}..{hi} (declared by the file)"),
-        Bounds::FormatDefault(lo, hi) => println!("bounds {lo}..{hi} (format default)"),
-        other => println!("bounds {other:?}"),
-    }
+    Ok(())
 }
-# Ok::<(), astroframe::Error>(())
 ```
 
 [`examples/`](examples/) walks the rest as a ladder: header-only, whole-image decode, native

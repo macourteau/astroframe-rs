@@ -16,43 +16,12 @@ use std::io::Cursor;
 use std::ops::ControlFlow;
 
 use astroframe::{
-    Bounds, Error, Granularity, Header, Normalizer, Orientation, PixelStorage, Range, Reader,
-    RowOrder, SampleSlice, Samples, Source,
+    Bounds, Granularity, Header, Normalizer, Orientation, PixelStorage, Range, Reader, RowOrder,
+    SampleSlice, Samples, Source,
 };
 
 use common::xisf::{self, Unit};
-use common::{Hdu, file};
-
-// ------------------------------------------------------------------ comparison
-
-/// Compare buffers by `to_bits()`, never by `==` and never approximately.
-#[track_caller]
-fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: length");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
-}
-
-/// The error's variant name. Assertions name the variant rather than matching on a message,
-/// which is text the crate is free to reword.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
+use common::{Hdu, assert_same_bits, file, kind};
 
 // ------------------------------------------------------------------ fixtures
 
@@ -918,7 +887,12 @@ fn fits_float_frames_decode_natively_and_refuse_normalized_output() {
     reader
         .read_samples_into(&mut native)
         .expect("native samples decode");
-    assert_eq!(native, Samples::F32(samples.clone()));
+    let Samples::F32(decoded) = &native else {
+        panic!("BITPIX -32 decodes as F32, got {:?}", native.format());
+    };
+    // By bits rather than by `==`: the fixture carries `0.0`, and `==` is precisely what would
+    // wave a decoder emitting `-0.0` there through.
+    assert_same_bits(decoded, &samples, "native f32 samples");
 
     // A second reader for the normalized half: `read_samples_into` above has already begun the
     // pixel phase, from which `with_bounds` is `InvalidRequest` per *Phases, and what resets*.

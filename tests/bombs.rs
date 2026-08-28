@@ -37,6 +37,7 @@ use std::io::Cursor;
 
 use astroframe::{Error, Limits, Reader};
 
+use common::kind;
 use common::xisf::{Unit, le_u16, lz4, repeating_u16, zlib};
 
 #[global_allocator]
@@ -55,18 +56,6 @@ const INFLATED: usize = 8 << 20;
 /// decode of the same geometry also pays — so this leaves roughly 3x headroom over the worst
 /// of them while a decode that materialized the payload would miss by 16x.
 const ALLOWED: usize = INFLATED / 16;
-
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
 
 fn attach_image(attrs: &str, block: Vec<u8>) -> Vec<u8> {
     Unit::new()

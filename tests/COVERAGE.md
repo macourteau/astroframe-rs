@@ -76,18 +76,19 @@ is reported and never substituted), `fits_decisions::roworder_spellings_normaliz
 | *Adversarial suite* | `adversarial::compressed_usize_disagrees_with_geometry`, `adversarial::uncompressed_block_size_mismatch`, `adversarial::sample_block_byte_cap_exceeded` — the cases where a declared size is used as a cross-check instead of an allocation size — and the rest of the suite |
 | *Every cap has a test that trips it* | `fits_caps::*`, `xml_guards::the_stored_block_cap_trips_on_a_sequential_source`, `xml_guards::the_subblock_count_cap_trips`, `xml_guards::the_zstd_declared_window_cap_trips`, `xml_guards::a_declared_header_length_above_the_cap_is_rejected_before_the_read` |
 | *A decompression bomb is refused without materializing* | `bombs::a_decompression_bomb_is_refused_without_materializing` (zlib, LZ4 and the zstd declared window, with the allocation asserted) |
-| *Fuzzing* | `fuzz_replay::synthetic_seeds_replay_without_panicking`, `fuzz_replay::committed_corpus_and_crash_artifacts_replay`, and the six `fuzz/fuzz_targets/*` under `cargo fuzz` |
+| *Fuzzing* | `fuzz_replay::every_seed_replays_within_the_fuzz_oracles_bound` — both seed sources, the synthetic ones and the committed corpus and crash artifacts — and the six `fuzz/fuzz_targets/*` under `cargo fuzz` |
 
 The stored-block cap closes I4's one remaining hole — a declared `attachment:pos:size` that
 becomes an allocation — so it is deliberately tested on a **sequential** source, the shape with
 no file length to fall back on.
 
 > **On the names in this file.** Most entries read `file::name` and select with
-> `cargo test name`. Some do not: `tests/header_alloc.rs`, `tests/bombs.rs` and
-> `tests/peak_memory.rs` install a `#[global_allocator]` and measure the whole process, so each
-> holds **one** `#[test]` that calls its shapes as plain functions — the harness runs tests in
-> parallel, and two of these racing on one counter measure each other. An entry naming such a
-> shape names a function, not a selectable test; run its file's single test instead.
+> `cargo test name`. Some do not: `tests/header_alloc.rs`, `tests/bombs.rs`,
+> `tests/peak_memory.rs` and `tests/fuzz_replay.rs` install a `#[global_allocator]` and measure
+> the whole process, so each holds **one** `#[test]` that calls its shapes as plain functions —
+> the harness runs tests in parallel, and two of these racing on one counter measure each
+> other. An entry naming such a shape names a function, not a selectable test; run its file's
+> single test instead.
 
 ## I5 — Malformed input errors, never aborts
 
@@ -99,7 +100,7 @@ no file length to fall back on.
 | *Caller misuse is an error, not a panic* | `fits_declines::a_wrong_sized_destination_is_invalid_request`, `fits_declines::select_channel_beyond_the_channel_count_is_invalid_request`, `fits_declines::select_channel_where_the_channel_count_is_none_is_invalid_request`, `fits_declines::with_bounds_after_the_pixel_phase_is_invalid_request`, `fits_declines::read_samples_into_with_a_mismatched_variant_is_invalid_request`, `fits_declines::a_second_with_bounds_and_a_second_select_channel_are_last_wins`, `fits_declines::an_invalid_second_with_bounds_leaves_the_first_range_in_force` |
 | *The XML guards* | `xml_guards::*`, including `quick_xml_resolves_only_the_five_predefined_entities_and_does_not_recurse`, which pins a property of the *dependency* rather than of this crate |
 | *Fuzzing* | as I4 |
-| *the unbounded-allocation clause*, held per-shape rather than only by the fuzzer | `header_alloc::header_parsing_stays_within_the_fuzz_oracles_allocation_bound` — every multiplying header shape and six two-multiplier growth grids, each asserting the fuzz oracle's own bound **and** a per-shape ratio, because the bound's fixed 8 MiB term admits a hundredfold multiple at the input sizes these shapes reach |
+| *the unbounded-allocation clause*, held per-shape rather than only by the fuzzer | `header_alloc::header_parsing_stays_within_the_fuzz_oracles_allocation_bound` — every multiplying header shape and three two-multiplier growth grids, each asserting the fuzz oracle's own bound **and** a per-shape ratio, because the bound's fixed 8 MiB term admits a hundredfold multiple at the input sizes these shapes reach |
 
 The **hang** clause is the one a fuzzer covers worst: a libFuzzer run reports a hang only as a
 timeout, and fuzz inputs are finite by construction, so an unbounded skip over a pipe is held by

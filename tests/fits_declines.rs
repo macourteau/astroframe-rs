@@ -17,7 +17,11 @@ use std::io::Cursor;
 
 use astroframe::{DeclineClass, Error, Limits, Reader, Samples, Sequential, Source};
 
-use common::{FailingRead, Hdu, file};
+use common::{
+    FailingRead, Hdu, STORED_2X2, STORED_2X2X3, assert_same_bits, empty_primary, expected_sample,
+    file, kind, table_extension, unsigned_2x2, unsigned_2x2_expected, unsigned_2x2_extension,
+    unsigned_2x2x3,
+};
 
 // ------------------------------------------------------------------ helpers
 
@@ -29,20 +33,6 @@ fn sequential(bytes: Vec<u8>) -> astroframe::Result<SeqReader> {
 
 fn sequential_with(bytes: Vec<u8>, limits: Limits) -> astroframe::Result<SeqReader> {
     Reader::sequential_with_limits(Cursor::new(bytes), limits)
-}
-
-/// The error's variant name. Assertions name the variant rather than matching on a message,
-/// which is text the crate is free to reword.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
 }
 
 /// Both pixel entry points at a declined position, since the table says *any* pixel call is
@@ -70,90 +60,7 @@ fn geometry(header: &astroframe::Header) -> (Option<u32>, Option<u32>, Option<u3
     (header.width(), header.height(), header.channels())
 }
 
-/// Compare buffers by `to_bits()`. `==` silently accepts a sign-of-zero difference, which is
-/// exactly the difference this crate's normalization contract is about.
-fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: destination length");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
-}
-
-/// The pinned normalization form, written out longhand so an expectation never comes from
-/// the code under test: `physical = BSCALE * raw + BZERO`, then `(physical - lo) as f32`,
-/// then a multiply by the `f32` reciprocal of the width.
-fn expected_sample(raw: i16, bzero: f64, lo: f64, hi: f64) -> f32 {
-    let physical: f64 = raw as f64 + bzero;
-    let shifted: f32 = (physical - lo) as f32;
-    shifted * (1.0f32 / ((hi - lo) as f32))
-}
-
 // ------------------------------------------------------------------ fixtures
-
-/// A primary holding no image — the ordinary shape of every multi-extension file.
-fn empty_primary() -> Hdu {
-    Hdu::primary().card("BITPIX", "8").card("NAXIS", "0")
-}
-
-/// The stored samples of the 2x2 fixtures: the two endpoints of the unsigned convention and
-/// two interior levels.
-const STORED_2X2: [i16; 4] = [-32768, -32767, 0, 32767];
-
-/// A decodable 2x2 frame under the FITS unsigned convention.
-fn unsigned_2x2() -> Hdu {
-    Hdu::primary()
-        .image_2d(16, 2, 2)
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2)
-}
-
-/// The same frame as an `IMAGE` extension.
-fn unsigned_2x2_extension() -> Hdu {
-    Hdu::extension("IMAGE")
-        .image_2d(16, 2, 2)
-        .card("PCOUNT", "0")
-        .card("GCOUNT", "1")
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2)
-}
-
-/// The 2x2 frame's expected normalized output at the default unsigned range.
-fn unsigned_2x2_expected() -> Vec<f32> {
-    STORED_2X2
-        .iter()
-        .map(|&raw| expected_sample(raw, 32768.0, 0.0, 65535.0))
-        .collect()
-}
-
-/// A three-channel 2x2 cube, each plane holding distinct levels.
-const STORED_2X2X3: [i16; 12] = [
-    -32768, -32767, -32766, -32765, 0, 1, 2, 3, 32764, 32765, 32766, 32767,
-];
-
-fn unsigned_2x2x3() -> Hdu {
-    Hdu::primary()
-        .image_3d(16, 2, 2, 3)
-        .unsigned_convention(16)
-        .data_i16(&STORED_2X2X3)
-}
-
-/// A non-image extension carrying a small data unit.
-fn table_extension() -> Hdu {
-    Hdu::extension("TABLE")
-        .card("BITPIX", "8")
-        .card("NAXIS", "2")
-        .card("NAXIS1", "4")
-        .card("NAXIS2", "2")
-        .card("PCOUNT", "0")
-        .card("GCOUNT", "1")
-        .data(vec![b'.'; 8])
-}
 
 /// An `IMAGE` extension declaring no data array. §7.1.1: no data blocks follow it.
 fn null_image_extension() -> Hdu {
@@ -305,25 +212,9 @@ fn header_structure_fault_is_malformed_at_next_image_for_an_extension() {
     }
 }
 
-/// Row *HDU-traversal cap tripped while advancing*: `LimitExceeded`, from `next_image()`,
-/// with no `Header`.
-#[test]
-fn hdu_traversal_cap_is_limit_exceeded_at_next_image() {
-    let bytes = file(&[
-        empty_primary(),
-        table_extension(),
-        table_extension(),
-        table_extension(),
-        unsigned_2x2_extension(),
-    ]);
-    let mut limits = Limits::default();
-    limits.hdus_per_advance = 2;
-    let mut reader = sequential_with(bytes, limits).expect("the primary header parses");
-    let err = reader.next_image().expect_err("the traversal cap trips");
-    assert_eq!(kind(&err), "LimitExceeded", "{err}");
-    assert!(format!("{err}").contains("HDUs traversed"), "{err}");
-    assert!(reader.header().is_none(), "no Header for a failed advance");
-}
+// Row *HDU-traversal cap tripped while advancing* is graded in
+// `fits_caps::hdus_per_advance_cap_trips`, alongside the cap criterion it shares a fixture
+// and a trip with.
 
 /// Row *A non-image extension whose data unit cannot be sized*: `Malformed`, from
 /// `next_image()`, with no `Header`.

@@ -99,7 +99,11 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![warn(clippy::all)]
+#![warn(missing_debug_implementations)]
+// The README's example is compiled and run as a doctest, so a snippet that drifts from the API
+// fails the build rather than misleading a reader. `cfg(doctest)` is what keeps the README out
+// of the rendered crate documentation, which covers the same ground in its own words.
+#![cfg_attr(doctest, doc = include_str!("../README.md"))]
 
 pub mod error;
 pub mod header;

@@ -25,7 +25,10 @@ struct Attachment {
 }
 
 /// Builds one monolithic XISF unit.
-#[derive(Default)]
+///
+/// There is no `Default`: a unit with empty root attributes carries neither the namespace nor
+/// the `version` §9.5 makes mandatory, so it is a fixture no test wants and every test could
+/// reach. [`Unit::new`] is the only way in.
 pub struct Unit {
     root_attrs: String,
     /// Root-level XML that carries no attachment, in document order relative to attachments.
@@ -35,12 +38,6 @@ pub struct Unit {
 enum Fragment {
     Xml(String),
     Attached(Attachment),
-}
-
-impl Default for Fragment {
-    fn default() -> Self {
-        Fragment::Xml(String::new())
-    }
 }
 
 impl Unit {
@@ -186,6 +183,26 @@ impl Unit {
             self.root_attrs, body
         )
     }
+}
+
+/// The declared-header-length field, so a fixture that writes its own header region keeps the
+/// preamble honest.
+pub fn with_header(header: &str, trailing: &[u8]) -> Vec<u8> {
+    raw_unit(b"XISF0100", header.len() as u32, header, trailing)
+}
+
+/// The 4 × 3 `UInt16` samples nearly every single-image fixture stores.
+pub fn samples() -> Vec<u16> {
+    repeating_u16(12)
+}
+
+/// The pinned normalization form for a `UInt16` image at the format default range, written
+/// out longhand so an expectation never comes from the code under test.
+pub fn expected_u16(levels: &[u16]) -> Vec<f32> {
+    levels
+        .iter()
+        .map(|&l| (l as f64 - 0.0) as f32 * (1.0f32 / 65535.0f32))
+        .collect()
 }
 
 /// Build a raw unit from a header string, bypassing the offset iteration.

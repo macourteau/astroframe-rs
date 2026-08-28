@@ -216,6 +216,45 @@ jobs:
                   | grep -E 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' || true)"
           [ -z "$hits" ] || { echo "$hits"; fail "banned numeric construct on the decode path"; }
 
+          # Sample buffers are compared by `to_bits()`, never by `==`, because `==` silently
+          # accepts a sign-of-zero difference — exactly the class of defect the endpoint tests
+          # exist to catch. `assert_eq!` over an `f32` buffer is that `==` spelled by a macro:
+          # `Samples` derives `PartialEq`, so it compiles and reads like a comparison of
+          # pixels. `tests/common/mod.rs::assert_same_bits` is what a suite reaches for
+          # instead.
+          #
+          # The scan tracks parenthesis depth from each `assert_eq!`/`assert_ne!` so a
+          # rustfmt-wrapped invocation is graded as one unit, and so a `Samples::F32(..)` match
+          # arm two lines away is not mistaken for one. Line comments and string literals are
+          # stripped first: a message that mentions `Samples::F32` is prose, and a message
+          # holding an unbalanced parenthesis would otherwise run the depth count off.
+          #
+          # It reaches what the assertion itself spells — the float `Samples`/`SampleSlice`
+          # variants, a written-out `[f32]`, and the `Image` accessors that hand back
+          # normalized samples. A buffer bound to a variable whose type was declared on an
+          # earlier line is past it, which is why the discipline is also stated in
+          # `CONTRIBUTING.md` rather than left to this check alone.
+          hits="$(git ls-files 'tests/*.rs' | xargs awk '
+              FNR == 1 { depth = 0 }
+              { line = $0; sub(/\/\/.*/, "", line); gsub(/"[^"]*"/, "S", line) }
+              depth == 0 {
+                i = match(line, /assert_(eq|ne)!\(/)
+                if (i == 0) next
+                line = substr(line, i); start = FNR; text = ""
+              }
+              {
+                text = text " " line
+                o = line; c = line
+                depth += gsub(/\(/, "(", o) - gsub(/\)/, ")", c)
+                if (depth <= 0) {
+                  depth = 0
+                  if (text ~ /(Samples|SampleSlice)::F(32|64)|\[f32\]|\[f64\]|Vec<f32>|Vec<f64>/ ||
+                      (text ~ /(into_samples\(\)|samples\(\)|channel\([^)])/ && text !~ /\.len\(\)/))
+                    print FILENAME ":" start ":" text
+                }
+              }' || true)"
+          [ -z "$hits" ] || { echo "$hits"; fail "an assert_eq! compares f32 samples; use assert_same_bits"; }
+
           # Invariant I1's mechanical enforcement: layer 2 lives alone, so a format cannot
           # grow its own arithmetic without the dependency edge becoming visible in review.
           hits="$(grep -nE '^\s*use\s+crate::(fits|xisf)' src/normalize.rs || true)"

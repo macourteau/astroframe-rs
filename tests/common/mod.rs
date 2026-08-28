@@ -1,4 +1,4 @@
-//! Fixture builders.
+//! Fixture builders and the assertions every suite grades with.
 //!
 //! Fixtures are built **byte by byte here**, never checked in as opaque blobs. Every byte is
 //! visible where the assertion is, which matters more than usual in this crate: a fixture
@@ -6,10 +6,51 @@
 //!
 //! Everything built here is synthetic. No real frame header, and so no observatory
 //! coordinates and no real `DATE-OBS`, ever reaches a committed file.
+//!
+//! [`assert_same_bits`] lives here rather than in each suite because it *is* the crate's
+//! `to_bits()` discipline: a suite carrying its own copy is a suite that can compare a sample
+//! buffer some other way without anything noticing.
 
 #![allow(dead_code)] // each integration test binary uses a different subset
 
 pub mod xisf;
+
+use astroframe::Error;
+
+// ------------------------------------------------------------------ grading
+
+/// The error's variant name. Assertions name the variant rather than matching on a message,
+/// which is text the crate is free to reword; a message substring is asserted separately
+/// where it is load-bearing.
+pub fn kind(e: &Error) -> &'static str {
+    match e {
+        Error::Io(_) => "Io",
+        Error::Malformed(_) => "Malformed",
+        Error::Unsupported(_) => "Unsupported",
+        Error::ChecksumMismatch(_) => "ChecksumMismatch",
+        Error::LimitExceeded(_) => "LimitExceeded",
+        Error::InvalidRequest(_) => "InvalidRequest",
+        other => panic!("a variant this suite does not know: {other:?}"),
+    }
+}
+
+/// Compare buffers by `to_bits()`, never by `==` and never approximately.
+///
+/// `==` silently accepts a sign-of-zero difference, which is exactly the class of defect
+/// these comparisons exist to catch.
+#[track_caller]
+pub fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: sample count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "{what}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
+            g.to_bits(),
+            w.to_bits()
+        );
+    }
+}
 
 /// A FITS header unit is a whole number of these.
 pub const BLOCK: usize = 2880;
@@ -223,14 +264,78 @@ fn pad_to_block(out: &mut Vec<u8>) {
     }
 }
 
-/// Pad a data unit region with zeros rather than spaces, which is what the standard says for
-/// a data unit as opposed to a header unit.
-pub fn zero_pad(mut bytes: Vec<u8>) -> Vec<u8> {
-    while !bytes.len().is_multiple_of(BLOCK) {
-        bytes.push(0);
-    }
-    bytes
+// ------------------------------------------------------------------ shared FITS fixtures
+
+/// The pinned normalization form, written out longhand so an expectation never comes from
+/// the code under test: `physical = BSCALE * raw + BZERO`, then `(physical - lo) as f32`,
+/// then a multiply by the `f32` reciprocal of the width.
+pub fn expected_sample(raw: i16, bzero: f64, lo: f64, hi: f64) -> f32 {
+    let physical: f64 = raw as f64 + bzero;
+    let shifted: f32 = (physical - lo) as f32;
+    shifted * (1.0f32 / ((hi - lo) as f32))
 }
+
+/// The stored samples of the 2x2 fixtures: the two endpoints of the unsigned convention and
+/// two interior levels.
+pub const STORED_2X2: [i16; 4] = [-32768, -32767, 0, 32767];
+
+/// A decodable 2x2 frame under the FITS unsigned convention: 16 destination bytes.
+pub fn unsigned_2x2() -> Hdu {
+    Hdu::primary()
+        .image_2d(16, 2, 2)
+        .unsigned_convention(16)
+        .data_i16(&STORED_2X2)
+}
+
+/// The same frame as an `IMAGE` extension.
+pub fn unsigned_2x2_extension() -> Hdu {
+    Hdu::extension("IMAGE")
+        .image_2d(16, 2, 2)
+        .card("PCOUNT", "0")
+        .card("GCOUNT", "1")
+        .unsigned_convention(16)
+        .data_i16(&STORED_2X2)
+}
+
+/// The 2x2 frame's expected normalized output at the default unsigned range.
+pub fn unsigned_2x2_expected() -> Vec<f32> {
+    STORED_2X2
+        .iter()
+        .map(|&raw| expected_sample(raw, 32768.0, 0.0, 65535.0))
+        .collect()
+}
+
+/// A three-channel 2x2 cube, each plane holding distinct levels: 12 samples in the file, 4 in
+/// a narrowed destination.
+pub const STORED_2X2X3: [i16; 12] = [
+    -32768, -32767, -32766, -32765, 0, 1, 2, 3, 32764, 32765, 32766, 32767,
+];
+
+pub fn unsigned_2x2x3() -> Hdu {
+    Hdu::primary()
+        .image_3d(16, 2, 2, 3)
+        .unsigned_convention(16)
+        .data_i16(&STORED_2X2X3)
+}
+
+/// A primary holding no image — the ordinary shape of every multi-extension file.
+pub fn empty_primary() -> Hdu {
+    Hdu::primary().card("BITPIX", "8").card("NAXIS", "0")
+}
+
+/// A non-image extension carrying a small data unit.
+pub fn table_extension() -> Hdu {
+    Hdu::extension("TABLE")
+        .card("BITPIX", "8")
+        .card("NAXIS", "2")
+        .card("NAXIS1", "4")
+        .card("NAXIS2", "2")
+        .card("PCOUNT", "0")
+        .card("GCOUNT", "1")
+        .data(vec![b'.'; 8])
+}
+
+// ------------------------------------------------------------------ sources
 
 /// A `Read` source that records how many bytes were pulled from it, so a test can assert that
 /// header-only decode touches only the header region.

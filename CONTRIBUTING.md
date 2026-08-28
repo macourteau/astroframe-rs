@@ -58,6 +58,8 @@ header.
 
 Compare pixel buffers with `f32::to_bits()`, never `==`. `==` silently accepts sign-of-zero
 differences, which is exactly the class of defect the endpoint tests exist to catch.
+`tests/common/mod.rs::assert_same_bits` is the one copy of that comparison, and the `greps`
+job fails the build on an `assert_eq!` over a float sample buffer anywhere under `tests/`.
 
 Some tests are `#[ignore]`d and read a corpus of real frames through `ASTROFRAME_CORPUS`.
 That corpus is not distributable — the frames carry observatory coordinates at full precision

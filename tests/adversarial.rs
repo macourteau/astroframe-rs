@@ -46,27 +46,12 @@ use std::io::Cursor;
 
 use astroframe::{Error, Image, Limits, Reader, SampleFormat, Samples};
 
-use common::FailingRead;
 use common::xisf::{
     Unit, checksum_attr, le_f32, le_u16, lz4, raw_unit, repeating_u16, shuffle, zlib,
 };
+use common::{FailingRead, assert_same_bits, kind};
 
 // ------------------------------------------------------------------ grading
-
-/// The error's variant name. Assertions name the variant rather than matching on a message,
-/// which is text the crate is free to reword; a message substring is asserted separately
-/// where it is load-bearing.
-fn kind(e: &Error) -> &'static str {
-    match e {
-        Error::Io(_) => "Io",
-        Error::Malformed(_) => "Malformed",
-        Error::Unsupported(_) => "Unsupported",
-        Error::ChecksumMismatch(_) => "ChecksumMismatch",
-        Error::LimitExceeded(_) => "LimitExceeded",
-        Error::InvalidRequest(_) => "InvalidRequest",
-        other => panic!("a variant this suite does not know: {other:?}"),
-    }
-}
 
 /// The whole decode the original corpus's entry point drives: construct, advance to the first
 /// image, decode it. The first error wins, wherever in that sequence it surfaces — which is
@@ -117,21 +102,6 @@ fn assert_names(case: &str, e: &Error, fragment: &str) {
         text.contains(fragment),
         "{case}: the error should name {fragment:?}, got {text:?}"
     );
-}
-
-/// Compare by `to_bits()`, never `==`: `==` accepts a sign-of-zero difference, which is
-/// exactly the class of defect these comparisons exist to catch.
-fn assert_same_bits(case: &str, got: &[f32], want: &[f32]) {
-    assert_eq!(got.len(), want.len(), "{case}: sample count");
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "{case}: sample {i}: got {g:?} ({:#010x}), want {w:?} ({:#010x})",
-            g.to_bits(),
-            w.to_bits()
-        );
-    }
 }
 
 /// The pinned normalization form for a `UInt16` image at the format default range, written
@@ -341,9 +311,9 @@ fn colorspace_absent_with_three_channels() {
     let image = decode(&bytes).expect("colorspace absent with three channels decodes");
     assert_eq!((image.width(), image.height(), image.channels()), (2, 2, 3));
     assert_same_bits(
-        "colorspace absent with three channels",
         image.samples(),
         &expected_u16(&levels),
+        "colorspace absent with three channels",
     );
 }
 
@@ -357,9 +327,9 @@ fn gray_with_two_channels() {
     let image = decode(&bytes).expect("gray with two channels decodes");
     assert_eq!((image.width(), image.height(), image.channels()), (2, 2, 2));
     assert_same_bits(
-        "gray with two channels",
         image.samples(),
         &expected_u16(&levels),
+        "gray with two channels",
     );
 }
 
@@ -373,9 +343,9 @@ fn rgb_with_four_channels() {
     let image = decode(&bytes).expect("rgb with four channels decodes");
     assert_eq!((image.width(), image.height(), image.channels()), (2, 2, 4));
     assert_same_bits(
-        "rgb with four channels",
         image.samples(),
         &expected_u16(&levels),
+        "rgb with four channels",
     );
 }
 
@@ -420,7 +390,7 @@ fn grade_bounds(case: &str, declared: &str) {
     let Samples::F32(got) = &native else {
         panic!("{case}: destination format changed")
     };
-    assert_same_bits(&format!("{case} (native)"), got, &BOUNDS_SAMPLES);
+    assert_same_bits(got, &BOUNDS_SAMPLES, &format!("{case} (native)"));
 }
 
 #[test]
@@ -804,9 +774,9 @@ fn shuffle_item_size_mismatch() {
     );
     let image = decode(&bytes).expect("shuffle item size mismatch decodes");
     assert_same_bits(
-        "shuffle item size mismatch",
         image.samples(),
         &expected_u16(&levels),
+        "shuffle item size mismatch",
     );
 }
 
@@ -1145,9 +1115,9 @@ fn subblock_lengths_do_not_sum_to_the_block_size() {
     );
     let image = decode(&bytes).expect("a summing subblock list decodes");
     assert_same_bits(
-        "subblock list sums",
         image.samples(),
         &expected_u16(&levels),
+        "subblock list sums",
     );
 }
 
@@ -1182,7 +1152,7 @@ fn checksummed_block_whose_digest_does_not_match() {
         stored,
     );
     let image = decode(&bytes).expect("a matching digest decodes");
-    assert_same_bits("matching digest", image.samples(), &expected_u16(&levels));
+    assert_same_bits(image.samples(), &expected_u16(&levels), "matching digest");
 }
 
 /// Net-new: an XISF block behind the cursor on a sequential source is `Unsupported`, **not**
@@ -1203,9 +1173,9 @@ fn a_block_behind_the_cursor_on_a_sequential_source() {
         .read_image()
         .expect("the first image decodes forward");
     assert_same_bits(
-        "sequential forward decode",
         image.samples(),
         &expected_u16(&first),
+        "sequential forward decode",
     );
 
     assert!(reader.next_image().expect("advance"));
@@ -1231,9 +1201,9 @@ fn a_block_behind_the_cursor_on_a_sequential_source() {
         .read_image()
         .expect("the second image decodes through a seekable source");
     assert_same_bits(
-        "seekable backward decode",
         image.samples(),
         &expected_u16(&second),
+        "seekable backward decode",
     );
 }
 
