@@ -37,41 +37,55 @@ fn main() -> astroframe::Result<()> {
         // `Samples::zeroed` once and `read_samples_into` in the loop.
         let samples = reader.read_samples()?;
 
-        // `Samples` is the owned enum, one variant per sample width. Unlike `Bounds` and
-        // `Granularity` it is deliberately **closed** — no `#[non_exhaustive]` — so this match
-        // needs no wildcard and a width added later is a compile error here rather than a
-        // silently-taken fallback arm. `SampleSlice` is its borrowed twin, closed for the same
-        // reason; that is what the chunked path hands you (see 05_streaming).
-        let summary = match &samples {
-            Samples::U8(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::U16(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::U32(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::U64(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::I16(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::I32(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::I64(v) => integer_summary(v.iter().map(|&x| i128::from(x))),
-            Samples::F32(v) => float_summary(v.iter().map(|&x| f64::from(x))),
-            Samples::F64(v) => float_summary(v.iter().copied()),
-        };
         println!(
-            "{}x{}x{}  {format:?}  {summary}",
-            g.width, g.height, g.channels
+            "{}x{}x{}  {format:?}  {}",
+            g.width,
+            g.height,
+            g.channels,
+            summarize(&samples)
         );
     }
     Ok(())
 }
 
-fn integer_summary(values: impl Iterator<Item = i128>) -> String {
-    let (mut min, mut max) = (i128::MAX, i128::MIN);
-    for v in values {
-        min = min.min(v);
-        max = max.max(v);
+/// Widest range in the file's own units, which means matching over the sample widths.
+///
+/// `Samples` is the owned enum, one variant per sample width. Unlike `Bounds` and
+/// `Granularity` it is deliberately **closed** — no `#[non_exhaustive]` — so this match needs
+/// no wildcard and a width added later is a compile error here rather than a silently-taken
+/// fallback arm. `SampleSlice` is its borrowed twin, closed for the same reason; that is what
+/// the chunked path hands you (see `05_streaming`).
+///
+/// Matching is what a caller wanting the file's *integers* has to do, because there is no one
+/// type they all fit in. When a `f64` will do — measuring a range, say — `SampleSlice::iter_f64`
+/// widens every variant through the same step the normalization itself uses and skips the
+/// match entirely; `07_channels_and_bounds` takes that path.
+fn summarize(samples: &Samples) -> String {
+    match samples {
+        Samples::U8(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::U16(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::U32(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::U64(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::I16(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::I32(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::I64(v) => integer_range(v.iter().map(|&x| i128::from(x))),
+        Samples::F32(v) => float_range(v.iter().map(|&x| f64::from(x))),
+        Samples::F64(v) => float_range(v.iter().copied()),
     }
+}
+
+/// `i128` holds every integer variant including `u64`, so the widening loses nothing.
+fn integer_range(values: impl Iterator<Item = i128>) -> String {
+    let (min, max) = values.fold((i128::MAX, i128::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
     format!("min {min}  max {max}")
 }
 
-fn float_summary(values: impl Iterator<Item = f64>) -> String {
-    let (mut min, mut max, mut nans) = (f64::INFINITY, f64::NEG_INFINITY, 0usize);
+/// NaN is passed through from float sources rather than repaired, so it is kept out of the
+/// range and counted instead — a silent skip is how a bad frame looks fine.
+fn float_range(values: impl Iterator<Item = f64>) -> String {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut nans = 0usize;
     for v in values {
         if v.is_nan() {
             nans += 1;

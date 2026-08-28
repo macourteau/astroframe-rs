@@ -27,16 +27,23 @@ fn main() -> astroframe::Result<()> {
         eprintln!("usage: 07_channels_and_bounds <frame> [channel]");
         std::process::exit(2);
     };
-    let channel: Option<u32> = args.next().and_then(|s| s.parse().ok());
+    // Parsed rather than best-effort: `parse().ok()` would turn a typo into "decode every
+    // channel", which is a silent wrong answer of exactly the kind this crate refuses to
+    // produce from a file.
+    let channel: Option<u32> = match args.next().map(|arg| arg.parse()) {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => {
+            eprintln!("channel: {e}");
+            std::process::exit(2);
+        }
+        None => None,
+    };
 
     // Pass 1 — the frame's own range, from native samples. This path works on every file,
     // including the ones tier 2 refuses.
-    let (lo, hi) = match measure_range(&path)? {
-        Some(range) => range,
-        None => {
-            println!("nothing to measure in {path}");
-            return Ok(());
-        }
+    let Some((lo, hi)) = measure_range(&path)? else {
+        println!("nothing to measure in {path}");
+        return Ok(());
     };
     println!("native range: {lo} .. {hi}");
 
@@ -80,9 +87,15 @@ fn main() -> astroframe::Result<()> {
     let mut buffer = vec![0.0f32; reader.destination_len()?];
     reader.read_image_into(&mut buffer)?;
 
-    let finite: Vec<f32> = buffer.iter().copied().filter(|s| !s.is_nan()).collect();
-    let min = finite.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // One pass, no second buffer: a megapixel frame does not need a copy of itself to be
+    // summarized, and `fold` over the filtered iterator is the same arithmetic without one.
+    let (min, max) = buffer
+        .iter()
+        .copied()
+        .filter(|s| !s.is_nan())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        });
     println!(
         "{} samples normalized, min {min:.6} max {max:.6}",
         buffer.len()
