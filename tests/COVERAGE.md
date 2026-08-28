@@ -85,10 +85,11 @@ no file length to fall back on.
 > **On the names in this file.** Most entries read `file::name` and select with
 > `cargo test name`. Some do not: `tests/header_alloc.rs`, `tests/bombs.rs`,
 > `tests/peak_memory.rs` and `tests/fuzz_replay.rs` install a `#[global_allocator]` and measure
-> the whole process, so each holds **one** `#[test]` that calls its shapes as plain functions —
-> the harness runs tests in parallel, and two of these racing on one counter measure each
-> other. An entry naming such a shape names a function, not a selectable test; run its file's
-> single test instead.
+> the whole process, so each holds **one** measuring `#[test]` that calls its shapes as plain
+> functions — the harness runs tests in parallel, and two of these racing on one counter
+> measure each other. An entry naming such a shape names a function, not a selectable test;
+> run its file's measuring test instead. (`tests/fuzz_replay.rs` also holds
+> `seed_the_fuzz_corpus`, which is `#[ignore]`d and so never races the measurement.)
 
 ## I5 — Malformed input errors, never aborts
 
