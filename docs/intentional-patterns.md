@@ -256,6 +256,18 @@ released each piece before building the next, so the *peak* was flat at 305 KB a
 range. **A flat peak is not evidence.** § Fuzzing's oracle counts every allocation rather than
 the high-water mark, which is the measure this invariant is stated against.
 
+**That walk exists twice, and one decoder is not the path.** Whether a subblocked block is
+streamed or materialized depends on what else the header declares: § Streaming's floors compose
+to `WholeImage` when the split is joined by byte shuffling, whose transform spans the whole
+pre-split block, and equally when a checksum covers the stored block the split does not divide.
+Both are combinations a writer picks for reasons of its own, so `codec::decompress` walks the
+same `Subblock count` boundaries `Stream::open` does. Carrying one codec state across the
+streaming walk while the materializing one built a `flate2::read::ZlibDecoder` (about 76 KB, a
+`Decompress` and the 32 KiB buffer its reader wraps) or a `ruzstd::FrameDecoder` (about 9 KB)
+per subblock left 4096 subblocks costing 312 MB from a 140 KB input and 37 MB from a 336 KB one.
+A per-occurrence walk is identified by the cap that bounds its length, never by the decoder that
+performs it.
+
 ### How it is enforced
 
 `tests/header_alloc.rs` is where the rule is enforced. Its shapes assert the fuzz oracle's
@@ -271,6 +283,12 @@ and against the same block split 512 times more ways. The second assertion is th
 one, for the reason the grid section below gives about one-dimensional slices: a shape at one
 subblock count passes any single-point bound loose enough to hold at all, however linear in the
 split the allocation behind it is.
+
+`a_materialized_subblock_costs_the_subblock_and_not_the_cap` is the same pair of assertions on
+the other decoder, its fixture shuffled so that the granularity floor is `WholeImage`, and it
+asserts that floor so the fixture cannot drift back onto the streaming path and pass by
+measuring a decoder the shape is not for. Two shapes for one rule, because the paragraph above
+about a walk existing twice was learnt from the streaming shape passing alone.
 
 **A fixture that exercises the code's memo-hit shape measures the memo, not the code.** Every
 reader here memoizes, and byte-identical inputs are the one shape every key hits however wrongly
