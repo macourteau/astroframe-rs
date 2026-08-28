@@ -38,10 +38,7 @@ pub(super) type ChainKey = (KeywordOrigin, Vec<usize>);
 /// `Reference` introduces, which is where the gate sits.
 #[derive(Default)]
 pub(super) struct Cache {
-    /// `is_string` rides along because a memo hit still has to decide whether the record opens
-    /// a `CONTINUE` chain, and §4.2.1.2 continues character strings only; that is not
-    /// recoverable from the built keyword's text.
-    pub(super) keywords: std::collections::HashMap<usize, (Keyword, bool)>,
+    pub(super) keywords: std::collections::HashMap<usize, Keyword>,
     /// Assembled `CONTINUE` chains, keyed on the records each one is assembled from — see
     /// [`close_chain`], which is where the reason a per-record memo does not cover this is
     /// written down.

@@ -1,44 +1,40 @@
-//! The FITS decoder: the HDU walk, the decline table, and big-endian sample decode.
+//! The FITS decoder: the HDU walk and big-endian sample decode.
 //!
 //! Structure, card layout, the data-unit size formula and the value grammar are in FITS
 //! Standard 4.0 and are not restated here. What is here is what the standard leaves open,
 //! plus the hazards whose cost of getting wrong is silent.
+//!
+//! What one HDU's cards *mean* — the decline table, the size formula, the `Header` they
+//! assemble into — is [`crate::fits::hdu`]. This module supplies the lists and holds the
+//! position.
 
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::fits::cards::{BLOCK, block_has_end, fold_cards, lex_integer, lex_logical, lex_number};
-use crate::header::{
-    Bounds, BoundsUnavailable, DeclineClass, DeclineReason, Geometry, Granularity, Header,
-    PixelStorage, RowOrder,
+use crate::fits::cards::{BLOCK, block_has_end, fold_cards, lex_logical};
+use crate::fits::hdu::{
+    Sizing, UnitSize, build_header, data_unit_size, is_image_position, keyword_value,
+    structural_value,
 };
+use crate::header::{Header, RowOrder};
 use crate::limits::{Limits, narrow};
-use crate::metadata::{Keyword, KeywordOrigin, KeywordSet, PropertySet};
-use crate::normalize::Scaling;
+use crate::metadata::{Keyword, KeywordOrigin};
 use crate::reader::{ChunkMeta, PixelPlan};
-use crate::samples::{SampleFormat, SampleSlice, Samples, slice_samples};
+use crate::samples::{SampleSlice, Samples, slice_samples};
 use crate::source::Source;
 
 /// One HDU's parsed header, before any decision about whether to sit on it.
 #[derive(Debug)]
 struct Hdu {
     /// Shared rather than owned, so that handing this HDU's cards to the `Header` it builds
-    /// costs a refcount. See [`KeywordSet`] for what the copy cost when it was one.
+    /// costs a refcount. See `KeywordSet` for what the copy cost when it was one.
     keywords: Arc<[Keyword]>,
+    /// The five sizing keywords, lexed once for this HDU rather than once per consumer.
+    sizing: Sizing,
     /// Where this HDU's data unit starts.
     data_start: u64,
     /// `XTENSION`'s value, trimmed; `None` for the primary HDU.
     xtension: Option<String>,
-}
-
-/// The structural facts a walk needs, each carrying whether it read at all.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum UnitSize {
-    /// `|BITPIX|/8 × GCOUNT × (PCOUNT + Π NAXISᵢ)`, rounded up to the block boundary.
-    Bytes(u64),
-    /// A missing, unparseable or out-of-standard-set sizing keyword, or arithmetic that
-    /// overflowed. There is no resumption point, so the walk ends.
-    Unsizable(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +108,7 @@ impl Decoder {
         )?;
 
         // Validation order, step 2: `SIMPLE` before anything structural.
-        match keyword_value(&keywords, "SIMPLE").and_then(lex_logical) {
+        match structural_value(&keywords, "SIMPLE").and_then(lex_logical) {
             Some(true) => {}
             Some(false) => {
                 return Err(Error::unsupported(
@@ -136,6 +132,7 @@ impl Decoder {
             primary_own: keywords.clone(),
             position: Position::Start,
             pending: Some(Hdu {
+                sizing: Sizing::read(&keywords),
                 keywords: keywords.into(),
                 data_start,
                 xtension: None,
@@ -193,9 +190,11 @@ impl Decoder {
                 return Ok(false);
             };
 
-            if is_image_position(&hdu) {
+            if is_image_position(&hdu.keywords, hdu.xtension.as_deref(), &hdu.sizing) {
                 let header = build_header(
-                    &hdu,
+                    &hdu.keywords,
+                    hdu.xtension.as_deref(),
+                    &hdu.sizing,
                     &self.primary_keywords,
                     &self.primary_own,
                     &self.primary_row_order,
@@ -248,7 +247,7 @@ impl Decoder {
         let Some(hdu) = self.current.as_ref() else {
             return Ok(());
         };
-        let end = match data_unit_size(&hdu.keywords, hdu.xtension.is_none()) {
+        let end = match data_unit_size(&hdu.keywords, &hdu.sizing, hdu.xtension.is_none()) {
             // `checked_add`, not `+`. `data_unit_size` checks its own arithmetic and can still
             // hand back a legitimate `18446744073709551360` — the largest multiple of 2880
             // below `u64::MAX` — from `NAXIS1 = 9223372036854774368` at `BITPIX = 16`, inside
@@ -284,7 +283,7 @@ impl Decoder {
     }
 
     fn skip_data_unit<S: Source>(&self, hdu: &Hdu, src: &mut S, limits: &Limits) -> Result<()> {
-        match data_unit_size(&hdu.keywords, hdu.xtension.is_none()) {
+        match data_unit_size(&hdu.keywords, &hdu.sizing, hdu.xtension.is_none()) {
             UnitSize::Bytes(n) => {
                 if src.position() < hdu.data_start {
                     src.skip(hdu.data_start - src.position(), limits)?;
@@ -337,6 +336,7 @@ impl Decoder {
                 ))
             })?;
         Ok(Some(Hdu {
+            sizing: Sizing::read(&keywords),
             keywords: keywords.into(),
             data_start: src.position(),
             xtension: Some(xtension),
@@ -551,475 +551,6 @@ fn reorigin(keywords: &[Keyword], origin: KeywordOrigin) -> Vec<Keyword> {
             k
         })
         .collect()
-}
-
-fn keyword_value<'a>(keywords: &'a [Keyword], name: &str) -> Option<&'a str> {
-    keywords
-        .iter()
-        .find(|k| k.name() == name)
-        .map(|k| k.value())
-}
-
-// ------------------------------------------------------------------ the decline table
-
-/// Whether the reader sits on this HDU or steps over it.
-///
-/// A primary with `NAXIS = 0` is the ordinary shape of every multi-extension file, so it is
-/// not a decline at all — only the *absence of any image anywhere* is left, and that is end
-/// of source rather than an error. An `XTENSION = 'IMAGE'` with `NAXIS = 0` answers the same
-/// question the same way. A `BINTABLE` carrying `ZIMAGE = T` is the opposite: a declined
-/// position rather than an aborted source, so the second-pass dispatch point has somewhere to
-/// attach.
-fn is_image_position(hdu: &Hdu) -> bool {
-    let naxis = keyword_value(&hdu.keywords, "NAXIS").and_then(lex_integer);
-    match hdu.xtension.as_deref() {
-        None | Some("IMAGE") => match naxis {
-            // A missing or unparseable NAXIS is a declined image position rather than an
-            // unsizable skip: the reader sits on it and reports what it can.
-            None => true,
-            Some(0) => false,
-            Some(_) => true,
-        },
-        Some("BINTABLE") => {
-            keyword_value(&hdu.keywords, "ZIMAGE").and_then(lex_logical) == Some(true)
-        }
-        _ => false,
-    }
-}
-
-/// Read the geometry, if it reads at all.
-///
-/// The line is **representability, not validity**: a geometry this crate can read is reported
-/// even when what it reads is what declines the position. So this is computed independently
-/// of which fault wins the class.
-fn read_geometry(keywords: &[Keyword], prefix: &str) -> Option<Geometry> {
-    let naxis = keyword_value(keywords, &format!("{prefix}NAXIS")).and_then(lex_integer)?;
-    let axis = |i: i64| -> Option<u32> {
-        let v = keyword_value(keywords, &format!("{prefix}NAXIS{i}")).and_then(lex_integer)?;
-        u32::try_from(v).ok()
-    };
-    match naxis {
-        2 => Some(Geometry {
-            width: axis(1)?,
-            height: axis(2)?,
-            channels: 1,
-        }),
-        3 => Some(Geometry {
-            width: axis(1)?,
-            height: axis(2)?,
-            channels: axis(3)?,
-        }),
-        _ => None,
-    }
-}
-
-fn read_sample_format(keywords: &[Keyword], prefix: &str) -> Option<SampleFormat> {
-    let bitpix = keyword_value(keywords, &format!("{prefix}BITPIX")).and_then(lex_integer)?;
-    sample_format_of(bitpix)
-}
-
-fn sample_format_of(bitpix: i64) -> Option<SampleFormat> {
-    match bitpix {
-        8 => Some(SampleFormat::U8),
-        16 => Some(SampleFormat::I16),
-        32 => Some(SampleFormat::I32),
-        64 => Some(SampleFormat::I64),
-        -32 => Some(SampleFormat::F32),
-        -64 => Some(SampleFormat::F64),
-        _ => None,
-    }
-}
-
-/// Walk the FITS validation order and return the first fault, if any.
-///
-/// > block and card structure → `SIMPLE`/`XTENSION` → `BITPIX` → `NAXIS` and `NAXISn` →
-/// > `PCOUNT` and `GCOUNT` → `GROUPS` → `ZIMAGE` → `BSCALE`/`BZERO`/`BLANK`
-///
-/// A header can carry two faults of different classes, and the decline table would otherwise
-/// not determine which one the caller sees. So a header carrying both `BITPIX = 5` and
-/// `NAXIS = 1` is `Malformed`, not `Unsupported`: structural validity of a value is settled
-/// before scope is.
-fn first_fault(hdu: &Hdu) -> Option<DeclineReason> {
-    let kw = &hdu.keywords;
-    let is_primary = hdu.xtension.is_none();
-
-    // BITPIX
-    match keyword_value(kw, "BITPIX").and_then(lex_integer) {
-        None => {
-            return Some(DeclineReason::new(
-                DeclineClass::Malformed,
-                "BITPIX is missing or is not an integer value",
-            ));
-        }
-        Some(b) if sample_format_of(b).is_none() => {
-            return Some(DeclineReason::new(
-                DeclineClass::Malformed,
-                format!("BITPIX = {b} is outside the standard set {{8, 16, 32, 64, -32, -64}}"),
-            ));
-        }
-        Some(_) => {}
-    }
-
-    // NAXIS and NAXISn
-    let naxis = match keyword_value(kw, "NAXIS").and_then(lex_integer) {
-        None => {
-            return Some(DeclineReason::new(
-                DeclineClass::Malformed,
-                "NAXIS is missing or is not an integer value",
-            ));
-        }
-        Some(n) if n < 0 => {
-            return Some(DeclineReason::new(
-                DeclineClass::Malformed,
-                format!("NAXIS = {n} is negative"),
-            ));
-        }
-        Some(n) => n,
-    };
-    for i in 1..=naxis {
-        match keyword_value(kw, &format!("NAXIS{i}")).and_then(lex_integer) {
-            None => {
-                return Some(DeclineReason::new(
-                    DeclineClass::Malformed,
-                    format!("NAXIS{i} is missing or is not an integer value"),
-                ));
-            }
-            Some(v) if v < 0 => {
-                return Some(DeclineReason::new(
-                    DeclineClass::Malformed,
-                    format!("NAXIS{i} = {v} is negative"),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-
-    // PCOUNT and GCOUNT — mandatory in every extension header (§3.4.1); absent and defaulted
-    // in the primary.
-    if !is_primary {
-        for name in ["PCOUNT", "GCOUNT"] {
-            if keyword_value(kw, name).and_then(lex_integer).is_none() {
-                return Some(DeclineReason::new(
-                    DeclineClass::Malformed,
-                    format!("{name} is missing or is not an integer value in an extension header"),
-                ));
-            }
-        }
-    }
-
-    // GROUPS
-    if keyword_value(kw, "GROUPS").and_then(lex_logical) == Some(true) {
-        return Some(DeclineReason::new(
-            DeclineClass::Unsupported,
-            "GROUPS = T: the random-groups structure is not an image this version reads",
-        ));
-    }
-
-    // ZIMAGE. It sits here rather than first because a header can carry two faults of
-    // different classes and the order is what makes the outcome determinate: a tile-compressed
-    // BINTABLE whose BITPIX is out of the standard set is `Malformed` on the BITPIX, not
-    // `Unsupported` on the tile compression. Reached only when ZIMAGE = T, per
-    // `is_image_position`.
-    if hdu.xtension.as_deref() == Some("BINTABLE") {
-        return Some(DeclineReason::new(
-            DeclineClass::Unsupported,
-            "tile-compressed image (ZIMAGE = T on a BINTABLE extension): this version declines \
-             it rather than misreading it as a table",
-        ));
-    }
-
-    // Scope, after structural validity is settled.
-    if naxis == 1 || naxis > 3 {
-        return Some(DeclineReason::new(
-            DeclineClass::Unsupported,
-            format!("NAXIS = {naxis}: this version reads NAXIS 2, or 3 read as channels"),
-        ));
-    }
-    for i in 1..=naxis {
-        match keyword_value(kw, &format!("NAXIS{i}")).and_then(lex_integer) {
-            Some(0) => {
-                return Some(DeclineReason::new(
-                    DeclineClass::Unsupported,
-                    format!(
-                        "NAXIS{i} = 0: a degenerate axis declares an image with no samples, \
-                         which this version declines"
-                    ),
-                ));
-            }
-            Some(v) if u32::try_from(v).is_err() => {
-                return Some(DeclineReason::new(
-                    DeclineClass::Unsupported,
-                    format!("NAXIS{i} = {v} is beyond the axis length this version represents"),
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    // BSCALE / BZERO / BLANK: unparseable values are malformed, but their *scope* — whether
-    // the pairing is the unsigned convention — is a bounds question rather than a decline.
-    for name in ["BSCALE", "BZERO"] {
-        if let Some(v) = keyword_value(kw, name)
-            && lex_number(v).is_none()
-        {
-            return Some(DeclineReason::new(
-                DeclineClass::Malformed,
-                format!("{name} = {v:?} is not a numeric value"),
-            ));
-        }
-    }
-    if let Some(v) = keyword_value(kw, "BLANK")
-        && lex_integer(v).is_none()
-    {
-        return Some(DeclineReason::new(
-            DeclineClass::Malformed,
-            format!("BLANK = {v:?} is not an integer value"),
-        ));
-    }
-
-    None
-}
-
-/// `|BITPIX|/8 × GCOUNT × (PCOUNT + Π NAXISᵢ)`, rounded up to the 2880-byte block boundary.
-///
-/// Named in the design because the naive `BITPIX × NAXIS*` form lands mid-file on any
-/// heap-carrying `BINTABLE` and misparses everything after it: `PCOUNT` carries a table's heap
-/// size. This is also the prerequisite for recognizing a tile-compressed file at all.
-///
-/// The primary HDU takes `PCOUNT = 0` and `GCOUNT = 1` (§4.4.1.1) with one exception: under
-/// `GROUPS = T` both are mandatory and the axis product runs over `NAXIS2`…`NAXISn`, because
-/// §6.1.1 fixes `NAXIS1 = 0` and a product including it is zero. The random-groups position is
-/// declined, but the walk still has to step over its data unit to reach whatever follows, and
-/// a zero-sized step lands inside the group data rather than on the next header.
-fn data_unit_size(keywords: &[Keyword], is_primary: bool) -> UnitSize {
-    let Some(bitpix) = keyword_value(keywords, "BITPIX").and_then(lex_integer) else {
-        return UnitSize::Unsizable("BITPIX is missing or is not an integer value");
-    };
-    if sample_format_of(bitpix).is_none() {
-        return UnitSize::Unsizable("BITPIX is outside the standard set");
-    }
-    let Some(naxis) = keyword_value(keywords, "NAXIS").and_then(lex_integer) else {
-        return UnitSize::Unsizable("NAXIS is missing or is not an integer value");
-    };
-    if !(0..=999).contains(&naxis) {
-        return UnitSize::Unsizable("NAXIS is outside the range the standard allows");
-    }
-    if naxis == 0 {
-        // §7.1.1: no data blocks follow, with PCOUNT zero and GCOUNT one. The skip is exact
-        // rather than estimated, so it costs no `Skipped block bytes` at all.
-        return UnitSize::Bytes(0);
-    }
-
-    let random_groups =
-        is_primary && keyword_value(keywords, "GROUPS").and_then(lex_logical) == Some(true);
-    let first_axis = if random_groups { 2 } else { 1 };
-
-    // The product of no axes is one everywhere except here: a random-groups header with
-    // `NAXIS = 1` has no group data array at all, so each group is its parameters and nothing
-    // else, and the term §6.1.1 adds `PCOUNT` to is zero rather than one.
-    let mut elements: u64 = u64::from(!(random_groups && naxis < 2));
-    for i in first_axis..=naxis {
-        let Some(v) = keyword_value(keywords, &format!("NAXIS{i}")).and_then(lex_integer) else {
-            return UnitSize::Unsizable("a NAXISn is missing or is not an integer value");
-        };
-        let Ok(v) = u64::try_from(v) else {
-            return UnitSize::Unsizable("a NAXISn is negative");
-        };
-        let Some(next) = elements.checked_mul(v) else {
-            return UnitSize::Unsizable("the axis product overflows u64");
-        };
-        elements = next;
-    }
-
-    let (pcount, gcount) = if is_primary && !random_groups {
-        (0u64, 1u64)
-    } else {
-        let Some(p) = keyword_value(keywords, "PCOUNT").and_then(lex_integer) else {
-            return UnitSize::Unsizable("PCOUNT is missing or is not an integer value");
-        };
-        let Some(g) = keyword_value(keywords, "GCOUNT").and_then(lex_integer) else {
-            return UnitSize::Unsizable("GCOUNT is missing or is not an integer value");
-        };
-        match (u64::try_from(p), u64::try_from(g)) {
-            (Ok(p), Ok(g)) => (p, g),
-            _ => return UnitSize::Unsizable("PCOUNT or GCOUNT is negative"),
-        }
-    };
-
-    let width = bitpix.unsigned_abs() / 8;
-    let bytes = elements
-        .checked_add(pcount)
-        .and_then(|n| n.checked_mul(gcount))
-        .and_then(|n| n.checked_mul(width));
-    let Some(bytes) = bytes else {
-        return UnitSize::Unsizable("the data-unit size arithmetic overflows u64");
-    };
-    let padded = bytes
-        .checked_add(BLOCK as u64 - 1)
-        .map(|n| n / BLOCK as u64 * BLOCK as u64);
-    match padded {
-        Some(n) => UnitSize::Bytes(n),
-        None => UnitSize::Unsizable("padding the data-unit size to a block boundary overflows u64"),
-    }
-}
-
-// ------------------------------------------------------------------ header assembly
-
-/// The two cards the `applied` closure below resolves: `BSCALE` and `BZERO`, both lexed to
-/// numbers, so re-reading them per image position costs nothing.
-///
-/// They are two of the four cards `INHERIT` gates the *application* of — the ones that change
-/// what a pixel means, which is why they are inheritable at all: applying a primary's `BSCALE`
-/// over an extension's own would rewrite every pixel and move the frame between "unsigned
-/// convention" and "no normalized output", the silent plausible repair this design refuses
-/// everywhere else. The other two are not in this list. `ROWORDER` is resolved beside `applied`
-/// rather than through it, because it is the one whose *text* is reported: re-classifying an
-/// inherited `ROWORDER` per image position built a copy of an assembled keyword value per
-/// extension, so `Decoder::primary_row_order` classifies it once for the source instead — the
-/// rule the two spellings implement is the same one stated in `applied`. `BLANK` is resolved
-/// nowhere: § FITS decisions reports it and substitutes no sample, so nothing ever asks whether
-/// one is inherited.
-const INHERITABLE: [&str; 2] = ["BSCALE", "BZERO"];
-
-fn build_header(
-    hdu: &Hdu,
-    primary_reported: &Arc<[Keyword]>,
-    primary_own: &[Keyword],
-    primary_row_order: &RowOrder,
-) -> Header {
-    let is_primary = hdu.xtension.is_none();
-    let tile_compressed = hdu.xtension.as_deref() == Some("BINTABLE");
-    let prefix = if tile_compressed { "Z" } else { "" };
-
-    // Both headers' cards are always reported when the reader advances to an image
-    // extension — the extension's followed by the primary's, each tagged by origin.
-    // Reporting is never gated on INHERIT: real archive frames put DATE-OBS, EXPTIME and
-    // EGAIN in the primary and frequently omit the keyword.
-    // Both lists are shared, never concatenated: `FITS header cards` times `Images per
-    // source` is a product no part of the input relates to, and building the merge cost a
-    // primary carrying 4090 `HISTORY` cards 52 MB held live across 256 zero-width extensions.
-    // `KeywordSet` carries the arithmetic and `Header::keywords` serves the concatenation as a
-    // view, exactly as `PropertySet` does for the XISF property merge.
-    let keywords = KeywordSet::new(
-        hdu.keywords.clone(),
-        if is_primary {
-            // A primary header inherits from nothing, so there is no second piece.
-            Arc::default()
-        } else {
-            primary_reported.clone()
-        },
-    );
-
-    let applied = |name: &str| -> Option<&str> {
-        if let Some(v) = keyword_value(&hdu.keywords, name) {
-            return Some(v);
-        }
-        // Inheritance fills gaps and never overrides, and the test is **per card**: an
-        // extension carrying BSCALE but no BZERO applies its own BSCALE beside the primary's
-        // BZERO. Under INHERIT = F, and equally when the extension carries no INHERIT card at
-        // all, no primary card is applied. An INHERIT card in a *primary* header gates
-        // nothing (Appendix K forbids it there), so it is data rather than an instruction.
-        if is_primary || !INHERITABLE.contains(&name) {
-            return None;
-        }
-        if keyword_value(&hdu.keywords, "INHERIT").and_then(lex_logical) != Some(true) {
-            return None;
-        }
-        keyword_value(primary_own, name)
-    };
-
-    let geometry = read_geometry(&hdu.keywords, prefix);
-    let sample_format = read_sample_format(&hdu.keywords, prefix);
-    let decline_reason = first_fault(hdu);
-
-    let bscale = applied("BSCALE").and_then(lex_number).unwrap_or(1.0);
-    let bzero = applied("BZERO").and_then(lex_number).unwrap_or(0.0);
-    // `applied`'s rule, spelled out rather than called, because `ROWORDER` is the one
-    // inheritable card whose *text* is reported: the other three are lexed to numbers. The
-    // inherited value is classified once for the whole source and cloned here — see
-    // `Decoder::primary_row_order` for what building it per position cost.
-    let row_order = if is_primary {
-        primary_row_order.clone()
-    } else if let Some(text) = keyword_value(&hdu.keywords, "ROWORDER") {
-        // The extension's own card, which is that extension's own input bytes.
-        RowOrder::classify(text)
-    } else if keyword_value(&hdu.keywords, "INHERIT").and_then(lex_logical) == Some(true) {
-        primary_row_order.clone()
-    } else {
-        RowOrder::Unspecified
-    };
-
-    let bounds = fits_bounds(sample_format, bscale, bzero, decline_reason.is_some());
-
-    Header {
-        geometry,
-        sample_format,
-        bounds,
-        scaling: Some(Scaling::Fits { bscale, bzero }),
-        row_order: Some(row_order),
-        orientation: None,
-        offset: None,
-        color_space: None,
-        pixel_storage: Some(PixelStorage::Planar),
-        image_id: None,
-        image_uuid: None,
-        image_type: None,
-        channel_index: None,
-        granularity: if decline_reason.is_some() {
-            Granularity::WholeImage
-        } else {
-            Granularity::Rows
-        },
-        decline_reason,
-        keywords,
-        properties: PropertySet::default(),
-        cfa: None,
-        // FITS defines neither concept, so there is nothing to report and no default that
-        // would belong to this format: § The API's rule is `None` rather than a fabricated
-        // value, the same answer `orientation()` gives here.
-        resolution: None,
-        display_function: None,
-    }
-}
-
-/// Where the representable range comes from for a FITS image.
-///
-/// Normalized output is offered for an integer `BITPIX` **only** when `BSCALE` is 1 and
-/// `BZERO` is the value that maps the signed storage type onto its unsigned range. Those are
-/// the cases where physical values provably occupy `[0, 2ⁿ − 1]`. Any other pairing is refused
-/// rather than normalized: a genuinely signed frame would otherwise have half its levels
-/// saturate to black, and a rescaled frame would normalize to a sliver near zero. Both would
-/// *look* like images and be wrong.
-///
-/// FITS defines no representable range for floats either. `DATAMIN`/`DATAMAX` are reported as
-/// ordinary keywords and not consumed: they describe the range the data *occupies*, not the
-/// range it is *displayed against*, and conflating the two would rescale every frame by its
-/// own content.
-fn fits_bounds(format: Option<SampleFormat>, bscale: f64, bzero: f64, declined: bool) -> Bounds {
-    if declined {
-        return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault);
-    }
-    let Some(format) = format else {
-        return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault);
-    };
-    if !format.is_integer() || bscale != 1.0 {
-        return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault);
-    }
-    // 0 for BITPIX = 8, 32768 for 16, 2147483648 for 32, 2^63 for 64. The 64-bit value
-    // exceeds i64::MAX and can only be parsed as a float, which is why the lexer must not
-    // assume an integer-valued keyword fits an i64.
-    let (expected_bzero, hi) = match format {
-        SampleFormat::U8 => (0.0, f64::from(u8::MAX)),
-        SampleFormat::I16 => (32768.0, f64::from(u16::MAX)),
-        SampleFormat::I32 => (2_147_483_648.0, f64::from(u32::MAX)),
-        SampleFormat::I64 => ((1u128 << 63) as f64, u64::MAX as f64),
-        _ => return Bounds::Unavailable(BoundsUnavailable::NoFormatDefault),
-    };
-    if bzero == expected_bzero {
-        Bounds::FormatDefault(0.0, hi)
-    } else {
-        Bounds::Unavailable(BoundsUnavailable::NoFormatDefault)
-    }
 }
 
 // ------------------------------------------------------------------ sample decode

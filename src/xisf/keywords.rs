@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::limits::Limits;
-use crate::metadata::{Keyword, KeywordOrigin};
+use crate::metadata::{Keyword, KeywordOrigin, ValueKind};
 use crate::xisf::cache::{Cache, memoized};
 use crate::xisf::xml::Doc;
 
@@ -161,7 +161,15 @@ fn close_chain(out: &mut [Keyword], state: &Chain<'_>, raw: &[RawKeyword<'_>], c
             // §4.2.1.2's precedence, resolved here rather than carried: the last continued
             // record's comment when it had one, and the opening record's otherwise.
             let comment = state.comment.unwrap_or(state.opener.comment);
-            Keyword::new(opener.name(), &value, Some(comment), opener.origin())
+            // A chain assembles character strings and nothing else, so the assembled
+            // keyword's kind is the opening record's.
+            Keyword::new(
+                opener.name(),
+                &value,
+                Some(comment),
+                opener.origin(),
+                opener.value_kind(),
+            )
         },
     );
     out[state.index] = assembled;
@@ -269,16 +277,21 @@ pub(super) fn fold_records<'a>(
                     // orphaned `CONTINUE` allocated 6.4 GB from a one-megabyte header. A node
                     // named `CONTINUE` is named that on every occurrence, so one memo serves
                     // both branches of this function.
-                    out.push(
-                        memoized(&mut cache.keywords, record.node, referenced, || {
+                    out.push(memoized(
+                        &mut cache.keywords,
+                        record.node,
+                        referenced,
+                        || {
                             let body = join_body(record.value, record.comment);
-                            (
-                                Keyword::new("CONTINUE", "", Some(&body), record.origin),
-                                false,
+                            Keyword::new(
+                                "CONTINUE",
+                                "",
+                                Some(&body),
+                                record.origin,
+                                ValueKind::Commentary,
                             )
-                        })
-                        .0,
-                    );
+                        },
+                    ));
                     if let Some(closed) = chain.take() {
                         close_chain(&mut out, &closed, raw, cache);
                     }
@@ -295,24 +308,22 @@ pub(super) fn fold_records<'a>(
 
         // Looked up **before** the unquoting below, which is the allocation being avoided: it
         // copies the value text, and copying it 49 000 times is the gigabyte.
-        let (keyword, is_string) = memoized(&mut cache.keywords, record.node, referenced, || {
+        let keyword = memoized(&mut cache.keywords, record.node, referenced, || {
             let (name, value_text) = hierarch(record.name, record.value);
             // XISF stores FITS keywords with their FITS quoting intact — the specification's
             // own example is `value="'2012-03-15T02:55:15'"` — so the unquoting rule applies
-            // here exactly as it does to a card.
-            let (value, is_string) = match unquote(value_text) {
-                Some(text) => (text, true),
-                None => (value_text.trim_ascii().to_owned(), false),
+            // here exactly as it does to a card, and so does the value kind it settles.
+            let (value, kind) = match unquote(value_text) {
+                Some(text) => (text, ValueKind::CharacterString),
+                None => (value_text.trim_ascii().to_owned(), ValueKind::Other),
             };
-            (
-                Keyword::new(&name, &value, Some(record.comment), record.origin),
-                is_string,
-            )
+            Keyword::new(&name, &value, Some(record.comment), record.origin, kind)
         });
 
         // §4.2.1.2 continues character strings only, so a numeric value ending in `&` is a
-        // value ending in `&`.
-        if is_string && keyword.value().ends_with('&') {
+        // value ending in `&`. Read off the built keyword rather than carried beside it: the
+        // kind a memo hit needs is on the value it hit.
+        if keyword.value_kind() == ValueKind::CharacterString && keyword.value().ends_with('&') {
             let value = keyword.value();
             chain = Some(Chain {
                 index: out.len(),

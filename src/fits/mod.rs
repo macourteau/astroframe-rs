@@ -5,5 +5,6 @@
 
 pub(crate) mod cards;
 pub(crate) mod decoder;
+pub(crate) mod hdu;
 
 pub(crate) use decoder::Decoder;

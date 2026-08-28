@@ -13,7 +13,7 @@
 //! [`fold_cards`].
 
 use crate::error::{Error, Result};
-use crate::metadata::{Keyword, KeywordOrigin};
+use crate::metadata::{Keyword, KeywordOrigin, ValueKind};
 
 /// One card, in bytes.
 const CARD: usize = 80;
@@ -131,10 +131,8 @@ pub(crate) fn fold_cards(
         }
 
         if let Some((name, body)) = hierarch(card)? {
-            let (value, comment, is_string) = parse_value(body)?;
-            push(
-                &mut out, &mut chain, name, value, comment, is_string, origin,
-            );
+            let (value, comment, kind) = parse_value(body)?;
+            push(&mut out, &mut chain, name, value, comment, kind, origin);
             continue;
         }
 
@@ -142,17 +140,21 @@ pub(crate) fn fold_cards(
         let name = String::from_utf8_lossy(trimmed_name).into_owned();
 
         if field(card, NAME, NAME + 2) == b"= " {
-            let (value, comment, is_string) = parse_value(field(card, NAME + 2, CARD))?;
-            push(
-                &mut out, &mut chain, name, value, comment, is_string, origin,
-            );
+            let (value, comment, kind) = parse_value(field(card, NAME + 2, CARD))?;
+            push(&mut out, &mut chain, name, value, comment, kind, origin);
         } else {
             let body = field(card, NAME, CARD);
             let text = trim_end_lossy(body);
             if name.is_empty() && text.is_empty() {
                 continue; // a blank card carries nothing to report
             }
-            out.push(Keyword::new(&name, "", Some(&text), origin));
+            out.push(Keyword::new(
+                &name,
+                "",
+                Some(&text),
+                origin,
+                ValueKind::Commentary,
+            ));
         }
     }
 
@@ -305,7 +307,9 @@ fn close_chain(out: &mut [Keyword], state: &Chain) {
     // comment when it had one, and the opening card's otherwise.
     let comment = state.comment.as_deref().or(state.first_comment.as_deref());
     if let Some(kw) = out.get_mut(state.index) {
-        *kw = Keyword::new(kw.name(), value, comment, kw.origin());
+        // A chain assembles character strings and nothing else — `push` opens one only for a
+        // string value — so the assembled keyword's kind is the opening card's.
+        *kw = Keyword::new(kw.name(), value, comment, kw.origin(), kw.value_kind());
     }
 }
 
@@ -316,14 +320,20 @@ fn push(
     name: String,
     value: String,
     comment: Option<String>,
-    is_string: bool,
+    kind: ValueKind,
     origin: KeywordOrigin,
 ) {
     // §4.2.1.2 continues character strings only, so a numeric value ending in `&` is a
     // value ending in `&`.
-    let opens = is_string && value.ends_with('&');
+    let opens = kind == ValueKind::CharacterString && value.ends_with('&');
     let index = out.len();
-    out.push(Keyword::new(&name, &value, comment.as_deref(), origin));
+    out.push(Keyword::new(
+        &name,
+        &value,
+        comment.as_deref(),
+        origin,
+        kind,
+    ));
     if opens {
         // The comment moves into the chain rather than being cloned into it: the card's own
         // copy is already packed into the `Keyword` pushed above.
@@ -338,7 +348,13 @@ fn push(
 
 /// A commentary keyword: empty value, card body as the comment.
 fn commentary(name: String, body: &[u8], origin: KeywordOrigin) -> Keyword {
-    Keyword::new(&name, "", Some(&trim_end_lossy(body)), origin)
+    Keyword::new(
+        &name,
+        "",
+        Some(&trim_end_lossy(body)),
+        origin,
+        ValueKind::Commentary,
+    )
 }
 
 /// The multi-word name and value body of a `HIERARCH` card, if this is one.
@@ -363,20 +379,25 @@ fn hierarch(card: &[u8]) -> Result<Option<(String, &[u8])>> {
     Ok(Some((name, field(body, offset + 1, body.len()))))
 }
 
-/// Parse the text after a value indicator into `(value, comment, is_string)`.
-fn parse_value(body: &[u8]) -> Result<(String, Option<String>, bool)> {
+/// Parse the text after a value indicator into `(value, comment, kind)`.
+///
+/// The kind is [`ValueKind::CharacterString`] exactly when the value field opened with a
+/// quote, which is §4.2.1's own criterion, and [`ValueKind::Other`] for everything else. The
+/// unquoted kinds are not told apart here: §4.2.2 through §4.2.6 are a parse of the text, and
+/// the text is what is reported.
+fn parse_value(body: &[u8]) -> Result<(String, Option<String>, ValueKind)> {
     let (value_part, comment_part) = split_value_comment(body);
     check_ascii(value_part, "value")?;
     let comment = comment_text(comment_part);
     if value_part.trim_ascii_start().first() == Some(&b'\'') {
         let value = parse_quoted(value_part)
             .ok_or_else(|| Error::malformed("unterminated FITS character-string value"))?;
-        Ok((value, comment, true))
+        Ok((value, comment, ValueKind::CharacterString))
     } else {
         Ok((
             String::from_utf8_lossy(value_part.trim_ascii()).into_owned(),
             comment,
-            false,
+            ValueKind::Other,
         ))
     }
 }

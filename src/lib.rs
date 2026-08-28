@@ -130,7 +130,7 @@ pub use limits::Limits;
 pub use metadata::{
     Cfa, DisplayChannels, DisplayFunction, Keyword, KeywordIter, KeywordOrigin, Keywords,
     Properties, Property, PropertyIter, PropertyScope, PropertyType, PropertyValue, Resolution,
-    ResolutionUnit,
+    ResolutionUnit, ValueKind,
 };
 pub use normalize::{Normalizer, Range, Sample, Scaling};
 pub use reader::{Chunk, Chunks, Reader};
