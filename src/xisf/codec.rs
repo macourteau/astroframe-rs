@@ -239,6 +239,22 @@ impl<S: Source> Read for BlockReader<'_, S> {
 /// How much compressed input to pull in one go.
 const INPUT_CHUNK: usize = 256 * 1024;
 
+/// The input window a subblock is read through: a chunk, or the subblock itself when the
+/// subblock is smaller.
+///
+/// **The `min` is the whole point.** §10.6 restarts the codec at every subblock boundary, so
+/// this window is a per-occurrence allocation whose count is `Subblock count` — and
+/// `docs/intentional-patterns.md` states that no per-occurrence allocation may be sized by a
+/// cap. A flat `INPUT_CHUNK` is exactly that: 4096 subblocks of fifteen stored bytes each cost
+/// a gigabyte of zeroed buffer, which § Fuzzing's oracle sees in full because it counts every
+/// allocation rather than the peak. Sized from the subblock, the window is bounded by that
+/// subblock's own stored bytes, and the sum over a block is bounded by the block.
+fn input_window(stored_left: u64) -> usize {
+    usize::try_from(stored_left)
+        .unwrap_or(INPUT_CHUNK)
+        .min(INPUT_CHUNK)
+}
+
 /// LZ4 state: one whole subblock, decompressed, and how much of it has been handed over.
 ///
 /// LZ4 as XISF stores it is a bare block with no framing, so nothing smaller than a whole
@@ -289,25 +305,68 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
-    /// Start a streaming decode of `codec`.
-    pub(crate) fn new<S: Source>(
+    /// Open `codec` over the subblock the cursors describe, **reusing this stream's state**
+    /// where the codec already matches.
+    ///
+    /// §10.6 splits the compression, so this runs once per subblock and the number of times is
+    /// `Subblock count` rather than anything the file's length bounds. Both framed codecs
+    /// therefore carry one state across the whole block and reset it at each boundary — a
+    /// `flate2::Decompress` costs about 43 KB to construct and a `ruzstd::FrameDecoder` about
+    /// 9.5 KB, and constructing either per subblock multiplies a fixed cost by a cap.
+    /// `Decompress::reset` and `FrameDecoder::reset` both keep the buffers and reset the
+    /// state, which is the same decode from a clean stream position.
+    ///
+    /// The peak is unchanged and § Streaming's promise of one subblock at a time still holds:
+    /// reuse holds strictly less than construction did, and the LZ4 arm — whose buffers are
+    /// the whole-subblock ones the promise is about — drops the outgoing subblock's before it
+    /// sizes the incoming one's.
+    pub(crate) fn open<S: Source>(
+        &mut self,
         codec: Codec,
         src: &mut S,
         left: &mut u64,
         at: &mut u64,
         uncompressed: u64,
         limits: &Limits,
-    ) -> Result<Stream> {
+    ) -> Result<()> {
         match codec {
-            Codec::Zlib => Ok(Stream::Zlib(Box::new(ZlibState {
-                d: flate2::Decompress::new(true),
-                buf: vec![0u8; INPUT_CHUNK],
-                at: 0,
-                end: 0,
-            }))),
+            Codec::Zlib => {
+                let want = input_window(*left);
+                if let Stream::Zlib(z) = self {
+                    z.d.reset(true);
+                    z.at = 0;
+                    z.end = 0;
+                    // The window only ever grows, and it grows to the subblock that asked for
+                    // it, so the sum over a block is bounded by the block's stored bytes. The
+                    // old buffer is released before the larger one is sized, since nothing in
+                    // it survives a reset.
+                    if z.buf.len() < want {
+                        z.buf = Vec::new();
+                        z.buf = vec![0u8; want];
+                    }
+                } else {
+                    *self = Stream::Plain;
+                    *self = Stream::Zlib(Box::new(ZlibState {
+                        d: flate2::Decompress::new(true),
+                        buf: vec![0u8; want],
+                        at: 0,
+                        end: 0,
+                    }));
+                }
+                Ok(())
+            }
             Codec::Zstd => {
-                let mut fd = ruzstd::decoding::FrameDecoder::new();
-                fd.set_max_window_size(limits.zstd_window_bytes);
+                let mut z = match std::mem::replace(self, Stream::Plain) {
+                    Stream::Zstd(z) => z,
+                    _ => Box::new(ZstdState {
+                        fd: ruzstd::decoding::FrameDecoder::new(),
+                        pending: Vec::new(),
+                        at: 0,
+                    }),
+                };
+                z.fd.set_max_window_size(limits.zstd_window_bytes);
+                z.pending = Vec::new();
+                z.at = 0;
                 let reader = BlockReader {
                     src,
                     limits,
@@ -318,14 +377,16 @@ impl Stream {
                 // producing a byte -- the precise shape of an allocation sized from an
                 // unvalidated declared size -- so the cap is enforced here, before the
                 // allocation, and a trip is LimitExceeded like any other cap.
-                fd.init(reader).map_err(|e| zstd_header_error(e, limits))?;
-                Ok(Stream::Zstd(Box::new(ZstdState {
-                    fd,
-                    pending: Vec::new(),
-                    at: 0,
-                })))
+                z.fd.reset(reader)
+                    .map_err(|e| zstd_header_error(e, limits))?;
+                *self = Stream::Zstd(z);
+                Ok(())
             }
             Codec::Lz4 | Codec::Lz4Hc => {
+                // Drop the outgoing subblock's buffers *before* sizing the incoming one's:
+                // these are the whole-subblock buffers § Streaming's peak-memory row is
+                // about, and holding two of them at once is twice what it promises.
+                *self = Stream::Plain;
                 // Both allocations are sized from a declared length, so both are capped
                 // before they are made. `materialized_bytes` is the right cap: this is the
                 // one buffer a `Block`-granularity decode materializes.
@@ -343,7 +404,8 @@ impl Stream {
                 })?;
                 let mut buf = vec![0u8; out_len];
                 decompress_one(&stored, codec, &mut buf, limits)?;
-                Ok(Stream::Lz4(Box::new(Lz4State { buf, at: 0 })))
+                *self = Stream::Lz4(Box::new(Lz4State { buf, at: 0 }));
+                Ok(())
             }
         }
     }
