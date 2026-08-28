@@ -9,8 +9,6 @@
 //! Fixtures are built byte by byte through `tests/common`, and every class is derived from
 //! § Errors' rules rather than from a case name.
 
-// `tests/common/mod.rs` is shared, and its lints belong to that file's owner rather than to
-// this suite, so they are silenced at the import instead of edited there.
 mod common;
 
 use std::io::Cursor;
