@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn an_unsupported_attribute_beats_a_missing_location() {
-        // The location check runs last, which is the whole reason these fixtures are
-        // `Unsupported` rather than `Malformed`.
+        // The location check runs after the attributes, which is the whole reason these
+        // fixtures are `Unsupported` rather than `Malformed`.
         let o =
             one(r#"<xisf version="1.0"><Image geometry="4:4:1" sampleFormat="Complex32"/></xisf>"#);
         assert_eq!(class(&o), Some(DeclineClass::Unsupported));

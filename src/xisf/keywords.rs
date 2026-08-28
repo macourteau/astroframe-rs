@@ -74,7 +74,7 @@ struct Chain<'a> {
     index: usize,
     /// The record that opened it. Its node and origin are the first half of the memo key, its
     /// `comment` is §4.2.1.2's fallback, and it is copied rather than borrowed because a
-    /// `RawKeyword` is four words of arena pointers.
+    /// `RawKeyword` is a `Copy` struct of arena pointers and holds no text of its own.
     opener: RawKeyword<'a>,
     /// The continuation records folded in so far, as positions in the record list.
     ///

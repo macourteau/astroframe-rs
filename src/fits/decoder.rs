@@ -386,9 +386,8 @@ impl Decoder {
             return Ok(None);
         }
 
-        // Which file row this is, and where its samples land in the destination. With
-        // `Planar` storage the unwanted channels are contiguous runs, so a narrowed decode
-        // skips them outright rather than reading and discarding samples one by one.
+        // With `Planar` storage the unwanted channels are contiguous runs, so a narrowed
+        // decode skips them outright rather than reading and discarding samples one by one.
         let (file_row, dest_start) = match p.selected {
             Some(k) => {
                 let y = p.next_file_row;
