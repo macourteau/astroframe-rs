@@ -84,13 +84,18 @@ pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurre
     let mut cache = Cache::default();
     // Root-level `Metadata` properties (§11.4) apply to every image in the unit, so they are
     // read once and reported at their document position in every image's list below.
-    let metadata = metadata_properties(doc, &mut cache);
+    // Positions and properties come back as two lists rather than as pairs, because the two
+    // halves have different lifetimes below: the properties are consumed into the shared list
+    // immediately, and only the positions are read again per occurrence. Zipped, the pairs
+    // outlive the walk beside the `Arc` built from them, which is a second copy of every
+    // `Property` — five `Arc`s each — for a half nothing reads.
+    let (metadata_positions, metadata) = metadata_properties(doc, &mut cache);
     // Built once and shared by every image, whatever it adds of its own. No sort is needed:
     // `metadata_properties` walks the root's children in document order and node indices ascend
     // with that walk, so the list is already ordered — which holds across several `<Metadata>`
     // elements as well as within one, and "they all come from one element" was the wrong reason
     // to give for it.
-    let shared_metadata: Arc<[Property]> = metadata.iter().map(|(_, p)| p.clone()).collect();
+    let shared_metadata: Arc<[Property]> = metadata.into();
 
     let mut out = Vec::new();
     // One `<Image uid>` reached through N root-level `<Reference>` elements is N occurrences of
@@ -133,8 +138,14 @@ pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurre
         out.push(match built.get(&image) {
             Some(shared) => shared.clone(),
             None => {
-                let fresh =
-                    build_occurrence(doc, limits, image, &metadata, &shared_metadata, &mut cache)?;
+                let fresh = build_occurrence(
+                    doc,
+                    limits,
+                    image,
+                    &metadata_positions,
+                    &shared_metadata,
+                    &mut cache,
+                )?;
                 if referenced {
                     built.insert(image, fresh.clone());
                 }
@@ -167,7 +178,10 @@ fn build_occurrence(
     doc: &Doc,
     limits: &Limits,
     image: usize,
-    metadata: &[(usize, Property)],
+    // Where each shared root `<Metadata>` property was found, in ascending order. The values
+    // themselves are in `shared_metadata`; all this needs of them is the position the split
+    // falls at.
+    metadata_positions: &[usize],
     shared_metadata: &Arc<[Property]>,
     cache: &mut Cache,
 ) -> Result<Occurrence> {
@@ -179,7 +193,10 @@ fn build_occurrence(
 
     let site = read_block_site(doc, image);
     let implied_bytes = implied_bytes(geometry, sample_format);
-    let stored = stored_size(site.location.as_ref(), site.materialized.as_deref());
+    let stored = stored_size(
+        site.location.as_ref(),
+        site.materialized.as_deref().map(Vec::as_slice),
+    );
     let (compression, subblocks, compression_fault) =
         read_compression(doc, limits, site.attrs_on, stored, implied_bytes);
     // Shared here, once, rather than in the `BlockPlan` literal below: from this point on the
@@ -253,15 +270,15 @@ fn build_occurrence(
     // root-level one, which is what pins the order the specification leaves undefined.
     // `PropertySet` is where that argument is written down and `Header::properties` serves the
     // concatenation as a view.
-    let split = metadata.partition_point(|(position, _)| *position < image);
+    let split = metadata_positions.partition_point(|position| *position < image);
     debug_assert!(
         collected
             .properties
             .iter()
             .all(|(position, _)| *position > image)
-            && metadata[split..].first().is_none_or(|(first, _)| {
-                collected.properties.iter().all(|(own, _)| own < first)
-            }),
+            && metadata_positions[split..]
+                .first()
+                .is_none_or(|first| { collected.properties.iter().all(|(own, _)| own < first) }),
         "an image's own properties fall between two root Metadata properties, never among them"
     );
     let own: Arc<[Property]> = collected.properties.into_iter().map(|(_, p)| p).collect();
@@ -418,7 +435,7 @@ fn implied_bytes(geometry: Option<Geometry>, format: Option<SampleFormat>) -> u6
 }
 
 /// The stored length of the block, where the header phase knows it.
-fn stored_size(location: Option<&Location>, materialized: Option<&Vec<u8>>) -> Option<u64> {
+fn stored_size(location: Option<&Location>, materialized: Option<&[u8]>) -> Option<u64> {
     match location {
         Some(Location::Attachment { size, .. }) => Some(*size),
         Some(Location::Embedded) => materialized.map(|bytes| bytes.len() as u64),
@@ -736,7 +753,8 @@ fn read_property(doc: &Doc, node: usize, scope: PropertyScope) -> Option<Propert
 /// A `FITSKeyword` here is a non-conforming placement (§11.6) and is ignored rather than
 /// reported: it is attached to no image, and reporting it against an arbitrary one would invent
 /// an association the file does not make.
-fn metadata_properties(doc: &Doc, cache: &mut Cache) -> Vec<(usize, Property)> {
+fn metadata_properties(doc: &Doc, cache: &mut Cache) -> (Vec<usize>, Vec<Property>) {
+    let mut positions = Vec::new();
     let mut out = Vec::new();
     // Memoized exactly as `collect_children` is, through the same [`Cache`], and for the same
     // shape one level up: several `<Reference>` elements inside `<Metadata>` may resolve to one
@@ -765,11 +783,12 @@ fn metadata_properties(doc: &Doc, cache: &mut Cache) -> Vec<(usize, Property)> {
                 || read_property(doc, target, PropertyScope::Metadata),
             );
             if let Some(property) = property {
-                out.push((node, property));
+                positions.push(node);
+                out.push(property);
             }
         }
     }
-    out
+    (positions, out)
 }
 
 #[cfg(test)]

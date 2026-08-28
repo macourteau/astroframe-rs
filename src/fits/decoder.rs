@@ -67,9 +67,12 @@ struct PixelState {
 pub(crate) struct Decoder {
     /// The primary header's cards, re-tagged `PrimaryHeader` — the list every image
     /// extension's report ends with, held once for the whole source.
+    ///
+    /// It is also what `INHERIT` reads the primary's `BSCALE` and `BZERO` from: `reorigin`
+    /// rewrites the origin and nothing else, and the lookup reads a card's name, its value and
+    /// its value kind. A second, un-re-origined copy of the same list is therefore one whole
+    /// `Vec<Keyword>` retained per source for a difference none of its readers can see.
     primary_keywords: Arc<[Keyword]>,
-    /// The primary header's own structural facts, needed for `INHERIT`.
-    primary_own: Vec<Keyword>,
     /// The primary's `ROWORDER`, classified **once for the source**.
     ///
     /// `INHERIT = T` applies it to every extension, and a `ROWORDER` value is a keyword value
@@ -129,7 +132,6 @@ impl Decoder {
             primary_row_order: keyword_value(&keywords, "ROWORDER")
                 .map(RowOrder::classify)
                 .unwrap_or(RowOrder::Unspecified),
-            primary_own: keywords.clone(),
             position: Position::Start,
             pending: Some(Hdu {
                 sizing: Sizing::read(&keywords),
@@ -173,7 +175,7 @@ impl Decoder {
                 self.position = Position::Done;
                 return Err(e);
             }
-            match self.read_next_hdu(src, limits) {
+            match read_next_hdu(src, limits) {
                 Ok(next) => self.pending = next,
                 Err(e) => {
                     self.position = Position::Done;
@@ -196,7 +198,6 @@ impl Decoder {
                     hdu.xtension.as_deref(),
                     &hdu.sizing,
                     &self.primary_keywords,
-                    &self.primary_own,
                     &self.primary_row_order,
                 );
                 self.header = Some(header);
@@ -220,9 +221,8 @@ impl Decoder {
                 )));
             }
 
-            let outcome = self
-                .skip_data_unit(&hdu, src, limits)
-                .and_then(|()| self.read_next_hdu(src, limits));
+            let outcome =
+                skip_data_unit(&hdu, src, limits).and_then(|()| read_next_hdu(src, limits));
             match outcome {
                 Ok(next) => self.pending = next,
                 Err(e) => {
@@ -280,67 +280,6 @@ impl Decoder {
         }
         self.pixels = None;
         Ok(())
-    }
-
-    fn skip_data_unit<S: Source>(&self, hdu: &Hdu, src: &mut S, limits: &Limits) -> Result<()> {
-        match data_unit_size(&hdu.keywords, &hdu.sizing, hdu.xtension.is_none()) {
-            UnitSize::Bytes(n) => {
-                if src.position() < hdu.data_start {
-                    src.skip(hdu.data_start - src.position(), limits)?;
-                }
-                if n > 0 {
-                    src.skip(n, limits)?;
-                }
-                Ok(())
-            }
-            UnitSize::Unsizable(why) => Err(Error::malformed(format!(
-                "cannot size the data unit of the extension at offset {}: {why}",
-                hdu.data_start
-            ))),
-        }
-    }
-
-    /// Read one more header unit, or `None` at end of source.
-    fn read_next_hdu<S: Source>(&self, src: &mut S, limits: &Limits) -> Result<Option<Hdu>> {
-        let mut first = [0u8; BLOCK];
-        let mut filled = 0usize;
-        while filled < BLOCK {
-            let got = src.read_some(&mut first[filled..])?;
-            if got == 0 {
-                break;
-            }
-            filled += got;
-        }
-        if filled == 0 {
-            return Ok(None);
-        }
-        if filled < BLOCK {
-            return Err(Error::malformed(format!(
-                "truncated header block: {filled} of {BLOCK} bytes before the source ended"
-            )));
-        }
-
-        let region = read_header_region_from(first, src, limits)?;
-        let keywords = fold_cards(
-            &region,
-            KeywordOrigin::Image,
-            limits.fits_header_cards,
-            limits.keyword_value_bytes,
-        )?;
-        let xtension = keyword_value(&keywords, "XTENSION")
-            .map(|v| v.trim().to_owned())
-            .ok_or_else(|| {
-                Error::malformed(format!(
-                    "the header unit ending at offset {} carries no XTENSION card",
-                    src.position()
-                ))
-            })?;
-        Ok(Some(Hdu {
-            sizing: Sizing::read(&keywords),
-            keywords: keywords.into(),
-            data_start: src.position(),
-            xtension: Some(xtension),
-        }))
     }
 
     // ------------------------------------------------------------- pixel phase
@@ -507,6 +446,69 @@ impl Decoder {
 
 // ------------------------------------------------------------------ header reading
 
+fn skip_data_unit<S: Source>(hdu: &Hdu, src: &mut S, limits: &Limits) -> Result<()> {
+    match data_unit_size(&hdu.keywords, &hdu.sizing, hdu.xtension.is_none()) {
+        UnitSize::Bytes(n) => {
+            if src.position() < hdu.data_start {
+                src.skip(hdu.data_start - src.position(), limits)?;
+            }
+            if n > 0 {
+                src.skip(n, limits)?;
+            }
+            Ok(())
+        }
+        UnitSize::Unsizable(why) => Err(Error::malformed(format!(
+            "cannot size the data unit of the extension at offset {}: {why}",
+            hdu.data_start
+        ))),
+    }
+}
+
+/// Read one more header unit, or `None` at end of source.
+fn read_next_hdu<S: Source>(src: &mut S, limits: &Limits) -> Result<Option<Hdu>> {
+    let mut first = [0u8; BLOCK];
+    let mut filled = 0usize;
+    while filled < BLOCK {
+        let got = src.read_some(&mut first[filled..])?;
+        if got == 0 {
+            break;
+        }
+        filled += got;
+    }
+    if filled == 0 {
+        return Ok(None);
+    }
+    if filled < BLOCK {
+        return Err(Error::malformed(format!(
+            "truncated header block at offset {}: {filled} of {BLOCK} bytes before the \
+             source ended",
+            src.position() - filled as u64
+        )));
+    }
+
+    let region = read_header_region_from(&first, src, limits)?;
+    let keywords = fold_cards(
+        &region,
+        KeywordOrigin::Image,
+        limits.fits_header_cards,
+        limits.keyword_value_bytes,
+    )?;
+    let xtension = keyword_value(&keywords, "XTENSION")
+        .map(|v| v.trim().to_owned())
+        .ok_or_else(|| {
+            Error::malformed(format!(
+                "the header unit ending at offset {} carries no XTENSION card",
+                src.position()
+            ))
+        })?;
+    Ok(Some(Hdu {
+        sizing: Sizing::read(&keywords),
+        keywords: keywords.into(),
+        data_start: src.position(),
+        xtension: Some(xtension),
+    }))
+}
+
 fn read_header_region<S: Source>(
     signature: &[u8; 8],
     src: &mut S,
@@ -515,7 +517,7 @@ fn read_header_region<S: Source>(
     let mut first = [0u8; BLOCK];
     first[..8].copy_from_slice(signature);
     src.read_exact(&mut first[8..])?;
-    read_header_region_from(first, src, limits)
+    read_header_region_from(&first, src, limits)
 }
 
 /// Read 2880-byte blocks until one contains `END`, bounded by the header-byte cap.
@@ -523,11 +525,13 @@ fn read_header_region<S: Source>(
 /// FITS has no declared header length to bound this, and over a pipe there is no file length
 /// either, so without the cap the keyword list grows until the process dies.
 fn read_header_region_from<S: Source>(
-    first: [u8; BLOCK],
+    first: &[u8; BLOCK],
     src: &mut S,
     limits: &Limits,
 ) -> Result<Vec<u8>> {
-    let mut region = Vec::from(first);
+    // By reference: a block passed by value is copied onto this frame and then again into the
+    // `Vec` below, once per HDU header the walk reads.
+    let mut region = Vec::from(*first);
     while !block_has_end(&region[region.len() - BLOCK..]) {
         if region.len() as u64 + BLOCK as u64 > limits.fits_header_bytes {
             return Err(Error::limit(format!(
