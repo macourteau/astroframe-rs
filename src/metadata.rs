@@ -19,6 +19,34 @@ pub enum KeywordOrigin {
     Reference,
 }
 
+/// What kind of value field a card carried, as FITS 4.0 §4.2 defines the kinds.
+///
+/// The value *text* is reported verbatim and the consumer parses it, so this reports the one
+/// thing the text cannot carry: whether the file wrote the value as a quoted character string.
+/// That distinction is a fact about the card rather than an interpretation of it, and it is
+/// load-bearing twice over — §4.2.1.2 continues character strings only, and a structural
+/// keyword the standard gives a numeric or logical type to is not satisfied by a string that
+/// spells the same characters. `BITPIX = '16'` is a character string, not the integer 16.
+///
+/// The kinds §4.2 lists beyond the character string — logical, integer, real, complex integer,
+/// complex floating, and the undefined value of a blank field — are not distinguished here:
+/// telling them apart is the parse the consumer does on the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ValueKind {
+    /// A character-string value (§4.2.1): the value field opened with a single quote. The
+    /// reported text is the unquoted content, with the doubled quotes resolved and the
+    /// insignificant trailing blanks stripped.
+    CharacterString,
+    /// A value field that is not a character string — §4.2.2's logical through §4.2.6's
+    /// complex floating value, and the undefined value of a blank field.
+    Other,
+    /// The card carries no value field at all: a commentary card (`COMMENT`, `HISTORY`, a
+    /// blank keyword name), or any card whose bytes 9 and 10 are not the value indicator.
+    /// The card's text is reported as the [comment](Keyword::comment).
+    Commentary,
+}
+
 /// One keyword, as the file wrote it.
 ///
 /// Values are the text in the file, with FITS quoting removed and trailing blanks stripped
@@ -61,6 +89,14 @@ pub struct Keyword {
     /// a FITS card carrying no comment and one carrying an empty one are different cards.
     pub(crate) value_end: Option<usize>,
     pub(crate) origin: KeywordOrigin,
+    /// What kind of value field the card carried.
+    ///
+    /// A copyable enum rather than the value's text, and it sits in the padding the three
+    /// fields above leave: `size_of::<Keyword>()` is the same with it as without, which
+    /// `keyword_stays_packed` holds to. A per-card `String` naming the kind would be an
+    /// allocation per occurrence bounded by a cap, which is the class
+    /// `docs/intentional-patterns.md` forbids.
+    pub(crate) value_kind: ValueKind,
 }
 
 impl Keyword {
@@ -73,6 +109,7 @@ impl Keyword {
         value: &str,
         comment: Option<&str>,
         origin: KeywordOrigin,
+        value_kind: ValueKind,
     ) -> Keyword {
         let mut buf = String::with_capacity(name.len() + value.len() + comment.map_or(0, str::len));
         buf.push_str(name);
@@ -88,6 +125,7 @@ impl Keyword {
             name_end,
             value_end,
             origin,
+            value_kind,
         }
     }
 
@@ -113,6 +151,32 @@ impl Keyword {
     /// Where this card came from.
     pub fn origin(&self) -> KeywordOrigin {
         self.origin
+    }
+
+    /// What kind of value field the card carried.
+    ///
+    /// The value text alone cannot answer it: the quotes are stripped from a character-string
+    /// value, so `BITPIX = '16'` and `BITPIX = 16` report the same [`value`](Keyword::value)
+    /// and are different cards. This crate reads a structural keyword only from the kind FITS
+    /// 4.0 gives it, and reporting the kind is what lets a consumer make the same distinction.
+    pub fn value_kind(&self) -> ValueKind {
+        self.value_kind
+    }
+}
+
+#[cfg(test)]
+mod keyword_layout {
+    use super::Keyword;
+
+    /// `Keyword` is allocated once per card and a header may carry 4096 of them per image
+    /// across 256 images, so its width is a cap-multiplied cost. The three texts are packed
+    /// into one allocation for that reason, and the two one-byte enums beside them ride in
+    /// the padding an `Arc<str>`, a `usize` and an `Option<usize>` leave — so carrying the
+    /// value kind is free. This pins that: a field that grows the struct is a decision to
+    /// take deliberately rather than to discover in a memory profile.
+    #[test]
+    fn keyword_stays_packed() {
+        assert_eq!(size_of::<Keyword>(), 48);
     }
 }
 

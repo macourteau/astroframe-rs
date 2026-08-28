@@ -117,6 +117,59 @@ fn simple_f_is_unsupported_at_construction() {
     assert!(format!("{err}").contains("SIMPLE = F"), "{err}");
 }
 
+/// A structural keyword written as a character string is not that keyword's value.
+///
+/// FITS 4.0 §4.2 gives `SIMPLE` a logical value and `BITPIX` an integer one, so `SIMPLE = 'T'`
+/// and `BITPIX = '16'` are quoted strings that spell the conforming text rather than the
+/// values the standard asks for. Reading them as though the quotes were absent is the silent
+/// plausible repair § The organizing principle refuses, so each lands on the row its keyword
+/// already has: `SIMPLE` not being a logical value is `Malformed` at construction, and a
+/// `BITPIX` that is not an integer value is `Malformed` at a declined position.
+///
+/// The card is still **reported** verbatim, `keywords()` being what the file said; it is the
+/// structural reading that refuses it.
+#[test]
+fn a_quoted_structural_value_is_not_the_structural_keywords_value() {
+    let quoted_simple = common::Hdu::default()
+        .raw(&common::card("SIMPLE", Some("'T'"), None))
+        .image_2d(16, 2, 2)
+        .data_i16(&STORED_2X2);
+    let err = sequential(file(&[quoted_simple])).expect_err("SIMPLE = 'T' asserts nothing");
+    assert_eq!(kind(&err), "Malformed", "{err}");
+    assert!(format!("{err}").contains("SIMPLE"), "{err}");
+
+    let quoted_bitpix = Hdu::primary()
+        .card("BITPIX", "'16'")
+        .card("NAXIS", "2")
+        .card("NAXIS1", "2")
+        .card("NAXIS2", "2")
+        .unsigned_convention(16)
+        .data_i16(&STORED_2X2);
+    let mut reader = sequential(file(&[quoted_bitpix])).expect("the header parses");
+    assert!(reader.next_image().expect("advancing succeeds"));
+    let header = reader.header().expect("a declined position still reports");
+    assert_eq!(
+        header.decline_reason().map(|d| d.class()),
+        Some(DeclineClass::Malformed)
+    );
+    assert!(
+        header
+            .decline_reason()
+            .is_some_and(|d| d.reason().contains("BITPIX")),
+        "{:?}",
+        header.decline_reason()
+    );
+    // Reported, and reported as the string it is.
+    assert_eq!(header.get("BITPIX").map(|k| k.value()), Some("16"));
+    assert_eq!(
+        header.get("BITPIX").map(|k| k.value_kind()),
+        Some(astroframe::ValueKind::CharacterString)
+    );
+    // The geometry three follow the row `BITPIX` already has: full geometry, no format.
+    assert_eq!(geometry(&header), (Some(2), Some(2), Some(1)));
+    assert!(header.sample_format().is_none());
+}
+
 /// Row *FITS header structure fault*, construction half: card grammar, no `END`, a truncated
 /// header block, and a byte outside `0x20`–`0x7E` in a keyword-name or value field, all
 /// `Malformed` at construction for the **primary** header.

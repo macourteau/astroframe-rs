@@ -186,6 +186,79 @@ So the discipline is mechanical rather than remembered: `tests/common/mod.rs::as
 is the one copy every suite grades with, and the `greps` job in `.github/workflows/ci.yml`
 fails the build on an `assert_eq!` over a float sample buffer anywhere under `tests/`.
 
+### A card's value carries its kind, and a structural keyword is read only from its own kind
+
+`Keyword` carries a `ValueKind` — `CharacterString`, `Other`, `Commentary` — beside the three
+texts, and every structural keyword this crate lexes is read through a lookup that refuses a
+character-string spelling. `SIMPLE = 'T'` does not assert conformance, `BITPIX = '16'` is not
+the integer 16, and `NAXIS1 = '512'` sizes nothing. Each lands on the row its keyword already
+has in § Errors' decline table: `SIMPLE` not being a logical value is `Malformed` at
+construction, and `BITPIX`, `NAXIS`, a `NAXISn`, `PCOUNT` or `GCOUNT` not being an integer
+value is `Malformed` at a declined position. The card is still **reported** verbatim — the
+value text is what the file wrote, and `Keyword::value_kind()` is what says it was written in
+quotes.
+
+FITS 4.0 §4.2 gives every keyword a value *type*, so this is the standard's own distinction
+rather than a strictness this crate invented. The keywords whose declared type **is** a
+character string — `XTENSION`, `ROWORDER` — read from the quoted spelling as before; the rule
+is the keyword's type, not a preference for unquoted text. Nothing in FITS makes the two forms
+interchangeable, and reading a string as the value of a numeric keyword is the silent plausible
+repair § The organizing principle refuses everywhere else.
+
+**Leniency here protects nothing real.** The choice was measured before it was made: 302 FITS
+files across two corpora — ESO, MAST (HST, JWST, TESS), IRSA, SDSS, SkyView, PixInsight,
+amateur capture software, and all 120 `fpack` variants — carry 28 444 cards with quoted values
+between them, and **not one** of them quotes `SIMPLE`, `BITPIX`, `NAXIS`, a `NAXISn`, `PCOUNT`,
+`GCOUNT`, `GROUPS`, `EXTEND`, `BLANK`, `ZIMAGE` or `TFIELDS`.
+
+The kind is a copyable enum rather than text, which is the `Arc<str>` discipline in
+`docs/intentional-patterns.md` applied to a field that is not text at all: a `String` naming
+the kind would be one allocation per card, and a header may carry 4096 cards across 256 image
+positions. It rides in the padding `Arc<str>`, `usize`, `Option<usize>` and `KeywordOrigin`
+leave, so `size_of::<Keyword>()` is 48 bytes with it and was 48 bytes without;
+`metadata::keyword_layout::keyword_stays_packed` holds that.
+
+`ValueKind` is public and `#[non_exhaustive]`, under the crate-wide rule in § The API. It
+distinguishes only what the parse distinguishes: §4.2.1's character string is separated from
+everything else because unquoting is where the fact would otherwise be lost, while §4.2.2's
+logical through §4.2.6's complex floating are a parse of the reported text and are reported as
+`Other` together. `Commentary` is the card with no value indicator at all, which is a third
+state rather than an empty value — a `COMMENT` card and a card carrying an empty value field
+are different cards.
+
+### The five sizing keywords are read once per HDU, and the reasons stay separate
+
+`fits::hdu::Sizing` holds `BITPIX`, `NAXIS`, the `NAXISn` run, `PCOUNT` and `GCOUNT` as the
+cards wrote them, lexed once per HDU and carried on the `Hdu`. It holds **data, never a
+verdict**: a value that did not read is `None`, a negative one is a negative `i64`, and the
+`NAXISn` run is truncated at the first axis that did not read, that truncation point being the
+fault expressed as a length. `is_image_position`, `first_fault` and `data_unit_size` each
+consume it and assign their own class, in their own order, in their own words.
+
+That split is the design's, not a convenience: § Errors → Validation order requires the decline
+table to stay independent of the size formula, so that a header carrying two faults classifies
+determinately. Sharing the *lexing* is what removes the drift; sharing the *judgement* would
+remove the rule.
+
+**The `999` bound on `NAXIS` goes away rather than moving.** § Errors enumerates the unsizable
+reasons exhaustively — a missing, unparseable or out-of-standard-set `BITPIX`; a missing or
+unparseable `NAXIS`, `NAXISn`, `PCOUNT` or `GCOUNT`; a value of one of them with no reading as
+a size; or arithmetic that overflows the `u64` the computation runs in — and a parseable,
+in-range-for-`i64` `NAXIS = 1000` is not among them. It needs no bound of its own either:
+`NAXIS1000` is not a name an eight-byte keyword field can hold, so the axis run reaches a
+`NAXISn` that is not there and returns the enumerated fault. What stays is a check that `NAXIS`
+is not **negative**, which is not scope but arithmetic — the axis run over a negative `NAXIS` is
+empty, so without it the unit would size as though the header declared no axes at all. Scope
+belongs to `first_fault`, which already declines `NAXIS = 1` and `NAXIS > 3` as `Unsupported`.
+
+Reading the run once has one observable consequence, and it is the two functions agreeing
+rather than one of them changing its mind: a **random-groups primary missing `NAXIS1`** is
+unsizable, where the size formula previously stepped over it by starting the axis product at
+`NAXIS2` and never asking whether `NAXIS1` was there. `first_fault` called that same header
+`Malformed` on the missing `NAXIS1` throughout, so the walk was sizing a header the decline
+table had already refused. §6.1.1 makes `NAXIS1` mandatory and fixes it at 0, so a conforming
+random-groups header is unaffected.
+
 ## Dependency policy: one reviewed exception
 
 § Dependencies of the design assumes the runtime graph is clean of the banned numeric helpers.
