@@ -210,7 +210,12 @@ jobs:
           # why these are banned is written *in* the code that must not use them, so a grep
           # over raw source flags its own rationale, and the only way to keep it green would
           # be to delete the explanation. Stripping comments keeps the check on what executes.
-          hits="$(git ls-files 'src/*.rs' \
+          #
+          # `tests/` is in scope alongside `src/`, and not for symmetry: a test that computes
+          # an expected value with `mul_add` produces a *wrong oracle* and then agrees with
+          # itself, so the check that is supposed to catch a fused multiply-add on the decode
+          # path passes green while the comparison it rests on has already fused one.
+          hits="$(git ls-files 'src/*.rs' 'tests/*.rs' \
                   | xargs grep -nE 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' \
                   | sed 's|//.*||' \
                   | grep -E 'mul_add|algebraic_|\bpowi\b|to_degrees|to_radians|fmuladd' || true)"
@@ -287,8 +292,17 @@ jobs:
           # No machine-local absolute path in committed content. `examples/` is in scope for
           # the same reason `tests/` is, and more so: every example takes a frame path, and
           # the tempting way to write one is to bake in the path the author tested with.
-          hits="$(git ls-files 'src/*' 'tests/*' 'docs/*' 'examples/*' '*.toml' '*.md' \
-                  | xargs grep -nE '[A-Z]:\\|/Users/|/home/[a-z]' || true)"
+          # `.github/`, `tools/` and `fuzz/` are in scope because each of them is written by
+          # hand against paths that exist on one machine — a workflow step, a spec-fetching
+          # script, a fuzz seed directory.
+          #
+          # The home-directory prefixes are written with their first character bracketed.
+          # `.github/` in scope means this file is one of the files scanned, and a pattern
+          # that matches the line defining it fails on itself, which leaves deleting the check
+          # as the only way to make the lane green. The bracket changes what the pattern reads
+          # like and nothing about what it matches.
+          hits="$(git ls-files 'src/*' 'tests/*' 'docs/*' 'examples/*' '.github/*' 'tools/*' 'fuzz/*' '*.toml' '*.md' \
+                  | xargs grep -nE '[A-Z]:\\|/[U]sers/|/[h]ome/[a-z]' || true)"
           [ -z "$hits" ] || { echo "$hits"; fail "a machine-local absolute path is committed"; }
 
           # The crate is written from the published specifications alone. Descriptive prose

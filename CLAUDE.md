@@ -48,6 +48,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 
+# `missing_docs` and broken intra-doc links are both errors in CI, and neither clippy nor the
+# doctests reach them — only rustdoc does. Specification citations are what break this: a
+# reference written `[23]` reads to rustdoc as a link to an item named `23`.
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
+
 # The feature powerset. The empty set is a supported configuration: with both formats off
 # the crate still compiles and exposes the header types and the normalization primitive,
 # and every constructor returns Unsupported.
@@ -67,6 +72,12 @@ RUSTC=$RT/rustc $RT/cargo check --locked --all-features --all-targets
 
 cargo deny --all-features check licenses
 cargo package --locked --all-features
+
+# The resident-memory half of § Streaming's peak-memory criterion. Maintainer-local rather
+# than per-push: it reads `/proc`, so it is Linux-only, and it measures what the operating
+# system actually holds, which needs a quiet machine to mean anything. Run it beside the
+# corpus run below. The allocation half runs on every push and is covered by `cargo test`.
+cargo test --release --all-features --test peak_memory_resident -- --ignored --nocapture
 ```
 
 The grep-shaped checks in `.github/workflows/ci.yml`'s `greps` job are plain shell — read them

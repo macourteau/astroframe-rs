@@ -22,6 +22,11 @@ discovery.
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
+
+# `missing_docs` and broken intra-doc links are both errors in CI, and neither clippy nor the
+# doctests reach them — only rustdoc does. Specification citations are what break this: a
+# reference written `[23]` reads to rustdoc as a link to an item named `23`.
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
 ```
 
 For anything touching features, the numeric path, or packaging, also run:
