@@ -377,7 +377,7 @@ impl std::fmt::Debug for Keywords<'_> {
 /// `Metadata`-scope ones. A root-level property reaching an image through a `Reference` is
 /// tagged with the scope of the element it attaches to, and an **unreferenced** root-level
 /// property is attached to no image and is not reported at all, so no path produces a root
-/// scope. See `docs/implementation-decisions.md`.
+/// scope. See [`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/implementation-decisions.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PropertyScope {
@@ -1051,7 +1051,8 @@ impl DisplayChannels {
 /// empty image reference; they are reconstructed here from the surrounding prose, which
 /// states that a midtones balance of 0.5 defines a linear function, and from the midtones
 /// transfer function's ordinary identity — midtones 0.5, shadows 0, highlights 1, low range
-/// 0, high range 1, in every channel. Recorded in `docs/implementation-decisions.md`.
+/// 0, high range 1, in every channel. Recorded in
+/// [`docs/implementation-decisions.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/implementation-decisions.md).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayFunction {
     pub(crate) midtones: DisplayChannels,

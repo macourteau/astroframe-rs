@@ -35,7 +35,7 @@
 //! 65 536 `UInt16` levels and on 126 of 256 `UInt8` levels. Which is *more* accurate is not
 //! the point — the point is that one of them has to be chosen and written down, because a
 //! consumer comparing this crate's output against another decoder's needs to know which.
-//! See [`Normalizer`] and `docs/intentional-patterns.md`.
+//! See [`Normalizer`] and [`docs/intentional-patterns.md`](https://github.com/macourteau/astroframe-rs/blob/main/docs/intentional-patterns.md).
 //!
 //! **The decoded bits are part of the public API.** A release that changes one ULP of output
 //! for an input it previously decoded is a breaking change.

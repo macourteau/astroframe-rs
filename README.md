@@ -18,6 +18,9 @@ crate itself sets `#![forbid(unsafe_code)]`.
 astroframe = "0.2"
 ```
 
+Release history, and what each release did to the decoded bits, is in
+[CHANGELOG.md](https://github.com/macourteau/astroframe-rs/blob/main/CHANGELOG.md).
+
 ## Reading a header without decoding a pixel
 
 Constructing a `Reader` and reading a header reads no pixel byte, which for a metadata sweep
@@ -258,7 +261,7 @@ compressor and is round-tripped byte for byte through its decompressor, and only
 around it is built here. The frames that do straddle the split threshold are the 8 the sweep
 reads header-only.
 
-Separately, a validation run of 0.1.1 over 163 public-archive frames — ESO, MAST, IRSA, SDSS
+Separately, a validation run of 0.2.0 over 163 public-archive frames — ESO, MAST, IRSA, SDSS
 and SkyView — walked 512 image positions: 410 decoded, 102 declined with a stated reason, none
 failed, and every decoded position was byte-identical to an independent decoder over the raw
 sample bytes. That run is a maintainer's record rather than a test in this repository.

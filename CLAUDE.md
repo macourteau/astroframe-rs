@@ -43,6 +43,8 @@ mechanical rather than remembered: each deprecated item has a test asserting the
 yet reached its removal line. Bumping past that line fails the suite with the item named. A
 failure there is the mechanism working — delete the item, then delete its test.
 
+Every entry in `CHANGELOG.md` states whether decoded output moved and what was compared to
+establish it. A release that cannot answer that question is not ready to be tagged.
 
 ## Local verification — run this before pushing
 
