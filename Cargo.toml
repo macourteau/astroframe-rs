@@ -41,7 +41,7 @@ checksum = ["dep:sha1", "dep:sha2", "dep:sha3"]
 [dependencies]
 thiserror = "2.0"
 
-quick-xml = { version = "0.41", optional = true }
+quick-xml = { version = "0.42", optional = true }
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 # `rust_backend` is flate2's own default and selects miniz_oxide. It is named here rather
 # than inherited so that the crate's pure-Rust claim rests on this manifest rather than on
