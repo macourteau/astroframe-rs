@@ -399,7 +399,6 @@ impl<S: Source> Reader<S> {
         })
     }
 
-    #[allow(unused_variables)]
     fn sniff(signature: &[u8; 8], source: &mut S, limits: &Limits) -> Result<Inner> {
         if signature.starts_with(b"SIMPLE") {
             #[cfg(feature = "fits")]

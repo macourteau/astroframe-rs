@@ -732,6 +732,13 @@ fn element_heavy_header() {
 ///
 /// The header parse happens in the constructor — an over-guarded header is a unit-level fault,
 /// so there is no `Reader` to walk — which is why this is the whole measured region.
+// With neither format compiled in, `Reader` holds `Inner::NoFormat` instead of a boxed
+// decoder and so carries no drop glue at all, which is what clippy reports. The call still
+// says what the measurement needs it to say in every configuration that decodes anything.
+#[cfg_attr(
+    not(any(feature = "fits", feature = "xisf")),
+    allow(clippy::drop_non_drop)
+)]
 fn measure(shape: &str, unit: &[u8]) {
     let bound = oracle_bound(unit.len());
 

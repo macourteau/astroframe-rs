@@ -67,6 +67,13 @@ fn attach_image(attrs: &str, block: Vec<u8>) -> Vec<u8> {
 /// the counter reset immediately before it — see the module documentation for why this is one
 /// test and not four.
 #[test]
+// With neither format compiled in, `Reader` holds `Inner::NoFormat` instead of a boxed
+// decoder and so carries no drop glue at all, which is what clippy reports. The call still
+// says what the measurement needs it to say in every configuration that decodes anything.
+#[cfg_attr(
+    not(any(feature = "fits", feature = "xisf")),
+    allow(clippy::drop_non_drop)
+)]
 fn a_decompression_bomb_is_refused_without_materializing() {
     // ---- fixtures, all built before any measurement begins ----
 

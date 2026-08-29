@@ -75,18 +75,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The cargo features *are* the untested configuration unless CI builds their powerset.
+      # The cargo features *are* the untested configuration unless CI covers their powerset.
       # The empty set is not a curiosity: with both formats off the crate still compiles and
       # still exposes the header types and the normalization primitive, and every constructor
       # returns Unsupported. That is a documented, supported configuration.
+      #
+      # Clippy rather than `cargo build`, and `--all-targets`: a lint that fires in one feature
+      # configuration and not another is invisible to the all-features lane, and `cargo build`
+      # never compiles the tests, so a per-configuration fault in them is invisible to both.
       - name: Every feature combination
         run: |
           set -eu
           failed=""
           for f in "" fits xisf checksum fits,xisf fits,checksum xisf,checksum fits,xisf,checksum; do
             echo "::group::features [$f]"
-            cargo build --locked --no-default-features --features "$f" || failed="${failed} [$f]"
+            cargo clippy --locked --all-targets --no-default-features --features "$f" \
+              -- -D warnings || failed="${failed} [$f]"
             echo "::endgroup::"
           done
           [ -z "$failed" ] || { echo "FAILED:${failed}" >&2; exit 1; }

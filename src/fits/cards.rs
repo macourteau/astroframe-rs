@@ -418,13 +418,13 @@ fn hierarch(card: &[u8], ordinal: u64) -> Result<Option<(String, &[u8])>> {
     let Some(offset) = body.iter().position(|&b| b == b'=') else {
         return Ok(None);
     };
-    let lossy = String::from_utf8_lossy(field(body, 0, offset));
-    // The collapse is what allocates, so the two conditions that discard its result are asked
-    // first: a name field holding nothing but blanks, and one holding a byte the character set
-    // forbids. `HIERARCH = value` names nothing; it is an ordinary keyword named `HIERARCH`.
-    if lossy.split_whitespace().next().is_none() {
-        return Ok(None);
-    }
+    // § Header character set makes everything up to the `=` a keyword-name field on this
+    // card, so the raw bytes are checked before anything interprets them. The order matters
+    // and is not stylistic: `split_whitespace` is a Unicode predicate and U+00A0 is whitespace
+    // under it, so a name field of nothing but non-ASCII blanks would be discarded as empty by
+    // the test below and the card accepted as an ordinary `HIERARCH` keyword — carrying the
+    // illegal bytes into the comment field, which tolerates them, while the same bytes beside
+    // a real word are a hard error.
     check_ascii(
         field(card, 0, NAME + offset),
         "keyword name",
@@ -433,6 +433,13 @@ fn hierarch(card: &[u8], ordinal: u64) -> Result<Option<(String, &[u8])>> {
             name: b"HIERARCH",
         },
     )?;
+    // Every byte is ASCII by here, so this asks only whether the field is all blanks.
+    // `HIERARCH = value` names nothing; it is an ordinary keyword named `HIERARCH`. It is
+    // asked before `collapse_whitespace`, the one allocation on this path.
+    let lossy = String::from_utf8_lossy(field(body, 0, offset));
+    if lossy.split_whitespace().next().is_none() {
+        return Ok(None);
+    }
     Ok(Some((
         collapse_whitespace(&lossy),
         field(body, offset + 1, body.len()),
@@ -763,6 +770,19 @@ mod tests {
         let kws = fold(&[card("HIERARCH ESO DET EXP")]);
         assert_eq!(kws[0].name(), "HIERARCH");
         assert_eq!(kws[0].value(), "");
+    }
+
+    #[test]
+    fn a_hierarch_name_of_only_non_ascii_blanks_is_a_character_set_error() {
+        // U+00A0 is whitespace to `split_whitespace` but lies outside 0x20-0x7E. A name field
+        // holding nothing else must not be discarded as blank before the character set is
+        // checked, or the card is accepted as an ordinary `HIERARCH` keyword and the illegal
+        // bytes go unreported — while the same bytes beside a real word are refused.
+        let mut bytes = b"HIERARCH ".to_vec();
+        bytes.extend_from_slice("\u{a0}".as_bytes());
+        bytes.extend_from_slice(b" = 1");
+        let err = fold_err(&[raw(&bytes)]);
+        assert!(format!("{err}").contains("character set"), "{err}");
     }
 
     #[test]

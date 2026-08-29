@@ -38,6 +38,7 @@ it is a minor bump at `0.x` and a major after `1.0`. The exhaustive tests in
 Conventional-commit prefixes (`feat:`, `fix:`, `chore:`, `docs:`) are still house style for
 readability. They carry no release semantics here.
 
+
 ## Local verification — run this before pushing
 
 Every command below runs locally. None of them should be discovered by a red pipeline: CI is
@@ -57,7 +58,8 @@ RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
 # the crate still compiles and exposes the header types and the normalization primitive,
 # and every constructor returns Unsupported.
 for f in "" fits xisf checksum fits,xisf fits,checksum xisf,checksum fits,xisf,checksum; do
-  cargo build --locked --no-default-features --features "$f" || echo "FAILED: [$f]"
+  cargo clippy --locked --all-targets --no-default-features --features "$f" \
+    -- -D warnings || echo "FAILED: [$f]"
 done
 
 # The MSRV is reported, not targeted — the job exists so the declared number stays true.
@@ -85,7 +87,22 @@ cargo package --locked --all-features
 # than per-push: it reads `/proc`, so it is Linux-only, and it measures what the operating
 # system actually holds, which needs a quiet machine to mean anything. Run it beside the
 # corpus run below. The allocation half runs on every push and is covered by `cargo test`.
+#
+# `--nocapture` is load-bearing. Off Linux the test skips and still reports `ok`, so without
+# the printed figures a skip and a measurement are indistinguishable — which is how this half
+# of the criterion went unmeasured while appearing to pass.
 cargo test --release --all-features --test peak_memory_resident -- --ignored --nocapture
+```
+
+Off Linux, run it in a container rather than reading that skip as a pass. `git archive` rather
+than a bind mount, so the tag is what gets measured and no target directory rides along:
+
+```sh
+git archive --format=tar HEAD > /tmp/astroframe-src.tar
+docker run --rm -v /tmp/astroframe-src.tar:/src.tar:ro rust:1 bash -c '
+  mkdir -p /work && tar xf /src.tar -C /work && cd /work
+  cargo test --release --locked --all-features \
+    --test peak_memory_resident -- --ignored --nocapture'
 ```
 
 The grep-shaped checks in `.github/workflows/ci.yml`'s `greps` job are plain shell — read them

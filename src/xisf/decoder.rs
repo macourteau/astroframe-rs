@@ -800,11 +800,7 @@ fn decode_row(
         }};
     }
 
-    // Moved out and back rather than borrowed in place: `std::mem::replace` leaves an empty
-    // `Vec` behind for the duration, so the fill below writes into the scratch buffer the
-    // caller already has and no second row is ever allocated.
-    let mut scratch = std::mem::replace(&mut p.scratch, Samples::U8(Vec::new()));
-    match &mut scratch {
+    match &mut p.scratch {
         Samples::U8(v) => match unshuffle {
             None if stride == 1 => {
                 let start = (first_sample * sample_bytes - origin) as usize;
@@ -833,7 +829,6 @@ fn decode_row(
         Samples::F32(v) => fill!(v, 4, f32::from_be_bytes, f32::from_le_bytes),
         Samples::F64(v) => fill!(v, 8, f64::from_be_bytes, f64::from_le_bytes),
     }
-    p.scratch = scratch;
     Ok(())
 }
 
