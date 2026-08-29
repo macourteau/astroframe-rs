@@ -16,6 +16,30 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.2.2] — 2026-08-28
+
+Decoded output does not move. The 1080-variant XISF-against-FITS differential over 41.8 billion
+pixels, the 1542-frame corpus sweep and the `fitsrs` differential all agree with 0.2.1 sample for
+sample — which is the comparison that matters here, every XISF frame reaching its pixels through
+the header parser this release rewrites.
+
+### Changed
+
+- `quick-xml` 0.42. It decodes to `str` at the parser rather than handing out bytes, so the XISF
+  header walk reads names and values as text throughout. The crate's own UTF-8 check for element
+  and attribute names goes with it: the parser performs that check now, and the rule it enforced
+  moves to the reader boundary, where one arm states the reason in this crate's own words rather
+  than the dependency's.
+- **Invalid UTF-8 in a namespace URI or in a prefix is `Malformed`.** Those two surfaces went
+  through a lossy conversion, which the parser's own decode now precedes and forecloses. §9.5
+  fixes the header encoding as UTF-8 and § XISF decisions makes invalid UTF-8 `Malformed`, which
+  is what the name, text, CDATA and attribute-value paths already reported; these two were the
+  exceptions. **This changes what is accepted** on those surfaces alone — a header carrying such
+  a byte is refused rather than read through a substituted character — and no sample decodes
+  differently.
+
+The MSRV is unaffected: `quick-xml` 0.42 declares 1.86 against this crate's 1.88.
+
 ## [0.2.1] — 2026-08-28
 
 Decoded output does not move. No change in this release touches the normalization primitive
@@ -140,6 +164,7 @@ documented cap, a frame the crate cannot decode under its stated rules is an err
 best guess, and a position this version does not handle is *declined* with a class and a reason
 while the walk continues.
 
+[0.2.2]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.2
 [0.2.1]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.1
 [0.2.0]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.1.1
