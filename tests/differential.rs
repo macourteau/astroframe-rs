@@ -489,7 +489,7 @@ fn every_fits_sample_format_has_a_fitsrs_counterpart() {
         let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
         assert!(reader.next_image().expect("advance"), "{what}: an image");
         let format = reader
-            .header()
+            .current_header()
             .expect("header")
             .sample_format()
             .expect("a standard BITPIX");

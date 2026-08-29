@@ -38,6 +38,11 @@ it is a minor bump at `0.x` and a major after `1.0`. The exhaustive tests in
 Conventional-commit prefixes (`feat:`, `fix:`, `chore:`, `docs:`) are still house style for
 readability. They carry no release semantics here.
 
+A bump also settles outstanding deprecations, and `tests/deprecations.rs` is what makes that
+mechanical rather than remembered: each deprecated item has a test asserting the version has not
+yet reached its removal line. Bumping past that line fails the suite with the item named. A
+failure there is the mechanism working — delete the item, then delete its test.
+
 
 ## Local verification — run this before pushing
 

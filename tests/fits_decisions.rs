@@ -63,7 +63,7 @@ fn inherit_fills_gaps_per_card_and_never_overrides() {
         ),
     ]);
     let reader = advance_to_extension(bytes);
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(
         header.scaling(),
         Some(Scaling::Fits {
@@ -82,7 +82,7 @@ fn inherit_fills_gaps_per_card_and_never_overrides() {
     ]);
     let reader = advance_to_extension(bytes);
     assert_eq!(
-        reader.header().expect("header").scaling(),
+        reader.current_header().expect("header").scaling(),
         Some(Scaling::Fits {
             bscale: 1.0,
             bzero: 32768.0
@@ -102,7 +102,7 @@ fn inherit_false_and_inherit_absent_both_apply_nothing() {
             image_extension(&cards, &[0, 1, 2, 3]),
         ]);
         let reader = advance_to_extension(bytes);
-        let header = reader.header().expect("header");
+        let header = reader.current_header().expect("header");
         assert_eq!(
             header.scaling(),
             Some(Scaling::Fits {
@@ -128,7 +128,7 @@ fn inherit_true_applies_the_primarys_roworder() {
         image_extension(&[("INHERIT", "T")], &[0, 1, 2, 3]),
     ]);
     let reader = advance_to_extension(bytes);
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(
         header.row_order(),
         Some(&RowOrder::BottomUp),
@@ -146,7 +146,7 @@ fn both_headers_cards_are_always_reported_and_tagged() {
         image_extension(&[("INHERIT", "F")], &[0, 1, 2, 3]),
     ]);
     let reader = advance_to_extension(bytes);
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
 
     let exptime = header
         .keyword("EXPTIME")
@@ -180,7 +180,7 @@ fn inherit_in_a_primary_header_is_data_not_an_instruction() {
         .data_i16(&[-32768, -32767, 0, 32767])]);
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(header.keyword("INHERIT").map(|k| k.value()), Some("T"));
     // It gated nothing: the primary's own scaling stands and the frame still decodes.
     assert_eq!(
@@ -213,7 +213,7 @@ fn blank_is_reported_and_no_sample_is_substituted() {
         .data_i16(&stored)]);
     let mut reader = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(header.keyword("BLANK").map(|k| k.value()), Some("-32768"));
 
     let mut samples = Samples::zeroed(header.sample_format().expect("format"), 4);
@@ -245,7 +245,7 @@ fn fits_checksum_keywords_are_reported_and_not_verified() {
         .data_i16(&[-32768, -32767, 0, 32767])]);
     let mut reader = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(
         header.keyword("CHECKSUM").map(|k| k.value()),
         Some("0000000000000000")
@@ -285,7 +285,7 @@ fn roworder_spellings_normalize_and_unknown_values_survive_verbatim() {
         let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
         assert!(reader.next_image().expect("advance"));
         assert_eq!(
-            reader.header().expect("header").row_order(),
+            reader.current_header().expect("header").row_order(),
             Some(&expected),
             "ROWORDER = {written}"
         );
@@ -300,7 +300,7 @@ fn roworder_spellings_normalize_and_unknown_values_survive_verbatim() {
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     assert!(reader.next_image().expect("advance"));
     assert_eq!(
-        reader.header().expect("header").row_order(),
+        reader.current_header().expect("header").row_order(),
         Some(&RowOrder::Unspecified)
     );
 }
@@ -367,7 +367,7 @@ fn naxis_three_is_read_as_channels() {
         .data_i16(&stored)]);
     let mut reader = Reader::seekable(Cursor::new(bytes)).expect("construct");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(
         (header.width(), header.height(), header.channels()),
         (Some(2), Some(2), Some(3))
@@ -414,7 +414,7 @@ fn a_data_unit_is_sized_with_pcount_and_gcount() {
         heap,
         marker(),
     ]));
-    let header = reader.header().expect("the marker's header");
+    let header = reader.current_header().expect("the marker's header");
     assert_eq!(
         (header.width(), header.height()),
         (Some(4), Some(1)),
@@ -435,7 +435,7 @@ fn a_data_unit_is_sized_with_pcount_and_gcount() {
         grouped,
         marker(),
     ]));
-    let header = reader.header().expect("the marker's header");
+    let header = reader.current_header().expect("the marker's header");
     assert_eq!(
         (header.width(), header.height()),
         (Some(4), Some(1)),
@@ -478,7 +478,7 @@ fn a_random_groups_primary_is_declined_and_stepped_over_exactly() {
         "the random-groups primary is an image position, declined rather than skipped"
     );
     let header = reader
-        .header()
+        .current_header()
         .expect("a declined position still reports what it can");
     let reason = header
         .decline_reason()
@@ -495,7 +495,7 @@ fn a_random_groups_primary_is_declined_and_stepped_over_exactly() {
         reader.next_image().expect("the walk steps past the groups"),
         "the image extension beyond the group data is reached"
     );
-    let header = reader.header().expect("the extension's header");
+    let header = reader.current_header().expect("the extension's header");
     assert_eq!(
         (header.width(), header.height()),
         (Some(4), Some(1)),

@@ -203,7 +203,7 @@ fn no_image_element() {
         "no image element: the walk ends normally rather than erroring"
     );
     assert!(
-        reader.header().is_none(),
+        reader.current_header().is_err(),
         "no image element: no position, so no header"
     );
 }
@@ -673,7 +673,7 @@ fn output_byte_cap_exceeded() {
 
     let mut reader = Reader::seekable(Cursor::new(&bytes)).expect("construction succeeds");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("a header at this position");
+    let header = reader.current_header().expect("a header at this position");
     assert!(
         header.decline_reason().is_none(),
         "output byte cap exceeded: the fixture must be sound apart from the cap"
@@ -709,7 +709,7 @@ fn sample_block_byte_cap_exceeded() {
 
     let mut reader = Reader::seekable(Cursor::new(&bytes)).expect("construction succeeds");
     assert!(reader.next_image().expect("advance"));
-    let header = reader.header().expect("a header at this position");
+    let header = reader.current_header().expect("a header at this position");
     assert!(
         header.decline_reason().is_none(),
         "sample block byte cap exceeded: the fixture must be sound apart from the cap"

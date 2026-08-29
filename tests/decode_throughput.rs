@@ -48,7 +48,7 @@ fn decode_one(path: &std::path::Path) -> Option<(u64, std::time::Duration)> {
     let start = Instant::now();
     let mut bytes = 0u64;
     while reader.next_image().ok()? {
-        let header = reader.header()?;
+        let header = reader.current_header().ok()?;
         if header.decline_reason().is_some() {
             continue;
         }

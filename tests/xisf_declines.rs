@@ -79,8 +79,8 @@ fn declined(what: &str, bytes: Vec<u8>) -> (Header, DeclineClass) {
         "{what}: a declined position is still a position"
     );
     let header = reader
-        .header()
-        .unwrap_or_else(|| panic!("{what}: a declined position still reports"));
+        .current_header()
+        .unwrap_or_else(|e| panic!("{what}: a declined position still reports: {e}"));
     let decline = header
         .decline_reason()
         .unwrap_or_else(|| panic!("{what}: decline_reason is Some"))
@@ -637,7 +637,9 @@ fn an_unreadable_referenced_element_declines_every_image_that_reaches_it() {
             reader.next_image().expect("the walk advances"),
             "{position}"
         );
-        let header = reader.header().expect("a declined position still reports");
+        let header = reader
+            .current_header()
+            .expect("a declined position still reports");
         let decline = header
             .decline_reason()
             .unwrap_or_else(|| panic!("image {position} declines"));
@@ -666,12 +668,15 @@ fn a_unit_declaring_no_image_walks_zero_images_and_ends_normally() {
         .build();
 
     let mut reader = seekable(bytes).expect("a unit declaring no image still constructs");
-    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        reader.current_header().is_err(),
+        "construction selects no image"
+    );
     assert!(
         !reader.next_image().expect("end of source is not an error"),
         "the walk ends normally rather than erroring"
     );
-    assert!(reader.header().is_none(), "and reports no Header");
+    assert!(reader.current_header().is_err(), "and reports no Header");
     // Idempotent: a second advance is still `Ok(false)`.
     assert!(!reader.next_image().expect("still not an error"));
 }
@@ -706,7 +711,7 @@ fn the_deduplicated_reference_spelling_reports_one_occurrence_per_reference() {
     let mut seen = 0;
     while reader.next_image().expect("the walk advances") {
         seen += 1;
-        let header = reader.header().expect("a header per occurrence");
+        let header = reader.current_header().expect("a header per occurrence");
         // Every occurrence is the same image, so it reports the same identity and the same
         // geometry — a `Reference` is the image, not a copy of it.
         assert_eq!(header.image_id(), None, "occurrence {seen}");
@@ -738,7 +743,7 @@ fn a_second_occurrence_of_one_block_is_unsupported_on_a_sequential_source_only()
     assert!(reader.next_image().expect("the walk still advances"));
     assert!(
         reader
-            .header()
+            .current_header()
             .expect("a header")
             .decline_reason()
             .is_none(),
@@ -805,7 +810,10 @@ fn one_faulty_image_declines_its_own_position_and_the_others_still_decode() {
     let mut reader = seekable(bytes).expect("one faulty image does not fail the source");
 
     assert!(reader.next_image().expect("the walk advances"));
-    assert_eq!(reader.header().expect("a header").image_id(), Some("a"));
+    assert_eq!(
+        reader.current_header().expect("a header").image_id(),
+        Some("a")
+    );
     let image = reader.read_image().expect("the first image decodes");
     assert_same_bits(&image.into_samples(), &want, "image a");
 
@@ -814,7 +822,9 @@ fn one_faulty_image_declines_its_own_position_and_the_others_still_decode() {
             .next_image()
             .expect("the walk advances past the fault")
     );
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     assert_eq!(header.image_id(), Some("b"));
     let decline = header.decline_reason().expect("declined");
     assert_eq!(decline.class(), DeclineClass::Unsupported, "{decline:?}");
@@ -824,7 +834,10 @@ fn one_faulty_image_declines_its_own_position_and_the_others_still_decode() {
     // The decline did not consume the walk: XISF blocks are located by declared offset rather
     // than by walking past them, so a declined image never blocks the next one.
     assert!(reader.next_image().expect("the walk advances"));
-    assert_eq!(reader.header().expect("a header").image_id(), Some("c"));
+    assert_eq!(
+        reader.current_header().expect("a header").image_id(),
+        Some("c")
+    );
     let image = reader.read_image().expect("the third image decodes");
     assert_same_bits(&image.into_samples(), &want, "image c");
 

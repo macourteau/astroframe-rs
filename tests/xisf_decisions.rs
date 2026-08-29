@@ -272,7 +272,9 @@ fn an_attachment_position_inside_the_header_region_is_refused() {
     let inside = located_u16(|_p, s| format!("attachment:40:{s}"), &stored);
     let mut reader = seekable(inside).expect("the unit itself is well-formed");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     let decline = header.decline_reason().expect("the position is declined");
     assert_eq!(decline.class(), DeclineClass::Malformed);
     assert!(
@@ -447,7 +449,9 @@ fn an_embedded_blocks_compression_is_read_from_the_child_data_element() {
 fn declined(bytes: Vec<u8>) -> (DeclineClass, String) {
     let mut reader = seekable(bytes).expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     let decline = header
         .decline_reason()
         .expect("the position is declined")
@@ -673,7 +677,10 @@ fn a_foreign_namespaced_image_element_is_not_an_image_occurrence() {
         r#"<ev:Image xmlns:ev="http://example.invalid/evil" geometry="2:2:1" sampleFormat="UInt16" location="embedded"/>"#,
     );
     let mut reader = seekable(bytes).expect("the unit constructs");
-    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        reader.current_header().is_err(),
+        "construction selects no image"
+    );
     assert!(
         !reader.next_image().expect("end of source is not an error"),
         "a foreign-namespaced Image is not walked as an XISF Image"
@@ -842,7 +849,10 @@ fn the_reserved_xmlns_prefix_binds_nothing_however_a_document_declares_it() {
         base64(&stored)
     ));
     let mut reader = seekable(unit).expect("the unit constructs");
-    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        reader.current_header().is_err(),
+        "construction selects no image"
+    );
     assert!(
         !reader.next_image().expect("end of source is not an error"),
         "an element prefixed with the reserved xmlns is not an XISF Image"
@@ -1181,7 +1191,9 @@ fn the_three_subblock_checks_hold_and_subblocks_without_compression_is_malformed
     let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), limits)
         .expect("the unit itself constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     let decline = header.decline_reason().expect("the position is declined");
     assert_eq!(decline.class(), DeclineClass::LimitExceeded, "{decline:?}");
     // All three run before any allocation: the count cap is enforced while the list is still
@@ -1401,7 +1413,7 @@ fn a_header_only_prefix_of_a_unit_carrying_a_thumbnail_still_parses() {
 
     let mut reader = seekable(prefix).expect("a header-only prefix parses");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("geometry is reported");
+    let header = reader.current_header().expect("geometry is reported");
     assert_eq!((header.width(), header.height()), (Some(4), Some(3)));
     // And the mismatch is an error only when someone asks for the pixels that are not there.
     let err = reader
@@ -2249,14 +2261,14 @@ fn baseline_conformance_reads_several_images_of_different_shapes_from_one_monoli
     let mut reader = seekable(bytes).expect("the unit constructs");
 
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a header");
+    let header = reader.current_header().expect("a header");
     assert_eq!(header.image_id(), Some("frame"));
     assert_eq!(header.sample_format(), Some(SampleFormat::U16));
     let image = reader.read_image().expect("the first image decodes");
     assert_same_bits(&image.into_samples(), &expected_u16(&first), "first image");
 
     assert!(reader.next_image().expect("the walk advances again"));
-    let header = reader.header().expect("a header");
+    let header = reader.current_header().expect("a header");
     assert_eq!(header.image_id(), Some("crop_mask"));
     assert_eq!(header.sample_format(), Some(SampleFormat::U8));
     assert_eq!(
@@ -2292,7 +2304,7 @@ fn a_header_only_prefix_yields_a_complete_header_with_no_error() {
 
     let mut reader = seekable(prefix).expect("a header-only prefix constructs");
     assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.header().expect("a complete Header");
+    let header = reader.current_header().expect("a complete Header");
     // Complete: the geometry three, the sample format, and the reported attributes, with no
     // decline — the declared offset lies past the end of this source and is not checked here.
     assert!(header.decline_reason().is_none(), "{header:?}");

@@ -524,7 +524,7 @@ impl<S: Source> Reader<S> {
     /// [`Reader::current_header`] is the same value past the first advance, as a `Result`
     /// rather than an `Option` — which is what a caller inside the `while next_image()?` loop
     /// wants, the `None` being unreachable there.
-    pub fn header(&self) -> Option<Header> {
+    fn header_inner(&self) -> Option<Header> {
         let base = dispatch!(&self.inner, d => d.header(), Option<&Header>)?;
         let mut header = base.clone();
 
@@ -589,8 +589,21 @@ impl<S: Source> Reader<S> {
     /// # Ok(()) }
     /// ```
     pub fn current_header(&self) -> Result<Header> {
-        self.header()
+        self.header_inner()
             .ok_or_else(|| Error::invalid_request("no image is selected; call next_image first"))
+    }
+
+    /// The current image's header, or `None` before the first [`Reader::next_image`].
+    ///
+    /// `None` reports a caller error — asking before an image is selected — which
+    /// [`Reader::current_header`] states as [`Error::InvalidRequest`] instead. The two
+    /// otherwise return the same value.
+    #[deprecated(
+        since = "0.2.1",
+        note = "use `current_header`, which reports \"no image is selected\" as an error rather than as `None`"
+    )]
+    pub fn header(&self) -> Option<Header> {
+        self.header_inner()
     }
 
     /// Advance to the next image, uniformly across both formats and every file layout.
@@ -936,7 +949,9 @@ impl<S: Source> Reader<S> {
         self.normalizer_for(&header)?;
         let mut data = vec![0.0f32; expected];
         self.read_image_into(&mut data)?;
-        let header = self.header().expect("header exists in the pixel phase");
+        let header = self
+            .current_header()
+            .expect("header exists in the pixel phase");
         Ok(Image { header, data })
     }
 
@@ -1330,6 +1345,48 @@ mod tests {
     /// text verbatim, not a numeric pair re-rendered through a formatter — `1.500e+03` becomes
     /// `1500` that way, which is precisely the "re-rendering a number through a formatter can
     /// lose digits" failure § Decisions the implementer must not silently change bans for keyword values.
+    /// `header` is deprecated but still shipped, so its agreement with `current_header` is
+    /// asserted rather than assumed: the two must not drift while both exist. `Header` is not
+    /// `PartialEq`, so the comparison is over what a caller can observe.
+    #[cfg(feature = "fits")]
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_header_spelling_agrees_with_current_header() {
+        let mut bytes = Vec::new();
+        for text in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                    8",
+            "NAXIS   =                    2",
+            "NAXIS1  =                    1",
+            "NAXIS2  =                    1",
+            "END",
+        ] {
+            let mut card = text.as_bytes().to_vec();
+            card.resize(80, b' ');
+            bytes.extend_from_slice(&card);
+        }
+        bytes.resize(2880, b' ');
+        bytes.resize(5760, 0);
+
+        let mut reader = Reader::seekable(std::io::Cursor::new(bytes)).unwrap();
+        assert!(reader.header().is_none(), "no image is selected yet");
+        assert!(
+            reader.current_header().is_err(),
+            "and the same question answered as an error rather than as a value"
+        );
+
+        assert!(reader.next_image().unwrap());
+        let old = reader
+            .header()
+            .expect("the deprecated spelling still answers");
+        let new = reader
+            .current_header()
+            .expect("and so does the current one");
+        assert_eq!(old.width(), new.width());
+        assert_eq!(old.height(), new.height());
+        assert_eq!(old.sample_format(), new.sample_format());
+    }
+
     #[cfg(feature = "xisf")]
     #[test]
     fn overriding_a_declared_bounds_preserves_the_files_verbatim_text() {
@@ -1352,13 +1409,13 @@ mod tests {
         let mut reader = Reader::sequential(std::io::Cursor::new(bytes)).unwrap();
         assert!(reader.next_image().unwrap());
         assert!(
-            matches!(reader.header().unwrap().bounds(), Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1500.0),
+            matches!(reader.current_header().unwrap().bounds(), Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1500.0),
             "fixture sanity check: the file's declared bounds must parse before the override \
              matters"
         );
         reader.set_bounds(0.0, 100.0).unwrap();
 
-        match reader.header().unwrap().bounds() {
+        match reader.current_header().unwrap().bounds() {
             Bounds::CallerSupplied {
                 declared,
                 effective,

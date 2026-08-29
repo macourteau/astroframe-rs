@@ -201,7 +201,9 @@ fn walk(path: &std::path::Path) -> Outcome {
             Ok(false) => break,
             Err(e) => return Outcome::Failed(e),
         }
-        let Some(header) = reader.header() else { break };
+        let Ok(header) = reader.current_header() else {
+            break;
+        };
         if let Some(reason) = header.decline_reason() {
             return Outcome::Declined(reason.reason().to_owned());
         }
@@ -422,7 +424,7 @@ fn decode_first<S: astroframe::Source>(reader: astroframe::Result<Reader<S>>) ->
     if !reader.next_image().ok()? {
         return None;
     }
-    let header = reader.header()?;
+    let header = reader.current_header().ok()?;
     if header.decline_reason().is_some() {
         return None;
     }
@@ -465,7 +467,9 @@ fn the_masters_walk_their_images() {
         };
         let mut shapes: Vec<String> = Vec::new();
         while reader.next_image().unwrap_or(false) {
-            let Some(h) = reader.header() else { break };
+            let Ok(h) = reader.current_header() else {
+                break;
+            };
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 shapes.push(format!("{w}x{ht}x{c}/{:?}", h.sample_format()));
             }
@@ -502,7 +506,7 @@ fn normalized_pixels(path: &std::path::Path) -> Result<Option<Vec<f32>>, Error> 
     if !reader.next_image()? {
         return Ok(None);
     }
-    let Some(header) = reader.header() else {
+    let Ok(header) = reader.current_header() else {
         return Ok(None);
     };
     if header.decline_reason().is_some() {

@@ -419,7 +419,6 @@ pub enum Bounds {
     /// The file stated this range.
     Declared(SampleRange),
     /// `set_bounds` overrode whatever the file said.
-    #[non_exhaustive]
     CallerSupplied {
         /// The range in force.
         effective: SampleRange,
@@ -443,7 +442,6 @@ pub enum Granularity {
     /// Row by row.
     Rows,
     /// One subblock at a time.
-    #[non_exhaustive]
     Block {
         /// The number of independently-deliverable pieces — the only thing a caller can act
         /// on.

@@ -878,7 +878,10 @@ fn header_only_decode_reads_no_pixel_bytes() {
         want_fits,
         "FITS: construction reads the header region and not one byte more"
     );
-    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        reader.current_header().is_err(),
+        "construction selects no image"
+    );
 
     let unit = Unit::new().image_u16(8, 4, 1, &data);
     let want_xisf = u64::from(common::xisf::PREAMBLE as u32) + u64::from(unit.header_length());
@@ -889,7 +892,10 @@ fn header_only_decode_reads_no_pixel_bytes() {
         want_xisf,
         "XISF: the preamble plus the declared header length, and nothing of the attachment"
     );
-    assert!(reader.header().is_none(), "construction selects no image");
+    assert!(
+        reader.current_header().is_err(),
+        "construction selects no image"
+    );
 }
 
 /// The FITS header region's actual size: 2880-byte blocks up to and including the one carrying
@@ -1071,13 +1077,13 @@ fn set_bounds_and_select_channel_reset_across_next_image() {
     first_image(&mut reader);
     reader.select_channel(1).expect("a channel the file has");
     reader.set_bounds(0.0, 32767.0).expect("a valid range");
-    let narrowed = reader.header().expect("configured header");
+    let narrowed = reader.current_header().expect("configured header");
     assert_eq!(narrowed.channels(), Some(1));
     assert_eq!(narrowed.channel_index(), Some(1));
     let first = whole_buffer(&mut reader, 8);
 
     assert!(reader.next_image().expect("a second image"));
-    let header = reader.header().expect("header");
+    let header = reader.current_header().expect("header");
     assert_eq!(
         header.channels(),
         Some(3),
@@ -1159,7 +1165,7 @@ fn select_channel_decodes_the_same_bits_as_slicing_a_full_decode() {
             let mut reader = Reader::seekable(Cursor::new(bytes.clone())).expect("construct");
             first_image(&mut reader);
             reader.select_channel(k).expect("a channel the file has");
-            let header = reader.header().expect("the narrowed header");
+            let header = reader.current_header().expect("the narrowed header");
             assert_eq!(header.channels(), Some(1), "{what}: narrowed geometry");
             assert_eq!(header.channel_index(), Some(k), "{what}: the file's index");
 

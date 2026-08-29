@@ -107,7 +107,10 @@ fn hdus_per_advance_cap_trips() {
     let err = reader.next_image().expect_err("the traversal cap");
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert!(format!("{err}").contains("HDUs traversed"), "{err}");
-    assert!(reader.header().is_none(), "no Header for a failed advance");
+    assert!(
+        reader.current_header().is_err(),
+        "no Header for a failed advance"
+    );
 
     // Raised past the four positions the walk steps over, the same file reaches its image.
     let mut limits = Limits::default();
@@ -149,7 +152,7 @@ fn total_samples_cap_counts_the_files_channels_under_select_channel() {
     assert!(reader.next_image().expect("advancing succeeds"));
     reader.select_channel(1).expect("the channel exists");
     assert_eq!(
-        reader.header().and_then(|h| h.channels()),
+        reader.current_header().ok().and_then(|h| h.channels()),
         Some(1),
         "the reader is narrowed"
     );
@@ -367,7 +370,7 @@ fn geometry_beyond_a_known_length_is_malformed_only_in_the_pixel_phase() {
     let mut reader =
         Reader::seekable(Cursor::new(header_only)).expect("a header-only prefix parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("the header is reported");
+    let header = reader.current_header().expect("the header is reported");
     assert!(
         header.decline_reason().is_none(),
         "a prefix is not a declined position: {:?}",
@@ -468,7 +471,7 @@ fn a_geometry_whose_axis_product_exceeds_u64_trips_the_total_samples_cap() {
             "{case}: the geometry is representable, so the position is not skipped"
         );
         // Header-phase reporting says what the file declared; nothing has multiplied yet.
-        let header = reader.header().expect("a header");
+        let header = reader.current_header().expect("a header");
         assert!(
             header.decline_reason().is_none(),
             "{case}: a large geometry is not a decline"

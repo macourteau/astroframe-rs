@@ -193,7 +193,7 @@ fn header_lane(data: &[u8]) {
                 Ok(true) => advances += 1,
                 Ok(false) | Err(_) => break,
             }
-            let _ = reader.header();
+            let _ = reader.current_header();
         }
     }
     assert_within(
@@ -212,7 +212,9 @@ fn decode_any_lane(data: &[u8]) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
-            let Some(h) = reader.header() else { break };
+            let Ok(h) = reader.current_header() else {
+                break;
+            };
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
                 let mut dst = vec![0.0f32; len];
@@ -236,7 +238,7 @@ fn decode_alloc_lane(data: &[u8]) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
-            if let Some(h) = reader.header()
+            if let Ok(h) = reader.current_header()
                 && let (Some(w), Some(ht), Some(c), Some(f)) =
                     (h.width(), h.height(), h.channels(), h.sample_format())
             {
@@ -261,7 +263,9 @@ fn decode_sequential_lane(data: &[u8]) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
-            let Some(h) = reader.header() else { break };
+            let Ok(h) = reader.current_header() else {
+                break;
+            };
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
                 let mut dst = vec![0.0f32; len];

@@ -145,7 +145,9 @@ fn a_quoted_structural_value_is_not_the_structural_keywords_value() {
         .data_i16(&STORED_2X2);
     let mut reader = sequential(file(&[quoted_bitpix])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     assert_eq!(
         header.decline_reason().map(|d| d.class()),
         Some(DeclineClass::Malformed)
@@ -257,7 +259,7 @@ fn header_structure_fault_is_malformed_at_next_image_for_an_extension() {
         let err = reader.next_image().expect_err(name);
         assert_eq!(kind(&err), "Malformed", "{name}: {err}");
         assert!(
-            reader.header().is_none(),
+            reader.current_header().is_err(),
             "{name}: a header that did not parse is not a position, so nothing is reported"
         );
     }
@@ -287,7 +289,10 @@ fn non_image_extension_that_cannot_be_sized_is_malformed_at_next_image() {
         .expect_err("the data unit cannot be sized");
     assert_eq!(kind(&err), "Malformed", "{err}");
     assert!(format!("{err}").contains("PCOUNT"), "{err}");
-    assert!(reader.header().is_none(), "no Header for a failed advance");
+    assert!(
+        reader.current_header().is_err(),
+        "no Header for a failed advance"
+    );
     // The walk is over: the image that follows is unreachable, because reaching it would
     // mean guessing where the unsizable data unit ended.
     assert!(
@@ -317,7 +322,10 @@ fn skipped_data_unit_past_the_cap_is_limit_exceeded_at_next_image() {
         .expect_err("the skipped-block cap trips");
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert!(format!("{err}").contains("skipped block bytes"), "{err}");
-    assert!(reader.header().is_none(), "no Header for a failed advance");
+    assert!(
+        reader.current_header().is_err(),
+        "no Header for a failed advance"
+    );
 }
 
 // --------------------------------------------------- declined-position rows
@@ -342,7 +350,9 @@ fn bitpix_fault_is_malformed_at_a_declined_position_with_full_geometry() {
             reader.next_image().expect("advancing succeeds"),
             "{name}: the reader sits on the position"
         );
-        let header = reader.header().expect("a declined position still reports");
+        let header = reader
+            .current_header()
+            .expect("a declined position still reports");
         assert_eq!(
             header.decline_reason().map(|d| d.class()),
             Some(DeclineClass::Malformed),
@@ -394,7 +404,9 @@ fn naxis_fault_is_malformed_at_a_declined_position_with_no_geometry() {
             reader.next_image().expect("advancing succeeds"),
             "{name}: the reader sits on the position"
         );
-        let header = reader.header().expect("a declined position still reports");
+        let header = reader
+            .current_header()
+            .expect("a declined position still reports");
         assert_eq!(
             header.decline_reason().map(|d| d.class()),
             Some(DeclineClass::Malformed),
@@ -436,7 +448,9 @@ fn pcount_or_gcount_fault_in_an_image_extension_is_malformed_with_full_geometry(
             reader.next_image().expect("advancing succeeds"),
             "{name}: the reader sits on the extension"
         );
-        let header = reader.header().expect("a declined position still reports");
+        let header = reader
+            .current_header()
+            .expect("a declined position still reports");
         assert_eq!(
             header.decline_reason().map(|d| d.class()),
             Some(DeclineClass::Malformed),
@@ -481,7 +495,9 @@ fn naxis_outside_two_or_three_is_unsupported_with_no_geometry() {
             reader.next_image().expect("advancing succeeds"),
             "{name}: the reader sits on the position"
         );
-        let header = reader.header().expect("a declined position still reports");
+        let header = reader
+            .current_header()
+            .expect("a declined position still reports");
         // Unsupported, not Malformed: the header is valid FITS and self-consistent, and only
         // the scope this version reads excludes it.
         assert_eq!(
@@ -508,7 +524,9 @@ fn naxisn_zero_is_unsupported_with_full_geometry() {
         reader.next_image().expect("advancing succeeds"),
         "a degenerate axis is still an image position"
     );
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     assert_eq!(
         header.decline_reason().map(|d| d.class()),
         Some(DeclineClass::Unsupported)
@@ -538,7 +556,9 @@ fn groups_t_is_unsupported_with_full_geometry() {
         .card("GROUPS", "T");
     let mut reader = sequential(file(&[hdu])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     assert_eq!(
         header.decline_reason().map(|d| d.class()),
         Some(DeclineClass::Unsupported)
@@ -565,7 +585,9 @@ fn bintable_with_zimage_is_unsupported_with_geometry_from_the_z_keywords() {
         reader.next_image().expect("advancing succeeds"),
         "a tile-compressed BINTABLE is a declined position, not an extension to step over"
     );
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     assert_eq!(
         header.decline_reason().map(|d| d.class()),
         Some(DeclineClass::Unsupported)
@@ -597,7 +619,7 @@ fn primary_naxis_zero_with_no_image_extension_ends_the_walk_normally() {
                 .expect("a source with no image is not an error"),
             "{name}: end of source is Ok(false)"
         );
-        assert!(reader.header().is_none(), "{name}");
+        assert!(reader.current_header().is_err(), "{name}");
     }
 }
 
@@ -613,7 +635,7 @@ fn image_extension_with_naxis_zero_is_stepped_over() {
     ]);
     let mut reader = sequential(bytes).expect("the primary header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("an image position reports");
+    let header = reader.current_header().expect("an image position reports");
     assert!(
         header.decline_reason().is_none(),
         "the image itself decodes"
@@ -649,7 +671,7 @@ fn image_extension_with_naxis_zero_is_stepped_over() {
             .expect("a source with no image is not an error"),
         "a file of NAXIS = 0 extensions walks zero images"
     );
-    assert!(reader.header().is_none());
+    assert!(reader.current_header().is_err());
 }
 
 /// Rows *`BITPIX` missing…* and *`PCOUNT` or `GCOUNT` missing…*, second half: the **next**
@@ -675,7 +697,8 @@ fn a_declined_position_that_cannot_be_sized_ends_the_walk_on_the_next_advance() 
     );
     assert!(
         reader
-            .header()
+            .current_header()
+            .ok()
             .and_then(|h| h.decline_reason().map(|d| d.class()))
             .is_some(),
         "the position is reported before the walk ends"
@@ -742,7 +765,9 @@ fn structural_validity_is_settled_before_scope() {
         .card("NAXIS1", "4");
     let mut reader = sequential(file(&[hdu])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("a declined position still reports");
+    let header = reader
+        .current_header()
+        .expect("a declined position still reports");
     let decline = header.decline_reason().expect("the position is declined");
     assert_eq!(decline.class(), DeclineClass::Malformed, "{decline:?}");
     assert!(
@@ -842,7 +867,7 @@ fn non_ascii_in_a_comment_card_parses_and_geometry_survives() {
         .data_i16(&STORED_2X2);
     let mut reader = sequential(file(&[hdu])).expect("a tolerated byte does not fail the frame");
     assert!(reader.next_image().expect("advancing succeeds"));
-    let header = reader.header().expect("an image position reports");
+    let header = reader.current_header().expect("an image position reports");
     assert!(header.decline_reason().is_none(), "the frame is decodable");
     assert_eq!(geometry(&header), (Some(2), Some(2), Some(1)));
     // The text is decoded lossily rather than dropped, so the card is still reported.
@@ -957,7 +982,11 @@ fn select_channel_where_the_channel_count_is_none_is_invalid_request() {
     let mut reader = sequential(file(&[hdu])).expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
     assert!(
-        reader.header().and_then(|h| h.channels()).is_none(),
+        reader
+            .current_header()
+            .ok()
+            .and_then(|h| h.channels())
+            .is_none(),
         "the fixture is a position reporting no geometry"
     );
     let err = reader.select_channel(0).expect_err("no channel count");
@@ -1039,7 +1068,7 @@ fn a_second_set_bounds_and_a_second_select_channel_are_last_wins() {
         .select_channel(0)
         .expect("narrowing runs from the file's channels each time");
     assert_eq!(
-        reader.header().and_then(|h| h.channels()),
+        reader.current_header().ok().and_then(|h| h.channels()),
         Some(1),
         "a narrowed reader reports one channel"
     );

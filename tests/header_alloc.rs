@@ -841,7 +841,9 @@ fn a_shared_chain_says_what_each_image_actually_carries() {
             Ok(false) => break,
             Err(error) => panic!("the fixture walks to its end: {error}"),
         }
-        let header = reader.header().expect("a header at an image position");
+        let header = reader
+            .current_header()
+            .expect("a header at an image position");
         let keyword = header
             .keywords()
             .into_iter()
@@ -898,7 +900,7 @@ fn a_full_primary_header_reported_by_many_extensions() {
     while matches!(reader.next_image(), Ok(true)) {
         kept.push(
             reader
-                .header()
+                .current_header()
                 .expect("a header at an image position")
                 .clone(),
         );
@@ -1064,7 +1066,7 @@ fn walk_headers(unit: Vec<u8>, images: usize) -> Cell {
         match reader.next_image() {
             Ok(true) => kept.push(
                 reader
-                    .header()
+                    .current_header()
                     .expect("a header at an image position")
                     .clone(),
             ),
@@ -1564,7 +1566,7 @@ fn a_long_inherited_row_order_applied_by_many_extensions() {
     while matches!(reader.next_image(), Ok(true)) {
         kept.push(
             reader
-                .header()
+                .current_header()
                 .expect("a header at an image position")
                 .clone(),
         );

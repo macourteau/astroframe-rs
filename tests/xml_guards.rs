@@ -248,7 +248,7 @@ fn quick_xml_resolves_only_the_five_predefined_entities_and_does_not_recurse() {
     let mut reader = construct(&bytes, Limits::default()).expect("the five predefined resolve");
     assert!(reader.next_image().expect("advance"));
     assert_eq!(
-        reader.header().expect("a header").image_id(),
+        reader.current_header().expect("a header").image_id(),
         Some("<>&\"'"),
         "the five predefined XML entities resolve, and nothing else does"
     );
@@ -259,7 +259,7 @@ fn quick_xml_resolves_only_the_five_predefined_entities_and_does_not_recurse() {
     let mut reader = construct(&bytes, Limits::default()).expect("one resolution pass succeeds");
     assert!(reader.next_image().expect("advance"));
     assert_eq!(
-        reader.header().expect("a header").image_id(),
+        reader.current_header().expect("a header").image_id(),
         Some("&lt;"),
         "entity resolution does not recurse; a second pass would yield \"<\""
     );

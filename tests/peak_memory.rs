@@ -206,7 +206,7 @@ fn subblocked_lz4_row() {
     assert!(reader.next_image().expect("advance"));
     assert!(
         matches!(
-            reader.header().expect("a header").granularity(),
+            reader.current_header().expect("a header").granularity(),
             astroframe::Granularity::Block { subblocks, .. } if subblocks == PARTS as u32
         ),
         "the fixture must actually reach the Block floor for the bound below to mean anything"
@@ -312,7 +312,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
         let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
         assert!(reader.next_image().expect("advance"));
         assert_eq!(
-            reader.header().expect("a header").granularity(),
+            reader.current_header().expect("a header").granularity(),
             astroframe::Granularity::Rows,
             "§ Streaming puts a framed codec plus subblocks at `Rows`; a fixture reporting \
              anything else is not on the streaming subblock path this measures"
@@ -411,7 +411,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
         let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
         assert!(reader.next_image().expect("advance"));
         assert_eq!(
-            reader.header().expect("a header").granularity(),
+            reader.current_header().expect("a header").granularity(),
             astroframe::Granularity::WholeImage,
             "a shuffled subblocked block is materialized; a fixture reporting anything else \
              is on the streaming path the shape above already measures"
