@@ -207,9 +207,21 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
     let mut elements: u64 = 0;
 
     loop {
-        let event = reader
-            .read_event_into(&mut buf)
-            .map_err(|e| Error::malformed(format!("XISF header is not well-formed XML: {e}")))?;
+        let event = reader.read_event_into(&mut buf).map_err(|e| match e {
+            // §9.5 fixes the header encoding as UTF-8 and § XISF decisions makes invalid UTF-8
+            // `Malformed`. The parser decodes to `str`, so this one arm covers every surface —
+            // names, attribute values, text and CDATA alike — and the message names the
+            // encoding rather than whatever the substituted character went on to break.
+            // Reported in this crate's own words: a dependency rewording itself must not
+            // reword what a caller matches on. A lossy conversion would honour the rule
+            // nowhere and report the wrong reason besides: U+FFFD substituted into
+            // `geo\u{fffd}metry` yields an attribute nothing matches, and the file is then
+            // declined for a `geometry` §11.5.1 makes mandatory on a file that carries one.
+            quick_xml::Error::Encoding(_) => {
+                Error::malformed(format!("XISF header is not valid UTF-8: {e}"))
+            }
+            _ => Error::malformed(format!("XISF header is not well-formed XML: {e}")),
+        })?;
 
         match event {
             Event::DocType(_) => {
@@ -242,12 +254,12 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                 // Namespaces §5.3), so the element's own scope is opened before its name is
                 // resolved.
                 namespaces.open(&start, limits);
-                let prefix = qname_prefix(qname)?;
+                let prefix = qname_prefix(qname);
                 let resolved = namespaces.resolve(prefix);
                 if stack.is_empty() {
                     check_root_namespace(prefix, resolved)?;
                 }
-                let local = local_name(qname)?;
+                let local = local_name(qname);
                 let name = if in_xisf_or_no_namespace(prefix, resolved) {
                     intern(&mut arena, &[local])?
                 } else {
@@ -285,9 +297,7 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                 // Character data is assembled across CDATA and entity boundaries *before*
                 // either white-space rule applies, so a `String` property split by a CDATA
                 // section reads the same as one written plainly.
-                let decoded = text.xml_content(XmlVersion::Explicit1_0).map_err(|e| {
-                    Error::malformed(format!("XISF header text is not valid UTF-8: {e}"))
-                })?;
+                let decoded = text.xml_content(XmlVersion::Explicit1_0);
                 if let Some(&top) = stack.last() {
                     nodes[top].text.push_str(&decoded);
                 }
@@ -298,9 +308,7 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                 // section as well: a `String` property carrying `a\r\nb` reads back as `a\nb`
                 // whichever of the two spellings its writer chose. Decoding it the same way
                 // the `Text` arm does is also what keeps the common section allocation-free.
-                let decoded = data.xml_content(XmlVersion::Explicit1_0).map_err(|e| {
-                    Error::malformed(format!("XISF header CDATA is not valid UTF-8: {e}"))
-                })?;
+                let decoded = data.xml_content(XmlVersion::Explicit1_0);
                 if let Some(&top) = stack.last() {
                     nodes[top].text.push_str(&decoded);
                 }
@@ -325,7 +333,7 @@ pub(crate) fn parse(bytes: &[u8], limits: &Limits) -> Result<Doc> {
                 // declaration is tolerated: it makes the header invalid by §9.5 and real
                 // writers omit it, and nothing in decoding depends on it.
                 if let Some(Ok(encoding)) = decl.encoding() {
-                    let name = String::from_utf8_lossy(&encoding).into_owned();
+                    let name = encoding.into_owned();
                     if !name.eq_ignore_ascii_case("utf-8") && !name.eq_ignore_ascii_case("utf8") {
                         return Err(Error::unsupported(format!(
                             "XISF header declares the encoding {name:?}; §9.5 fixes it as UTF-8 \
@@ -424,33 +432,16 @@ fn arena_index(len: usize) -> Result<u32> {
 /// before any other element is reached) and for every other element once
 /// [`Namespaces::resolve`] has decided the element resolves into the XISF namespace or into
 /// none.
-fn local_name(qname: &[u8]) -> Result<&str> {
-    let local = match qname.iter().rposition(|b| *b == b':') {
+fn local_name(qname: &str) -> &str {
+    match qname.rfind(':') {
         Some(i) => &qname[i + 1..],
         None => qname,
-    };
-    xml_name(local)
-}
-
-/// A QName's prefix, if it has one — the piece before the last `:`.
-fn qname_prefix(qname: &[u8]) -> Result<Option<&str>> {
-    match qname.iter().rposition(|b| *b == b':') {
-        Some(i) => xml_name(&qname[..i]).map(Some),
-        None => Ok(None),
     }
 }
 
-/// One name's bytes as text.
-///
-/// §9.5 fixes the header encoding as UTF-8 and § XISF decisions makes invalid UTF-8
-/// `Malformed`, which the text, CDATA and attribute-*value* paths all honour. A lossy
-/// conversion here honours it nowhere and reports the *wrong reason* besides: U+FFFD
-/// substituted into `geo\xFFmetry` yields an attribute nothing matches, and the file is then
-/// declined for a `geometry` §11.5.1 makes mandatory on a file that carries one.
-fn xml_name(raw: &[u8]) -> Result<&str> {
-    str::from_utf8(raw).map_err(|_| {
-        Error::malformed("XISF header carries an element or attribute name that is not valid UTF-8")
-    })
+/// A QName's prefix, if it has one — the piece before the last `:`.
+fn qname_prefix(qname: &str) -> Option<&str> {
+    qname.rfind(':').map(|i| &qname[..i])
 }
 
 /// Every prefix→URI binding in scope, as one stack over the whole document.
@@ -520,10 +511,10 @@ impl Namespaces {
             // declaration leaves this loop without allocating. Owning the value first cost one
             // heap allocation per attribute in the document, on a path most attributes leave
             // immediately.
-            let prefix: Option<Box<str>> = if key == b"xmlns" {
+            let prefix: Option<Box<str>> = if key == "xmlns" {
                 None
             } else {
-                match key.strip_prefix(b"xmlns:".as_slice()) {
+                match key.strip_prefix("xmlns:") {
                     // XML Namespaces §3 reserves `xmlns` and binds it to no namespace name at
                     // all, so `xmlns:xmlns="…"` declares nothing and the document carrying it
                     // is namespace-ill-formed. Recording it would bind a prefix that a name
@@ -533,12 +524,12 @@ impl Namespaces {
                     // with `xmlns:xmlns` recorded against XISF's namespace, `<xmlns:Image>`
                     // resolves into it and interns as a bare `Image`. `read_attributes` takes
                     // the other end for attribute names, and §3 is one rule needing both.
-                    Some(b"xmlns") => continue,
-                    Some(pfx) => Some(Box::from(String::from_utf8_lossy(pfx).as_ref())),
+                    Some("xmlns") => continue,
+                    Some(pfx) => Some(Box::from(pfx)),
                     None => continue,
                 }
             };
-            let uri = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+            let uri = attr.value.into_owned();
             let index = self.bindings.len();
             let shadowed = match &prefix {
                 Some(prefix) => self.prefixed.insert(prefix.clone(), index),
@@ -700,15 +691,15 @@ fn read_attributes(
         // `xmlns:`-prefixed key — `xmlns:xmlns:a="…"` does bind the prefix `xmlns:a`, and the
         // attribute `xmlns:a:b` would otherwise be resolved through it.
         let raw_key = attr.key.as_ref();
-        let key = if raw_key == b"xmlns" || raw_key.starts_with(b"xmlns:") {
-            xml_name(raw_key)?
+        let key = if raw_key == "xmlns" || raw_key.starts_with("xmlns:") {
+            raw_key
         } else {
-            match qname_prefix(raw_key)? {
+            match qname_prefix(raw_key) {
                 Some(prefix) => match namespaces.resolve(Some(prefix)) {
-                    Some(uri) if same_namespace(uri, XISF_NAMESPACE) => local_name(raw_key)?,
-                    _ => xml_name(raw_key)?,
+                    Some(uri) if same_namespace(uri, XISF_NAMESPACE) => local_name(raw_key),
+                    _ => raw_key,
                 },
-                None => xml_name(raw_key)?,
+                None => raw_key,
             }
         };
         // Hashed before interning, so the duplicate check below is a set lookup rather than a
@@ -771,10 +762,8 @@ fn resolve_entity(entity: &quick_xml::events::BytesRef<'_>) -> Result<String> {
     })? {
         return Ok(c.to_string());
     }
-    let name = entity.decode().map_err(|e| {
-        Error::malformed(format!("XISF header entity name is not valid UTF-8: {e}"))
-    })?;
-    quick_xml::escape::resolve_predefined_entity(&name)
+    let name: &str = entity;
+    quick_xml::escape::resolve_predefined_entity(name)
         .map(str::to_owned)
         .ok_or_else(|| {
             Error::malformed(format!(
