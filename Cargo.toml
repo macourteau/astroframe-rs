@@ -12,10 +12,12 @@ readme = "README.md"
 # What a consumer unpacking the `.crate` can use, and nothing else. `CLAUDE.md` is an
 # instruction file for work in this repository rather than consumer documentation, and its
 # links point into `/docs`, which this same list excludes — so shipping it publishes a page
-# of dead links. The repository's own machinery goes with it: the workflows, the licence
-# policy, the specification-fetching scripts and the ignore file all describe how this
-# repository is developed, which happens on GitHub rather than in a registry tarball.
+# of dead links. The repository's own machinery goes with it: the workflows, the agent
+# skills, the licence policy, the specification-fetching scripts and the ignore file all
+# describe how this repository is developed, which happens on GitHub rather than in a
+# registry tarball.
 exclude = [
+    "/.claude",
     "/.github",
     "/.gitignore",
     "/CLAUDE.md",
