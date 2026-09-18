@@ -16,6 +16,64 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.2.3] — 2026-09-17
+
+Decoded output does not move. No change in this release touches the normalization primitive or
+any sample path — the two behavioural changes are in header-attribute parsing and in an error
+path — and every comparison that would show movement agrees: the exhaustive
+`tests/normalization.rs`, the XISF-against-FITS differential over the `xisf_variants` set, and
+`corpus_native_samples_match_fitsrs`, which grades native samples against an independent
+decoder. Both differentials compare against references outside this crate, so agreement is
+agreement with what 0.2.2 produced.
+
+The corpus sweep reads 1566 files: 1446 decode and 120 decline, every decline a tile-compressed
+image this version states it refuses. The 120 `fpack_variants` are each a clean `Unsupported`,
+the masters walk their images, and 66 files agree across the open, sequential and seekable entry
+points. Peak resident memory was measured on Linux rather than skipped: 40 KiB above baseline
+for a 25 MP FITS against the 25 MiB allowed, and 8.4 MiB for a compressed XISF against 26.8 MiB.
+
+Revision 1 of the XISF 1.0 specification document (version 1.01, September 2026) settles both.
+It does not change the format version, and it states that every unit valid under the original
+document remains valid.
+
+### Fixed
+
+- **§8.3.3's lowercase non-finite float spellings are accepted.** The grammar admits seven
+  non-numeric spellings, not three: alongside `NaN`, `+Inf` and `-Inf`, a decoder *must* accept
+  `nan`, `-nan`, `inf` and `-inf`. The case distinction is narrower than it looks — a sign is
+  mandatory on `Inf` and forbidden on `+inf` and `+nan` — so `NAN`, `INF`, `Inf`, `+inf`,
+  `+nan` and `-NaN` are still refused. **This changes what is accepted**, and on two elements
+  it changes what is declined: a `Resolution` or a `DisplayFunction` carrying one of these
+  spellings declined the whole frame, so conforming files were refused outright. `offset="inf"`
+  is now reported rather than declined, §11.5.2's constraint being "greater than or equal to
+  zero"; `-inf`, `nan` and `-nan` remain outside it. A `bounds` endpoint is unaffected either
+  way — a non-finite one is caught by the range validity rule stated on `k`. No sample decodes
+  differently, the inputs affected being ones that previously decoded nothing at all.
+- **A checksum this build cannot verify declines its position instead of failing the unit.**
+  §7 separates an unsupported feature from a malformed file: the affected object becomes
+  unavailable and the rest of the XISF unit stays accessible. An embedded block's contents are
+  read during the header parse, so without the `checksum` feature one such block anywhere in a
+  unit failed construction and took every other image with it. **This changes what is
+  declined** in builds without that feature, and nothing in the default build. A digest that
+  does not match still fails the unit outright, which is what §10.5 asks for.
+
+### Changed
+
+- **Documentation throughout states the rules Revision 1 settles**, in place of the gaps they
+  were argued from. `zstd` is a standard codec that §10.6 recommends and §7.2 requires of a
+  baseline decoder, rather than an extension read because writers emit it — and the attribute
+  syntax this crate established by reading attachment bytes is what §10.6.9/§10.6.10 specify.
+  §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder, its "claiming support" qualifier
+  applying to encoders, so a build without the `checksum` feature is not a baseline decoder;
+  this is now stated rather than described as a free narrowing. Ignoring unrecognized elements
+  and attributes is §7's rule rather than this crate's reading of a silence.
+- **Citations retargeted.** Revision 1 renumbers three things: white space from §8.3.4 to
+  §8.3.5, the CFA `pattern` table from Table 15 to Table 18, and — because the colour-space
+  transformations moved to the new normative Annex B — every equation after §8.5.4, downward.
+  The range map is Equation [4] where it was [18], the identity display function [9] where it
+  was [23], the byte-shuffling transform [19]-[21] where it was [33]-[35]. The top-level
+  sections did not move.
+
 ## [0.2.2] — 2026-08-28
 
 Decoded output does not move. The 1080-variant XISF-against-FITS differential over 41.8 billion
