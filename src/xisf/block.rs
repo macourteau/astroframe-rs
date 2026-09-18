@@ -41,10 +41,10 @@ pub(crate) enum Location {
 
 /// Parse a `location` attribute.
 ///
-/// **Both `attachment:` and `attached:` are accepted.** `attachment:` is normative (§10.3),
-/// but four of the specification's own examples write `attached:`, and a writer that followed
-/// the examples produces files that are otherwise valid. The spellings cannot be confused
-/// with each other or with any other location form.
+/// **Both `attachment:` and `attached:` are accepted.** `attachment:` is the only spelling
+/// §10.3 defines, and the only one the specification's examples show. `attached:` is read
+/// because files written against earlier examples that carried it exist and are otherwise
+/// valid. The spellings cannot be confused with each other or with any other location form.
 pub(crate) fn parse_location(text: &str) -> Result<Location> {
     let text = trim(text);
     if text == "embedded" {
@@ -99,7 +99,7 @@ pub(crate) fn parse_encoding(text: &str) -> Result<Encoding> {
     }
 }
 
-/// A compression codec (§10.6.3–§10.6.8, plus `zstd`).
+/// A compression codec (§10.6.3–§10.6.10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Codec {
     /// zlib-wrapped, not raw deflate. A framed stream, so it decompresses incrementally.
@@ -110,10 +110,9 @@ pub(crate) enum Codec {
     Lz4Hc,
     /// Framed, and the only one of the three with a real magic number.
     ///
-    /// **Corpus-derived rather than specified**: `zstd` appears nowhere in XISF 1.0, and its
-    /// attribute syntax (`zstd:<size>`, `zstd+sh:<size>:<item-size>`) was established by
-    /// reading attachment bytes. PixInsight writes these blocks, so declining them would make
-    /// the crate fail on real output to preserve a boundary that was not at stake.
+    /// §10.6.9/§10.6.10 give the attribute syntax as `zstd:<size>` and
+    /// `zstd+sh:<size>:<item-size>`, and §7.2 makes support for both an ability every baseline
+    /// decoder has. §10.6 recommends this codec over the others.
     Zstd,
 }
 
@@ -277,8 +276,7 @@ pub(crate) fn check_subblock_sums(
 /// A cryptographic hashing algorithm (§10.5 Table 9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Algorithm {
-    /// `sha-1`, also `sha1`. The one §10.5 makes mandatory for a decoder claiming checksum
-    /// support.
+    /// `sha-1`, also `sha1`.
     Sha1,
     /// `sha-256`, also `sha256`.
     Sha256,
@@ -301,9 +299,11 @@ pub(crate) struct Checksum {
 
 /// Parse a `checksum` attribute — `algorithm:digest`.
 ///
-/// All five algorithms are supported rather than the mandatory one alone. A cheaper
-/// sha1-only build would be conformant, but three hash crates is a small price beside a
-/// feature matrix where a file's decodability depends on which digest its writer chose.
+/// All five algorithms are supported. §10.5 requires SHA-1, SHA-256 and SHA-512 of every
+/// decoder — the "claiming support" qualifier applies to encoders — so a sha1-only build would
+/// not be one. The two SHA-3 algorithms are optional and are here for the same reason the
+/// other three are mandatory: a feature matrix where a file's decodability depends on which
+/// digest its writer chose is worth more than one hash crate.
 pub(crate) fn parse_checksum(text: &str) -> Result<Checksum> {
     let text = trim(text);
     let (name, digest) = text.split_once(':').ok_or_else(|| {
@@ -373,8 +373,10 @@ fn hex_digit(b: u8) -> std::result::Result<u8, ()> {
 /// across the entire block and no prefix yields any complete sample — which is why shuffling
 /// forces `WholeImage` granularity, ignoring any subblock split.
 ///
-/// A **trailing partial item** is copied through unshuffled. The planes are defined over
-/// "subsets of equally significant bytes", which exist only for complete items, so a partial
+/// A **trailing partial item** is copied through unshuffled, which §10.6.2 states outright:
+/// bytes at the end of a block that do not form a complete item "are not shuffled and shall be
+/// stored unaltered after the shuffled bytes". The planes are defined over "subsets of
+/// equally significant bytes", which exist only for complete items, so a partial
 /// item belongs to no plane. That case is reachable on a conforming file precisely because
 /// `item-size` is not tied to the sample width: a three-sample `UInt16` block with a legal
 /// `item-size="4"` is six bytes with two left over.
@@ -460,7 +462,7 @@ mod tests {
         assert!(c.shuffled);
         assert_eq!(c.item_size, Some(2));
 
-        // The corpus-derived zstd syntax.
+        // The §10.6.9/§10.6.10 zstd syntax.
         assert_eq!(parse_compression("zstd:64").unwrap().codec, Codec::Zstd);
         assert_eq!(
             parse_compression("zstd+sh:64:4").unwrap().item_size,

@@ -686,9 +686,9 @@ fn collect_children<'a>(doc: &'a Doc, image: usize, cache: &mut Cache) -> Collec
             // reached from inside an image is not an occurrence and contributes nothing.
             "ICCProfile" | "RGBWorkingSpace" | "Table" | "Structure" | "Thumbnail" | "Data"
             | "Image" => {}
-            // Unknown elements are ignored: the specification states no forward-compatibility
-            // rule anywhere, and ignoring unknowns is the only reading under which a 1.0
-            // decoder survives a later revision.
+            // Unknown elements are ignored, which §7 requires: XML elements, attributes and
+            // properties a decoder does not recognize *shall* be ignored. It is also the only
+            // reading under which a 1.0 decoder survives a later revision.
             _ => {}
         }
     }
