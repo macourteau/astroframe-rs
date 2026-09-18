@@ -8,8 +8,9 @@
 //! - **A leading `+` or `-` is admitted even where the field is conceptually unsigned**
 //!   (§8.3.1), so a sign is parsed and then range-checked rather than rejected outright.
 //! - **Binary, octal and hexadecimal integer forms exist** (§8.3.2).
-//! - **`NaN`, `+Inf` and `-Inf` are conforming float spellings** (§8.3.3), which is how a
-//!   file declaring `bounds="NaN:1"` comes to exist at all.
+//! - **Seven non-numeric float spellings are conforming** (§8.3.3) — `NaN`, `+Inf`, `-Inf`
+//!   and the lowercase `nan`, `-nan`, `inf`, `-inf` — which is how a file declaring
+//!   `bounds="NaN:1"` comes to exist at all.
 //!
 //! "White space" here is the four characters XML itself defines — space, tab, CR and LF —
 //! not Rust's Unicode-aware `char::is_whitespace`, which would also accept spaces no
@@ -87,20 +88,26 @@ fn from_radix(digits: &str, radix: u32, valid: impl Fn(char) -> bool) -> Option<
     i128::from_str_radix(digits, radix).ok()
 }
 
-/// Parse a §8.3.3 floating-point scalar, including the three non-numeric spellings.
+/// Parse a §8.3.3 floating-point scalar, including the non-numeric spellings.
 ///
-/// `NaN`, `+Inf` and `-Inf` are conforming, so they are parsed rather than rejected — and
-/// then caught downstream by the range validity rule, which is where a `bounds="NaN:1"` file
-/// is supposed to fail.
+/// The grammar admits seven of them: `NaN`, `+Inf` and `-Inf`, which encoders *should* write,
+/// and the alternatives `nan`, `-nan`, `inf` and `-inf`, which a decoder *must* accept. All
+/// seven are parsed rather than rejected — and then caught downstream by the range validity
+/// rule, which is where a `bounds="NaN:1"` file is supposed to fail.
+///
+/// The case distinction is the grammar's own and is narrower than it looks: a sign is
+/// mandatory on `Inf` and forbidden on `+inf` and `+nan`, so `Inf`, `+inf`, `+nan`, `NAN` and
+/// `-NaN` are all non-conforming.
 pub(crate) fn parse_float(text: &str) -> Option<f64> {
     let text = trim(text);
     match text {
-        "NaN" => return Some(f64::NAN),
-        "+Inf" => return Some(f64::INFINITY),
-        "-Inf" => return Some(f64::NEG_INFINITY),
+        "NaN" | "nan" => return Some(f64::NAN),
+        "-nan" => return Some(-f64::NAN),
+        "+Inf" | "inf" => return Some(f64::INFINITY),
+        "-Inf" | "-inf" => return Some(f64::NEG_INFINITY),
         _ => {}
     }
-    // Rust's parser is more permissive than §8.3.3: it accepts `inf`, `NAN`, `1.` and a bare
+    // Rust's parser is more permissive than §8.3.3: it accepts `NAN`, `+inf`, `1.` and a bare
     // `.` sign-only form. Reject those spellings here so a decoder reading this crate's
     // output and one reading the specification's grammar agree on what a file said.
     if !conforms_to_float_grammar(text) {
@@ -179,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn floats_follow_section_8_3_3_including_the_three_non_numeric_spellings() {
+    fn floats_follow_section_8_3_3_including_the_non_numeric_spellings() {
         assert_eq!(parse_float("123"), Some(123.0));
         assert_eq!(parse_float("-123.456"), Some(-123.456));
         assert_eq!(parse_float(".123"), Some(0.123));
@@ -193,11 +200,32 @@ mod tests {
         );
         assert_eq!(parse_float("+Inf"), Some(f64::INFINITY));
         assert_eq!(parse_float("-Inf"), Some(f64::NEG_INFINITY));
-        // Spellings Rust accepts and §8.3.3 does not.
-        assert_eq!(parse_float("inf"), None);
+        // The lowercase alternatives, which §8.3.3 admits and a decoder must accept.
+        assert_eq!(parse_float("inf"), Some(f64::INFINITY));
+        assert_eq!(parse_float("-inf"), Some(f64::NEG_INFINITY));
+        assert!(
+            parse_float("nan")
+                .expect("`nan` is a conforming spelling")
+                .is_nan()
+        );
+        assert!(
+            parse_float("-nan")
+                .expect("`-nan` is a conforming spelling")
+                .is_nan()
+        );
+        assert_eq!(
+            parse_float(" inf "),
+            Some(f64::INFINITY),
+            "§8.3.5 white space"
+        );
+        // Spellings Rust accepts and §8.3.3 does not. The grammar admits a sign on `Inf`
+        // and a leading `-` on the lowercase forms, and nothing else.
         assert_eq!(parse_float("NAN"), None);
-        assert_eq!(parse_float("nan"), None);
+        assert_eq!(parse_float("INF"), None);
+        assert_eq!(parse_float("+inf"), None, "the lowercase forms take no `+`");
+        assert_eq!(parse_float("+nan"), None, "the lowercase forms take no `+`");
         assert_eq!(parse_float("Inf"), None, "the sign is mandatory on Inf");
+        assert_eq!(parse_float("-NaN"), None);
         assert_eq!(parse_float("1."), None, "a fractional part is not optional");
         assert_eq!(parse_float("1e"), None);
         assert_eq!(parse_float(""), None);

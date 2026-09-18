@@ -21,10 +21,9 @@ mod common;
 use std::io::Cursor;
 
 use astroframe::{DeclineClass, Error, Header, Limits, Reader, Seekable, Sequential, Source};
-use common::xisf::{
-    Unit, base64, checksum_attr, expected_u16, le_u16, raw_unit, repeating_u16, samples,
-    with_header,
-};
+use common::xisf::{Unit, expected_u16, le_u16, raw_unit, repeating_u16, samples, with_header};
+#[cfg(feature = "checksum")]
+use common::xisf::{base64, checksum_attr};
 use common::{assert_same_bits, kind};
 
 // ------------------------------------------------------------------ helpers
@@ -229,6 +228,13 @@ fn a_unit_level_fault_fails_at_construction_rather_than_declining_a_position() {
 /// Its contents are read during the header parse, so its digest is verified there. That is
 /// what makes tier 1 free for an `attachment` block and not free for an `embedded` one, and it
 /// is the only row in the table that fails the whole source over a pixel-block fault.
+///
+/// Failing the source is right for a **mismatch** and wrong for an algorithm the build cannot
+/// compute: §10.5 says a decoder *should not* load a unit whose verification fails, while §7
+/// requires an unsupported feature to leave the rest of the unit accessible. Without the
+/// `checksum` feature the same fixture takes the second path, graded in
+/// `tests/checksum_feature_off.rs`.
+#[cfg(feature = "checksum")]
 #[test]
 fn an_embedded_block_with_a_bad_digest_is_a_checksum_mismatch_at_construction() {
     let levels = samples();

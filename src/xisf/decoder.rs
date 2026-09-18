@@ -7,6 +7,7 @@ use crate::reader::{ChunkMeta, PixelPlan};
 use crate::samples::{SampleSlice, Samples, slice_samples};
 use crate::source::Source;
 use crate::xisf::block::{self, Codec, Location, unshuffled_byte};
+use crate::xisf::cache::decline_from;
 use crate::xisf::codec::{self, Stream};
 use crate::xisf::image::{BlockPlan, Occurrence, walk_occurrences};
 use crate::xisf::xml;
@@ -118,7 +119,7 @@ impl Decoder {
 
         let mut occurrences = walk_occurrences(&doc, limits)?;
         refuse_attachments_inside_the_header(&mut occurrences, PREAMBLE + declared);
-        verify_materialized_blocks(&occurrences)?;
+        verify_materialized_blocks(&mut occurrences)?;
 
         Ok(Decoder {
             occurrences,
@@ -606,15 +607,32 @@ fn read_incrementally<S: Source>(src: &mut S, declared: u64) -> Result<Vec<u8>> 
 /// construction. §10.5 permits on-demand verification, so this is where "on demand" lands for
 /// each location mode — and it is why a mismatched embedded digest fails the source outright
 /// rather than surfacing as a declined position.
-fn verify_materialized_blocks(occurrences: &[Occurrence]) -> Result<()> {
-    for occurrence in occurrences {
+///
+/// A **mismatch** and an **unsupported** verification are not the same failure, and §7 and
+/// §10.5 answer them differently. A mismatch fails the source: §10.5 says a decoder *should
+/// not* load a unit whose verification fails, which is the whole point of the attribute. An
+/// algorithm this build cannot compute is a feature the decoder lacks, and §7 requires the
+/// affected object to be treated as unavailable with the rest of the unit left accessible —
+/// so it declines the position instead. Without that split, a build with the `checksum`
+/// feature off could not open a unit at all because of one embedded block belonging to an
+/// image the caller never asked for.
+fn verify_materialized_blocks(occurrences: &mut [Occurrence]) -> Result<()> {
+    for occurrence in occurrences.iter_mut() {
         let Some(plan) = &occurrence.plan else {
             continue;
         };
         let (Some(checksum), Some(bytes)) = (&plan.checksum, &plan.materialized) else {
             continue;
         };
-        codec::verify(checksum, bytes)?;
+        match codec::verify(checksum, bytes) {
+            Ok(()) => {}
+            Err(error @ Error::Unsupported(_)) => {
+                occurrence.header.decline_reason = Some(decline_from(error));
+                occurrence.header.granularity = Granularity::WholeImage;
+                occurrence.plan = None;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
