@@ -876,7 +876,7 @@ pub struct Cfa {
 }
 
 impl Cfa {
-    /// The pattern string (§11.10.1), verbatim. Its characters are drawn from Table 15 —
+    /// The pattern string (§11.10.1), verbatim. Its characters are drawn from Table 18 —
     /// `0`, `R`, `G`, `B`, `W`, `C`, `M`, `Y`.
     pub fn pattern(&self) -> &str {
         &self.pattern

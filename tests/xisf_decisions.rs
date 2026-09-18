@@ -643,7 +643,7 @@ fn section_8_3_3_lowercase_non_finite_spellings_do_not_decline_a_conforming_fram
     assert!(df.low_range().red_gray.is_nan());
 }
 
-/// Row *Plain-text scalars follow §8.3*: surrounding white space is ignored (§8.3.4), a
+/// Row *Plain-text scalars follow §8.3*: surrounding white space is ignored (§8.3.5), a
 /// leading sign is admitted even where the field is conceptually unsigned (§8.3.1), and `0`,
 /// `+0` and `-0` are accepted as integers despite §8.3.1's regex admitting no decimal zero.
 #[test]
@@ -652,7 +652,7 @@ fn section_8_3_white_space_and_sign_spellings_are_accepted_around_plain_text_sca
     let stored = le_u16(&levels);
     // White space around each numeric field of the location and the geometry — the fields
     // §8.3.1 governs, not the `attachment` keyword §10.3 spells — and a signed zero offset — the
-    // spelling `attachment:0:…` makes necessary. `sampleFormat` is *not* among them: §8.3.4
+    // spelling `attachment:0:…` makes necessary. `sampleFormat` is *not* among them: §8.3.5
     // governs plain-text scalars, and Table 11's enumeration is not one.
     let unit = attached_unit(
         |position, size| {
@@ -662,7 +662,7 @@ fn section_8_3_white_space_and_sign_spellings_are_accepted_around_plain_text_sca
         },
         &stored,
     );
-    let header = decodes_to(unit, &levels, "§8.3.4 white space");
+    let header = decodes_to(unit, &levels, "§8.3.5 white space");
     assert_eq!(header.offset(), Some(0.0));
     // A `bounds` a writer wrote redundantly is `Declared`, not `FormatDefault`: §11.5.1 only
     // says such a `bounds` *should not* be written, so real writers produce it.

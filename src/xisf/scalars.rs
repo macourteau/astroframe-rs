@@ -3,7 +3,7 @@
 //! Four traps for a naive parser live here, and each of them is reachable on a conforming
 //! file:
 //!
-//! - **Surrounding white space must be ignored** (§8.3.4), so `geometry=" 4096 : 2160 : 1 "`
+//! - **Surrounding white space must be ignored** (§8.3.5), so `geometry=" 4096 : 2160 : 1 "`
 //!   is valid.
 //! - **A leading `+` or `-` is admitted even where the field is conceptually unsigned**
 //!   (§8.3.1), so a sign is parsed and then range-checked rather than rejected outright.
@@ -21,7 +21,7 @@ pub(crate) fn is_xml_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-/// Trim §8.3.4 white space from both ends.
+/// Trim §8.3.5 white space from both ends.
 pub(crate) fn trim(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_ascii() && is_xml_space(c as u8))
 }
@@ -143,7 +143,7 @@ fn conforms_to_float_grammar(text: &str) -> bool {
 }
 
 /// Split a colon-separated attribute — `geometry`, `bounds`, `compression` — trimming each
-/// field per §8.3.4.
+/// field per §8.3.5.
 pub(crate) fn split_fields(text: &str) -> Vec<&str> {
     text.split(':').map(trim).collect()
 }
