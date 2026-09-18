@@ -56,6 +56,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 
+# `--all-features` never runs the tests whose subject is a configuration it does not build.
+# `tests/checksum_feature_off.rs` is one: §7 governs what a decoder does with a block whose
+# checksum it cannot verify, which is only reachable with the feature off.
+cargo test --locked --no-default-features --features fits,xisf
+
 # `missing_docs` and broken intra-doc links are both errors in CI, and neither clippy nor the
 # doctests reach them — only rustdoc does. Specification citations are what break this: a
 # reference written `[23]` reads to rustdoc as a link to an item named `23`.

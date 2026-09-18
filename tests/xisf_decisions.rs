@@ -29,9 +29,11 @@ use astroframe::{
     PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, ResolutionUnit,
     SampleFormat, Samples, Seekable, Sequential,
 };
+#[cfg(feature = "checksum")]
+use common::xisf::checksum_attr;
 use common::xisf::{
-    PREAMBLE, Unit, base64, be_u16, checksum_attr, expected_u16, hex, le_f32, le_u8, le_u16, lz4,
-    repeating_u16, samples, shuffle, with_header, zlib,
+    PREAMBLE, Unit, base64, be_u16, expected_u16, hex, le_f32, le_u8, le_u16, lz4, repeating_u16,
+    samples, shuffle, with_header, zlib,
 };
 use common::{Streams, assert_granularity, assert_same_bits, kind};
 
@@ -602,6 +604,45 @@ fn entity_references_are_resolved_before_a_value_is_reported() {
     assert_eq!(text_of(property(&header, "Processing:Tool")), "A&B");
 }
 
+/// §8.3.3 admits seven non-numeric float spellings, and a decoder *must* accept all of them.
+///
+/// The lowercase `nan`, `-nan`, `inf` and `-inf` reach four attributes. On two of them —
+/// `Resolution` and `DisplayFunction` — a rejection declines the whole frame, so refusing the
+/// spelling refuses a conforming file outright; those are the ones graded here. On `offset`
+/// the spelling changes what §11.5.2's own constraint sees, graded with that row. On
+/// `bounds` the outcome is unchanged either way: an infinite or NaN endpoint is caught by the
+/// range validity rule stated on `k`, which is where such a file is supposed to fail.
+///
+/// The grammar's case distinction is narrower than it looks and is graded in
+/// `src/xisf/scalars.rs`: a sign is mandatory on `Inf` and forbidden on `+inf` and `+nan`.
+#[test]
+fn section_8_3_3_lowercase_non_finite_spellings_do_not_decline_a_conforming_frame() {
+    let levels = samples();
+    let children = concat!(
+        r#"<Resolution horizontal="inf" vertical="300" unit="cm"/>"#,
+        concat!(
+            r#"<DisplayFunction m="0.25:0.25:0.25:0.25" s="-inf:0.1:0.1:0.1" "#,
+            r#"h="1:1:1:1" l="nan:0:0:0" r="1:1:1:1"/>"#,
+        ),
+    );
+    let header = decodes_to(
+        attached_u16_with("", children, le_u16(&levels)),
+        &levels,
+        "lowercase non-finite spellings",
+    );
+
+    // Reported, not interpreted: §11.11 constrains neither, so the values reach the consumer
+    // as the file wrote them.
+    let resolution = header.resolution().expect("XISF defines a resolution");
+    assert!(resolution.horizontal().is_infinite() && resolution.horizontal() > 0.0);
+    assert_eq!(resolution.vertical(), 300.0);
+    let df = header
+        .display_function()
+        .expect("XISF defines a display function");
+    assert_eq!(df.shadows().red_gray, f64::NEG_INFINITY);
+    assert!(df.low_range().red_gray.is_nan());
+}
+
 /// Row *Plain-text scalars follow §8.3*: surrounding white space is ignored (§8.3.4), a
 /// leading sign is admitted even where the field is conceptually unsigned (§8.3.1), and `0`,
 /// `+0` and `-0` are accepted as integers despite §8.3.1's regex admitting no decimal zero.
@@ -1092,13 +1133,25 @@ fn a_negative_or_non_finite_offset_is_malformed_and_a_legal_one_is_reported() {
 
     // §11.5.2 defines `offset` as a scalar whose value must be greater than or equal to zero,
     // and §8.3.3 makes `NaN` and `-Inf` expressible — so the attribute is outside the range
-    // the specification defines for it rather than merely unusual.
-    for spelling in ["-1", "-0.5", "NaN", "-Inf"] {
+    // the specification defines for it rather than merely unusual. Each of those two has a
+    // lowercase spelling the same section admits, and the constraint sees them alike.
+    for spelling in ["-1", "-0.5", "NaN", "-Inf", "nan", "-nan", "-inf"] {
         let (class, reason) = declined(attached_u16(
             &format!(r#"offset="{spelling}""#),
             stored.clone(),
         ));
         assert_eq!(class, DeclineClass::Malformed, "{spelling}: {reason}");
+    }
+
+    // `+Inf` and `inf` are *not* among them: §11.5.2 excludes values below zero, and an
+    // infinity is not one. Reported rather than declined, and applied to nothing.
+    for spelling in ["+Inf", "inf"] {
+        let header = decodes_to(
+            attached_u16(&format!(r#"offset="{spelling}""#), stored.clone()),
+            &levels,
+            "an infinite offset",
+        );
+        assert_eq!(header.offset(), Some(f64::INFINITY), "{spelling}");
     }
 
     // A legal one is reported and applied to nothing.
@@ -1278,6 +1331,10 @@ fn item_size_one_is_a_no_op_and_a_trailing_partial_item_is_copied_through() {
 /// §10.5 makes SHA-1 mandatory for a decoder claiming checksum support and the other four
 /// optional, so a cheaper sha1-only build would be conformant — which is exactly why the four
 /// need a test.
+// Verification needs the hashes, so these grade the default build. Without the `checksum`
+// feature the same fixtures decline as `Unsupported` before any digest is computed, which is
+// §7's rule rather than §10.5's and is graded in `tests/checksum_feature_off.rs`.
+#[cfg(feature = "checksum")]
 #[test]
 fn every_checksum_algorithm_verifies_an_attached_block() {
     let levels = samples();
@@ -1299,6 +1356,10 @@ fn every_checksum_algorithm_verifies_an_attached_block() {
 ///
 /// The `embedded` counterpart — verified at construction, because its bytes live in the header
 /// region — is the decline table's own row and is graded in `xisf_declines.rs`.
+// Verification needs the hashes, so these grade the default build. Without the `checksum`
+// feature the same fixtures decline as `Unsupported` before any digest is computed, which is
+// §7's rule rather than §10.5's and is graded in `tests/checksum_feature_off.rs`.
+#[cfg(feature = "checksum")]
 #[test]
 fn a_mismatched_attachment_digest_surfaces_at_the_pixel_call_not_at_construction() {
     let levels = samples();
@@ -1938,6 +1999,10 @@ fn property_values_survive_in_all_three_of_their_shapes() {
 /// Each property of a block imposes a floor and the granularity is the **worst** of them, not
 /// the first one found. The combinations a first-match implementation gets wrong are the
 /// point, and they are the four in the middle.
+// Verification needs the hashes, so these grade the default build. Without the `checksum`
+// feature the same fixtures decline as `Unsupported` before any digest is computed, which is
+// §7's rule rather than §10.5's and is graded in `tests/checksum_feature_off.rs`.
+#[cfg(feature = "checksum")]
 #[test]
 fn granularity_is_the_worst_floor_not_the_first() {
     let levels = samples();

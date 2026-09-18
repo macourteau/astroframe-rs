@@ -54,10 +54,16 @@ pub(crate) fn verify(checksum: &Checksum, stored: &[u8]) -> Result<()> {
 /// Without the `checksum` feature the verification code and its three hash dependencies are
 /// not compiled in, so a block that declares a checksum is refused rather than trusted.
 ///
-/// That does not weaken the guarantee — it narrows what such a build decodes. §9.5 and §10.5
-/// require every block of a **digitally signed** unit that is not serialized directly in the
-/// header to carry a checksum, so this build cannot decode a signed unit whose pixels are
-/// attached.
+/// The refusal is `Unsupported` rather than a mismatch, and the distinction is load-bearing:
+/// it is what lets the caller decline the position and keep walking, per §7's rule that an
+/// unsupported feature leaves the rest of the unit accessible. Nothing unverified is ever
+/// handed out either way.
+///
+/// What such a build gives up is conformance, not safety. §7.2 makes verification of SHA-1,
+/// SHA-256 and SHA-512 an ability every decoder must have, so a build without this feature is
+/// not a baseline XISF decoder. It also cannot decode a **digitally signed** unit whose pixels
+/// are attached, since §9.5 and §10.5 require every block of one that is not serialized
+/// directly in the header to carry a checksum.
 #[cfg(not(feature = "checksum"))]
 pub(crate) fn verify(_checksum: &crate::xisf::block::Checksum, _stored: &[u8]) -> Result<()> {
     Err(Error::unsupported(

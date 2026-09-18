@@ -97,6 +97,13 @@ jobs:
             echo "::endgroup::"
           done
           [ -z "$failed" ] || { echo "FAILED:${failed}" >&2; exit 1; }
+      # The powerset lane compiles the tests in every configuration and runs them in none, so
+      # a test whose whole subject is a non-default configuration executes nowhere. Without
+      # the `checksum` feature a block declaring a checksum cannot be verified, and §7 governs
+      # what a decoder does then; `tests/checksum_feature_off.rs` grades it and compiles away
+      # under `--all-features`.
+      - name: Tests without the checksum feature
+        run: cargo test --locked --no-default-features --features fits,xisf
       - run: cargo build --locked --all-features --examples
 
   msrv:

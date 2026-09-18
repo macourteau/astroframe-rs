@@ -46,9 +46,9 @@ use std::io::Cursor;
 
 use astroframe::{Error, Image, Limits, Reader, SampleFormat, Samples};
 
-use common::xisf::{
-    Unit, checksum_attr, le_f32, le_u16, lz4, raw_unit, repeating_u16, shuffle, zlib,
-};
+#[cfg(feature = "checksum")]
+use common::xisf::checksum_attr;
+use common::xisf::{Unit, le_f32, le_u16, lz4, raw_unit, repeating_u16, shuffle, zlib};
 use common::{FailingRead, assert_same_bits, kind};
 
 // ------------------------------------------------------------------ grading
@@ -1124,6 +1124,11 @@ fn subblock_lengths_do_not_sum_to_the_block_size() {
 /// Net-new: § Deliberate divergences from prior art records that the prior decoder ignores `checksum` entirely,
 /// so a file declaring a non-matching digest decodes clean there. That is the strongest
 /// independent argument for verifying every checksum this crate reads.
+///
+/// A mismatch is only reachable where the digest can be computed. Without the `checksum`
+/// feature the same file declines as `Unsupported` before any comparison happens, which is
+/// §7's rule rather than §10.5's and is graded in `tests/checksum_feature_off.rs`.
+#[cfg(feature = "checksum")]
 #[test]
 fn checksummed_block_whose_digest_does_not_match() {
     let levels = repeating_u16(4);
