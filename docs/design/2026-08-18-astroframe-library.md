@@ -52,7 +52,7 @@ Local copies: FITS Standard 4.0 is public
 to `reference/xisf-1.0-spec.md` by `tools/xisf-spec-to-md.py` and is **not
 redistributed** — see `reference/README.md` for how to regenerate it. Two converter
 artifacts matter when reading that copy: equations are stripped to empty image
-references (so §8.5.5's Equation [18] and the shuffle transform's [33]–[35] are legible
+references (so §8.5.5's Equation [4] and the shuffle transform's [19]–[21] are legible
 only from surrounding prose), and normative negations are fused — `shall not`, `must not`
 and `should not` appear as `shallnot`, `mustnot` and `shouldnot`. Grepping the local copy
 for the spaced forms silently misses almost every prohibition in the specification.
@@ -285,11 +285,12 @@ Consequences the implementation must carry:
    `a*b+c` into an FMA, and never reassociates. That does not extend to floating-point
    *reductions*, of which there are none on this path and none may be added.
 
-**Saturation and NaN.** §8.5.5's Equation [18] defines the range map with hard
-saturation; §8.1 requires infinities and NaN to be "correctly handled (in an
-implementation-specific manner)" — a requirement to handle them, with the manner left open
-rather than the outcome — and §8.3.3 makes `NaN`, `+Inf` and `-Inf` conforming spellings for
-the `bounds` attribute itself, so none of the three is hypothetical. Step 3's result is
+**Saturation and NaN.** §8.5.5's Equation [4] defines the range map with hard
+saturation; §8.1 requires encoders and decoders to "be able to serialize and deserialize"
+infinities and NaN, with "their interpretation … implementation-specific" — a requirement to
+handle them, with the manner left open rather than the outcome — and §8.3.3 makes `NaN`,
+`+Inf`, `-Inf` and their lowercase alternatives conforming spellings for the `bounds`
+attribute itself, so none of the three is hypothetical. Step 3's result is
 therefore defined by exactly one statement:
 
 > A **finite** result saturates into `[0,1]`. **±Infinity** saturates too: `+Inf` to
@@ -2676,7 +2677,7 @@ criterion.
 | **The root `version` attribute is checked; anything but `1.0` is `Unsupported`** | §9.5 makes it mandatory, and a later version may redefine what this crate reads |
 | **The header is parsed namespace-aware, matching elements by local name — within the XISF namespace when the document declares one, and unconditionally when it does not** | §9.5 says the root *should* carry the namespace, so a prefixed serialization is legal and `quick-xml`'s plain reader would fail to match it; requiring the namespace would reject the conforming files that *should* permits, while matching local names unconditionally would confuse XISF's `Reference` (§11.13) with the identically-named element inside an XML-DSig `Signature` subtree. Parsing stops at `</xisf>` anyway, so that subtree is never reached — a consequence of the rule, not a substitute for it. A root element in some *other* namespace is `Malformed` at construction rather than a document that matches no `Image` and walks zero images, which would be the silent loss this design refuses |
 | **XML entity references are resolved; "verbatim" means after unescaping.** Duplicate attributes on one element are rejected rather than last-wins | `quick-xml` does not unescape automatically, so this is a decision rather than a default. A consumer comparing a keyword value against a string should not have to know how the writer chose to escape it. A `String` property's *whitespace* is still preserved exactly — unescaping changes entity syntax, not spacing |
-| **Plain-text scalars follow §8.3, and one specification defect is tolerated rather than reproduced**: `0`, `+0` and `-0` are accepted as integers | §8.3's four traps for a naive parser are surrounding whitespace that *must* be ignored (§8.3.4, so `geometry=" 4096 : 2160 : 1 "` is valid), leading `+`/`-` even where the field is conceptually unsigned (§8.3.1, so a sign is parsed then range-checked), binary/octal/hex integer forms (§8.3.2), and `NaN`/`+Inf`/`-Inf` float spellings (§8.3.3 — which is how a `bounds nan` file comes to exist). §8.3.1's integer regex admits no decimal spelling of zero at all, yet `attachment:0:…` is a real and necessary location |
+| **Plain-text scalars follow §8.3, and one specification defect is tolerated rather than reproduced**: `0`, `+0` and `-0` are accepted as integers | §8.3's four traps for a naive parser are surrounding whitespace that *must* be ignored (§8.3.5, so `geometry=" 4096 : 2160 : 1 "` is valid), leading `+`/`-` even where the field is conceptually unsigned (§8.3.1, so a sign is parsed then range-checked), binary/octal/hex integer forms (§8.3.2), and `NaN`/`+Inf`/`-Inf` float spellings (§8.3.3 — which is how a `bounds nan` file comes to exist). §8.3.1's integer regex admits no decimal spelling of zero at all, yet `attachment:0:…` is a real and necessary location |
 | **Header encoding is UTF-8 (§9.5); invalid UTF-8 is `Malformed` and a declared non-UTF-8 encoding is `Unsupported`. A missing XML declaration is tolerated** | `quick-xml` is built without its transcoding feature and guessing would be worse than refusing. The missing declaration makes the header invalid by §9.5 and is tolerated anyway, as deliberate leniency toward real writers rather than as a conformance claim; nothing in decoding depends on it |
 | **The XML header may not be a well-formed standalone document, and that is fine** | A signed unit places its `<Signature>` element *after* `</xisf>` (§9.5), so the header buffer has two roots. Pull-parsing naturally stops caring once the `xisf` element closes, which is what makes a signed unit decode normally even though signature verification is out of scope |
 | **`Metadata`'s absence is tolerated** | The specification requires it but defines no failure mode, and a decode-only library gains nothing by refusing |
@@ -2864,7 +2865,7 @@ Questions considered during design and explicitly not answered. Each entry is a 
 9. **Deferred** — Should v1 offer reduced-cost decode paths for previews — sub-rectangle (ROI) decode, decimated or reduced-resolution decode, or reading XISF's purpose-built `Thumbnail` element?
    _Reason: The Problem section names a preview consumer, and this version gives it nothing a full decode does not — so this is recorded rather than left as an inference. ROI and decimated decode interact with every layer at once: granularity stops describing delivery, the normalization primitive gains a stride, and the chunk contract changes shape, so it is a second decode path rather than an addition to this one. Reading `Thumbnail` is far cheaper and is the natural first step if a preview consumer materializes, since the element is already parsed and skipped; it was left out only because no consumer needs it yet. Nothing here forecloses either._
 10. **Out of scope** — Should v1 decode `CIELab` images, converting them to RGB?
-    _Reason: Requires the full RGB-working-space conversion machinery (XISF §8.5.4.1-§8.5.4.6), which is colour science rather than container decoding. This design declines colour-space conversion generally. A baseline XISF decoder needs only Gray and RGB (§7.2)._
+    _Reason: Requires the full RGB-working-space conversion machinery (XISF §8.5.4.1-§8.5.4.2 and Annex B), which is colour science rather than container decoding. This design declines colour-space conversion generally. A baseline XISF decoder needs only Gray and RGB (§7.2)._
 11. **Out of scope** — Should v1 expose a C ABI so non-Rust consumers can link the crate?
     _Reason: No consumer needs one. It would also be a second API design rather than a wrapper, flattening the borrowed-chunk API, the error enum and the sample-format enum into handles and out-parameters with ownership rules across the boundary. Nothing here blocks adding one later: the layering already separates the pure primitive from the I/O, which is the part such a surface would wrap._
 12. **Deferred** — Should XISF `Property` elements whose values live in a data block (vectors, matrices, long strings) be decoded?
