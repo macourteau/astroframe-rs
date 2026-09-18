@@ -353,7 +353,7 @@ impl std::fmt::Display for ImageType {
 pub enum Format {
     /// FITS, identified by the `SIMPLE` card the standard opens a file with.
     Fits,
-    /// XISF, identified by the `XISF0100` signature of §6.1.
+    /// XISF, identified by the `XISF0100` signature of §9.2.
     Xisf,
 }
 

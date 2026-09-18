@@ -329,8 +329,14 @@ jobs:
 
           # The converted XISF specification is not redistributed. On a public repository
           # this is a copyright matter rather than a hygiene one.
-          if git ls-files --error-unmatch 'reference/*.md' 'reference/*.html' >/dev/null 2>&1; then
-            fail "a converted specification file is committed under reference/"
+          # Anything tracked under reference/ other than the README. `--error-unmatch` over a
+          # pattern pair cannot express this: it fails when *any* pattern matches nothing, and
+          # `reference/*.md` always matches the committed README, so the gate turned entirely
+          # on whether a .html happened to be committed too. A converted .md alone — the
+          # likelier accident, being the file people read and cite — passed green.
+          converted=$(git ls-files 'reference/' | grep -vFx 'reference/README.md' || true)
+          if [ -n "$converted" ]; then
+            fail "a converted specification file is committed under reference/: $(echo "$converted" | tr '\n' ' ')"
           fi
 
           echo "all grep-shaped criteria pass"
