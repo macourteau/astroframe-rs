@@ -205,6 +205,34 @@ pub fn expected_u16(levels: &[u16]) -> Vec<f32> {
         .collect()
 }
 
+/// The same form for a `UInt8` image at its format default range.
+pub fn expected_u8(levels: &[u8]) -> Vec<f32> {
+    levels
+        .iter()
+        .map(|&l| (l as f64 - 0.0) as f32 * (1.0f32 / 255.0f32))
+        .collect()
+}
+
+/// The same form for a `Float32` image over a declared range, saturating at both ends.
+pub fn expected_f32(levels: &[f32], lo: f64, hi: f64) -> Vec<f32> {
+    let k = 1.0f32 / ((hi - lo) as f32);
+    levels
+        .iter()
+        .map(|&s| {
+            let shifted = ((s as f64) - lo) as f32;
+            (shifted * k).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// A one-image unit whose `<Image>` is written attribute by attribute and whose block is
+/// attached — for fixtures whose geometry or sample format is not the standard one.
+pub fn attached_image(attrs: &str, stored: Vec<u8>) -> Vec<u8> {
+    Unit::new()
+        .attached(&format!("<Image {attrs} {{loc}}/>"), stored)
+        .build()
+}
+
 /// Build a raw unit from a header string, bypassing the offset iteration.
 ///
 /// For fixtures whose whole point is a header this builder would refuse to produce — a bad
@@ -319,4 +347,85 @@ pub fn checksum_attr(algorithm: &str, stored: &[u8]) -> String {
         other => panic!("unknown checksum algorithm {other}"),
     };
     format!(r#"checksum="{algorithm}:{}""#, hex(&digest))
+}
+
+// ------------------------------------------------------------------ decoding a fixture
+
+/// The standard fixture geometry, as an `<Image>` with `extra` attributes spliced in and
+/// `{loc}` left for [`Unit::attached`] to fill.
+pub fn image_element(extra: &str) -> String {
+    format!(r#"<Image geometry="4:3:1" sampleFormat="UInt16" {extra} {{loc}}/>"#)
+}
+
+/// A one-image unit whose block is attached, with `extra` attributes on the `<Image>`.
+pub fn attached_u16(extra: &str, stored: Vec<u8>) -> Vec<u8> {
+    Unit::new().attached(&image_element(extra), stored).build()
+}
+
+/// A unit whose whole content is header XML — the shape every `embedded` fixture has.
+pub fn xml_unit(body: &str) -> Vec<u8> {
+    Unit::new().xml(body).build()
+}
+
+/// An `<Image location="embedded">` over the standard fixture geometry.
+pub fn embedded_u16(image_extra: &str, data_attrs: &str, text: &str) -> Vec<u8> {
+    xml_unit(&format!(
+        r#"<Image geometry="4:3:1" sampleFormat="UInt16" location="embedded" {image_extra}><Data {data_attrs}>{text}</Data></Image>"#
+    ))
+}
+
+/// A seekable reader over an in-memory fixture.
+pub fn seekable(
+    bytes: Vec<u8>,
+) -> astroframe::Result<astroframe::Reader<astroframe::Seekable<std::io::Cursor<Vec<u8>>>>> {
+    astroframe::Reader::seekable(std::io::Cursor::new(bytes))
+}
+
+/// Advance to the one image a fixture holds and decode it.
+///
+/// The trailing `next_image()` is part of the contract: a fixture meant to hold one image and
+/// silently holding two would otherwise pass every assertion made about the first.
+pub fn read_one(bytes: Vec<u8>) -> (astroframe::Header, Vec<f32>) {
+    let mut reader = seekable(bytes).expect("the unit constructs");
+    assert!(reader.next_image().expect("the walk advances"), "one image");
+    let header = reader.current_header().expect("the advanced position");
+    let image = reader.read_image().expect("the image decodes");
+    assert!(
+        !reader.next_image().expect("the walk ends"),
+        "the fixture holds exactly one image"
+    );
+    (header, image.into_samples())
+}
+
+/// Decode the one image a fixture holds and check it against the levels it was built from.
+pub fn decodes_to(bytes: Vec<u8>, levels: &[u16], what: &str) -> astroframe::Header {
+    let (header, got) = read_one(bytes);
+    super::assert_same_bits(&got, &expected_u16(levels), what);
+    header
+}
+
+/// A zstd frame built from **raw** (stored) blocks.
+///
+/// Written here byte by byte rather than produced by an encoder the crate does not depend on:
+/// magic, a single-segment frame header, then one last raw block. `Single_Segment_flag` makes
+/// the declared window the content size, which keeps a fixture below the `zstd_window_bytes`
+/// cap.
+///
+/// The `Frame_Content_Size` field widens with the input rather than being fixed at one byte:
+/// the memory fixtures need blocks far past 255 bytes to say anything about peak usage, and a
+/// one-byte field silently cannot describe them.
+pub fn zstd_raw(input: &[u8]) -> Vec<u8> {
+    assert!(input.len() < 128 * 1024, "one Raw_Block's maximum size");
+    let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
+    if input.len() < 256 {
+        out.push(0x20);
+        out.push(input.len() as u8);
+    } else {
+        out.push(0xa0); // Single_Segment_flag, and a four-byte Frame_Content_Size
+        out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    }
+    let block_header: u32 = ((input.len() as u32) << 3) | 1; // last block, Raw_Block
+    out.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    out.extend_from_slice(input);
+    out
 }

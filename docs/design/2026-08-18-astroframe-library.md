@@ -2289,13 +2289,24 @@ report, a pasted header.
     `subblocks` with neither must report `Block`; `zlib` **+** `subblocks` must report `Rows`,
     since `subblocks` only blocks a promotion and never lowers a `Rows` floor. An `embedded`
     source reports `WholeImage`.
-27. **Baseline XISF decoder conformance.** Each of the abilities XISF §7.2 requires of a
-    baseline decoder has a test demonstrating it: monolithic files; multiple `Image` elements
-    from one file; every standard compression codec; `embedded` and `attachment` pixel
-    locations (the partial one — no inline pixel data, per § Format support matrix); `Planar`
-    and `Normal` storage; `UInt8`, `UInt16` and `Float32` sample formats; `Gray` and `RGB`
-    colour spaces. This is what makes the format matrix's declines defensible rather than
-    gaps — everything declined sits above baseline.
+27. **Baseline XISF decoder conformance.** Each of the ten abilities XISF §7.2 requires of a
+    baseline decoder has a test demonstrating it, and they live together in
+    `tests/conformance.rs` rather than scattered through the suite: monolithic files; 8-, 16-,
+    32- and 64-bit scalar properties; multiple `Image` elements from one file; `embedded` and
+    `attachment` pixel locations (the partial one — no inline pixel data, per § Format support
+    matrix); both byte orders; every standard compression codec; verification of the SHA-1,
+    SHA-256 and SHA-512 checksums §10.5 requires of every decoder; `Planar` and `Normal`
+    storage; `UInt8`, `UInt16` and `Float32` sample formats; `Gray` and `RGB` colour spaces.
+    §7's three general obligations are graded there too — an unsupported feature leaves the
+    rest of the unit accessible, and unrecognized elements, attributes and properties are
+    ignored.
+
+    One file rather than an argument assembled from evidence, because the question it answers
+    is asked as a whole: *does this crate meet §7.2?* Its module documentation maps every
+    bullet to the test that grades it, so a revision adding a bullet leaves a visible hole.
+    This is also what makes the format matrix's declines defensible rather than gaps —
+    everything declined sits above baseline, and §7's rule for what sits above baseline is to
+    treat the object as unavailable and keep the unit readable.
 
 ### Format decisions, each pinned by a test
 

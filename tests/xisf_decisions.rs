@@ -1,7 +1,8 @@
 //! § XISF decisions, graded row by row through the **public API**, plus the XISF halves of
 //! *Reported metadata is reachable*, *Metadata that has no FITS equivalent survives*,
-//! *`granularity()` reports the right value*, *Baseline XISF decoder conformance* and
-//! *Header-only decode works on a truncated prefix*.
+//! *`granularity()` reports the right value* and *Header-only decode works on a truncated
+//! prefix*. Baseline decoder conformance is graded in `tests/conformance.rs`, bullet by
+//! bullet against XISF §7.2.
 //!
 //! Everything here drives `Reader` → `next_image` → `header()` → pixels. `src/xisf/image.rs`
 //! already unit-tests the header walk directly; where a unit test pins a mapping, the test
@@ -27,57 +28,21 @@ use std::io::Cursor;
 use astroframe::{
     ColorSpace, DeclineClass, Granularity, Header, ImageType, KeywordOrigin, Orientation,
     PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, ResolutionUnit,
-    SampleFormat, Samples, Seekable, Sequential,
+    SampleFormat, Sequential,
 };
 #[cfg(feature = "checksum")]
 use common::xisf::checksum_attr;
 use common::xisf::{
-    PREAMBLE, Unit, base64, be_u16, expected_u16, hex, le_f32, le_u8, le_u16, lz4, repeating_u16,
-    samples, shuffle, with_header, zlib,
+    PREAMBLE, Unit, attached_image, attached_u16, base64, be_u16, decodes_to, embedded_u16,
+    expected_u16, hex, image_element, le_u16, lz4, read_one, repeating_u16, samples, seekable,
+    shuffle, with_header, xml_unit, zlib,
 };
 use common::{Streams, assert_granularity, assert_same_bits, kind};
 
 // ------------------------------------------------------------------ helpers
 
-type SeekReader = Reader<Seekable<Cursor<Vec<u8>>>>;
-
-fn seekable(bytes: Vec<u8>) -> astroframe::Result<SeekReader> {
-    Reader::seekable(Cursor::new(bytes))
-}
-
 fn sequential(bytes: Vec<u8>) -> astroframe::Result<Reader<Sequential<Cursor<Vec<u8>>>>> {
     Reader::sequential(Cursor::new(bytes))
-}
-
-/// `<Image>` over the standard fixture geometry, with `extra` attributes spliced in.
-fn image_element(extra: &str) -> String {
-    format!(r#"<Image geometry="4:3:1" sampleFormat="UInt16" {extra} {{loc}}/>"#)
-}
-
-/// A one-image unit whose block is attached, with `extra` attributes on the `<Image>`.
-fn attached_u16(extra: &str, stored: Vec<u8>) -> Vec<u8> {
-    Unit::new().attached(&image_element(extra), stored).build()
-}
-
-/// Advance to the one image a fixture holds and decode it.
-fn read_one(bytes: Vec<u8>) -> (Header, Vec<f32>) {
-    let mut reader = seekable(bytes).expect("the unit constructs");
-    assert!(reader.next_image().expect("the walk advances"), "one image");
-    let header = reader.current_header().expect("the advanced position");
-    let image = reader.read_image().expect("the image decodes");
-    assert!(
-        !reader.next_image().expect("the walk ends"),
-        "the fixture holds exactly one image"
-    );
-    (header, image.into_samples())
-}
-
-/// Advance to the one image a fixture holds, decode it, and check it against the fixture's
-/// own stored levels.
-fn decodes_to(bytes: Vec<u8>, levels: &[u16], what: &str) -> Header {
-    let (header, got) = read_one(bytes);
-    assert_same_bits(&got, &expected_u16(levels), what);
-    header
 }
 
 /// Build a unit whose single attachment writes its **own** `location` spelling.
@@ -126,24 +91,6 @@ fn located_u16(location: impl Fn(u64, u64) -> String, stored: &[u8]) -> Vec<u8> 
         },
         stored,
     )
-}
-
-/// A zstd frame built from **raw** (stored) blocks.
-///
-/// The fixture is a frame written here byte by byte rather than one produced by an encoder
-/// the crate does not depend on: magic, a single-segment frame header with a one-byte content
-/// size, then one last raw block. It exercises exactly what the decision is about — that a
-/// `zstd` block is *framed* and is fed to a streaming decoder, one frame per subblock as
-/// §10.6.9 requires.
-fn zstd_raw(input: &[u8]) -> Vec<u8> {
-    assert!(input.len() < 256, "the one-byte frame content size field");
-    let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
-    out.push(0x20); // Single_Segment_flag, so the window is the content size
-    out.push(input.len() as u8);
-    let block_header: u32 = ((input.len() as u32) << 3) | 1; // last block, Raw_Block
-    out.extend_from_slice(&block_header.to_le_bytes()[..3]);
-    out.extend_from_slice(input);
-    out
 }
 
 // -------------------------------------------------- the preamble and the header region
@@ -326,18 +273,6 @@ fn big_endian_blocks_decode_and_absent_means_little_endian() {
 }
 
 // ------------------------------------------------------------------ embedded blocks
-
-/// A unit whose whole content is header XML — every `embedded` fixture has this shape.
-fn xml_unit(body: &str) -> Vec<u8> {
-    Unit::new().xml(body).build()
-}
-
-/// An `<Image location="embedded">` over the standard fixture geometry.
-fn embedded_u16(image_extra: &str, data_attrs: &str, text: &str) -> Vec<u8> {
-    xml_unit(&format!(
-        r#"<Image geometry="4:3:1" sampleFormat="UInt16" location="embedded" {image_extra}><Data {data_attrs}>{text}</Data></Image>"#
-    ))
-}
 
 /// Row *Embedded blocks come in two encodings, `base64` and lowercase `hex`*.
 ///
@@ -983,14 +918,6 @@ fn references_resolve_forward_and_take_the_position_of_the_reference() {
 
 // ------------------------------------------------------------------ shared builders
 
-/// A one-image unit whose `<Image>` is written attribute by attribute, for the fixtures whose
-/// point is a geometry or a sample format other than the standard one.
-fn attached_image(attrs: &str, stored: Vec<u8>) -> Vec<u8> {
-    Unit::new()
-        .attached(&format!("<Image {attrs} {{loc}}/>"), stored)
-        .build()
-}
-
 /// The header at the fixture's first image position, whatever it reports.
 fn first_header(bytes: Vec<u8>) -> Header {
     let mut reader = seekable(bytes).expect("the unit constructs");
@@ -1001,27 +928,6 @@ fn first_header(bytes: Vec<u8>) -> Header {
 /// The geometry three, as a triple, so the representability rule is one assertion.
 fn geometry_of(header: &Header) -> (Option<u32>, Option<u32>, Option<u32>) {
     (header.width(), header.height(), header.channels())
-}
-
-/// The pinned normalization form for a `UInt8` image at the format default range.
-fn expected_u8(levels: &[u8]) -> Vec<f32> {
-    levels
-        .iter()
-        .map(|&l| (l as f64 - 0.0) as f32 * (1.0f32 / 255.0f32))
-        .collect()
-}
-
-/// The pinned form for a `Float32` image over a declared `bounds` of `0:1`.
-fn expected_f32(levels: &[f32], lo: f64, hi: f64) -> Vec<f32> {
-    let k = 1.0f32 / ((hi - lo) as f32);
-    levels
-        .iter()
-        .map(|&s| {
-            let shifted = ((s as f64) - lo) as f32;
-            let out = shifted * k;
-            out.clamp(0.0, 1.0)
-        })
-        .collect()
 }
 
 /// Split a block in two and compress each half **independently**, which is what §10.6's
@@ -2129,223 +2035,6 @@ fn a_subblocked_zlib_block_streams_by_rows() {
         stored,
     );
     decodes_to(unit, &levels, "zlib + subblocks");
-}
-
-// ----------------------------------- *Baseline XISF decoder conformance* (XISF §7.2)
-
-/// §7.2's *every standard compression codec* bullet, plus the `zstd` this crate adds.
-///
-/// The three container shapes are the point: LZ4 and zstd fail in **opposite** directions, so
-/// a decoder reaching for a framed LZ4 reader breaks LZ4 and one reaching for a bare-block
-/// zstd reader breaks zstd. Every row here decodes to asserted pixels.
-#[test]
-fn baseline_conformance_reads_every_standard_codec_and_its_shuffled_variant() {
-    let levels = samples();
-    let plain = le_u16(&levels);
-    let size = plain.len();
-    let shuffled = shuffle(&plain, 2);
-
-    let cases: Vec<(String, Vec<u8>)> = vec![
-        (format!(r#"compression="zlib:{size}""#), zlib(&plain)),
-        (
-            format!(r#"compression="zlib+sh:{size}:2""#),
-            zlib(&shuffled),
-        ),
-        (format!(r#"compression="lz4:{size}""#), lz4(&plain)),
-        (format!(r#"compression="lz4+sh:{size}:2""#), lz4(&shuffled)),
-        // `lz4hc` is the same bare-block container written by a higher-effort compressor, so
-        // an ordinary LZ4 block is a conforming `lz4hc` block.
-        (format!(r#"compression="lz4hc:{size}""#), lz4(&plain)),
-        (
-            format!(r#"compression="lz4hc+sh:{size}:2""#),
-            lz4(&shuffled),
-        ),
-        (format!(r#"compression="zstd:{size}""#), zstd_raw(&plain)),
-        (
-            format!(r#"compression="zstd+sh:{size}:2""#),
-            zstd_raw(&shuffled),
-        ),
-    ];
-
-    for (attribute, stored) in cases {
-        decodes_to(attached_u16(&attribute, stored), &levels, &attribute);
-    }
-}
-
-/// §7.2's *pixel data from embedded and attachment locations* bullet — the partial one, since
-/// §11.5 forbids an `Image` from serializing pixel data inline at all.
-///
-/// Both locations over the same samples, so the two paths are proven to agree rather than
-/// separately plausible.
-#[test]
-fn baseline_conformance_reads_both_pixel_locations_that_an_image_may_use() {
-    let levels = samples();
-    let stored = le_u16(&levels);
-    let (_, from_attachment) = read_one(attached_u16("", stored.clone()));
-    let (_, from_embedded) = read_one(embedded_u16("", r#"encoding="base64""#, &base64(&stored)));
-    assert_same_bits(&from_attachment, &expected_u16(&levels), "attachment");
-    assert_same_bits(&from_embedded, &from_attachment, "the two locations agree");
-}
-
-/// §7.2's *`Planar` and `Normal` pixel storage* bullet, and its *`Gray` and `RGB` colour
-/// spaces* bullet.
-///
-/// The interleaved path is a transposition, and a transposition is where a decoder silently
-/// corrupts: the two fixtures store the same image in the two layouts and must produce the
-/// same planar output.
-#[test]
-fn baseline_conformance_reads_planar_and_normal_storage_in_gray_and_rgb() {
-    const W: usize = 2;
-    const H: usize = 2;
-    const C: usize = 3;
-    // A distinct level per (channel, row, column), so a transposition error cannot cancel.
-    let level = |c: usize, r: usize, x: usize| (1000 * c + 10 * r + x) as u16;
-
-    let mut planar = Vec::new();
-    for c in 0..C {
-        for r in 0..H {
-            for x in 0..W {
-                planar.push(level(c, r, x));
-            }
-        }
-    }
-    let mut interleaved = Vec::new();
-    for r in 0..H {
-        for x in 0..W {
-            for c in 0..C {
-                interleaved.push(level(c, r, x));
-            }
-        }
-    }
-
-    // `Planar` is the default and is written explicitly here, since the fixture's point is the
-    // pair rather than the default.
-    let from_planar = attached_image(
-        r#"geometry="2:2:3" sampleFormat="UInt16" colorSpace="RGB" pixelStorage="Planar""#,
-        le_u16(&planar),
-    );
-    let from_normal = attached_image(
-        r#"geometry="2:2:3" sampleFormat="UInt16" colorSpace="RGB" pixelStorage="Normal""#,
-        le_u16(&interleaved),
-    );
-
-    let (planar_header, planar_samples) = read_one(from_planar);
-    let (normal_header, normal_samples) = read_one(from_normal);
-    // The decode target is the whole image, **planar**, whatever the file's storage: the
-    // output layout is the crate's contract and the input layout is the file's business.
-    assert_same_bits(&planar_samples, &expected_u16(&planar), "Planar storage");
-    assert_same_bits(&normal_samples, &planar_samples, "Normal storage");
-    assert_eq!(planar_header.pixel_storage(), Some(PixelStorage::Planar));
-    assert_eq!(normal_header.pixel_storage(), Some(PixelStorage::Normal));
-    // Interleaving changes no granularity: every input row yields samples for all channels,
-    // so the decoder never has to hold more of the *input*.
-    assert_eq!(normal_header.granularity(), Granularity::Rows);
-
-    // The `Gray` half of the colour-space bullet, over the same machinery.
-    let gray = repeating_u16(4);
-    let header = decodes_to(
-        attached_image(
-            r#"geometry="2:2:1" sampleFormat="UInt16" colorSpace="Gray""#,
-            le_u16(&gray),
-        ),
-        &gray,
-        "Gray",
-    );
-    assert_eq!(header.color_space(), Some(ColorSpace::Gray));
-}
-
-/// §7.2's *`UInt8`, `UInt16` and `Float32` sample formats* bullet, graded at both layers: the
-/// normalized `f32` output and the native samples underneath it.
-#[test]
-fn baseline_conformance_reads_uint8_uint16_and_float32_samples() {
-    // `UInt8`.
-    let u8_levels: [u8; 12] = [0, 1, 2, 3, 127, 128, 129, 200, 253, 254, 255, 42];
-    let (header, got) = read_one(attached_image(
-        r#"geometry="4:3:1" sampleFormat="UInt8""#,
-        le_u8(&u8_levels),
-    ));
-    assert_eq!(header.sample_format(), Some(SampleFormat::U8));
-    assert_same_bits(&got, &expected_u8(&u8_levels), "UInt8");
-
-    // `UInt16`.
-    let u16_levels = samples();
-    let header = decodes_to(attached_u16("", le_u16(&u16_levels)), &u16_levels, "UInt16");
-    assert_eq!(header.sample_format(), Some(SampleFormat::U16));
-
-    // `Float32`. §11.5.1 makes `bounds` mandatory for a floating point real image, so the
-    // fixture declares one; the values straddle it so the saturating clamp is exercised too.
-    let f32_levels: [f32; 12] = [
-        0.0, 0.25, 0.5, 0.75, 1.0, -0.5, 1.5, 0.125, 0.375, 0.625, 0.875, 0.0625,
-    ];
-    let mut reader = seekable(attached_image(
-        r#"geometry="4:3:1" sampleFormat="Float32" bounds="0:1""#,
-        le_f32(&f32_levels),
-    ))
-    .expect("the unit constructs");
-    assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.current_header().expect("the advanced position");
-    assert_eq!(header.sample_format(), Some(SampleFormat::F32));
-    assert!(
-        matches!(header.bounds(), astroframe::Bounds::Declared(r) if r.lo() == 0.0 && r.hi() == 1.0)
-    );
-
-    // Layer 1 first — the file's own sample type, before any normalization.
-    let mut native = Samples::zeroed(SampleFormat::F32, 12);
-    reader
-        .read_samples_into(&mut native)
-        .expect("native samples decode");
-    match &native {
-        Samples::F32(v) => assert_same_bits(v, &f32_levels, "Float32 native samples"),
-        other => panic!("expected F32 samples, got {other:?}"),
-    }
-
-    // Then layer 2, over the declared range.
-    let image = reader.read_image().expect("the image normalizes");
-    assert_same_bits(
-        &image.into_samples(),
-        &expected_f32(&f32_levels, 0.0, 1.0),
-        "Float32 normalized",
-    );
-}
-
-/// §7.2's *monolithic files* and *multiple `Image` elements from one file* bullets.
-///
-/// The corpus makes the second concrete: one master holds two images of different geometry
-/// **and** different sample format in the same file.
-#[test]
-fn baseline_conformance_reads_several_images_of_different_shapes_from_one_monolithic_file() {
-    let first = repeating_u16(12);
-    let second: [u8; 6] = [0, 51, 102, 153, 204, 255];
-    let bytes = Unit::new()
-        .attached(&image_element(r#"id="frame""#), le_u16(&first))
-        .attached(
-            r#"<Image geometry="3:2:1" sampleFormat="UInt8" id="crop_mask" {loc}/>"#,
-            le_u8(&second),
-        )
-        .build();
-
-    let mut reader = seekable(bytes).expect("the unit constructs");
-
-    assert!(reader.next_image().expect("the walk advances"));
-    let header = reader.current_header().expect("a header");
-    assert_eq!(header.image_id(), Some("frame"));
-    assert_eq!(header.sample_format(), Some(SampleFormat::U16));
-    let image = reader.read_image().expect("the first image decodes");
-    assert_same_bits(&image.into_samples(), &expected_u16(&first), "first image");
-
-    assert!(reader.next_image().expect("the walk advances again"));
-    let header = reader.current_header().expect("a header");
-    assert_eq!(header.image_id(), Some("crop_mask"));
-    assert_eq!(header.sample_format(), Some(SampleFormat::U8));
-    assert_eq!(
-        (header.width(), header.height(), header.channels()),
-        (Some(3), Some(2), Some(1))
-    );
-    let image = reader.read_image().expect("the second image decodes");
-    assert_same_bits(&image.into_samples(), &expected_u8(&second), "second image");
-
-    // A single-image source returns `true` then `false`; this one returns `true` twice.
-    assert!(!reader.next_image().expect("the walk ends"));
 }
 
 // ------------------------ *Header-only decode works on a truncated prefix* (XISF half)

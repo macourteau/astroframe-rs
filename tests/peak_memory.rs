@@ -33,7 +33,7 @@ mod common;
 
 use astroframe::Reader;
 use common::Hdu;
-use common::xisf::{Unit, lz4, repeating_u16, shuffle, zlib};
+use common::xisf::{Unit, lz4, repeating_u16, shuffle, zlib, zstd_raw};
 use std::io::Cursor;
 
 #[global_allocator]
@@ -232,22 +232,6 @@ fn subblocked_lz4_row() {
          destination; holding one of {PARTS} subblocks at a time allows {allowed}. A decode \
          that holds the outgoing subblock's buffers alongside the incoming one's lands here."
     );
-}
-
-/// A zstd frame built from **raw** (stored) blocks, with a four-byte content size.
-///
-/// The fixture is a frame written here byte by byte rather than one produced by an encoder
-/// the crate does not depend on. `Single_Segment_flag` makes the declared window the content size,
-/// which keeps every split below the `zstd_window_bytes` cap.
-fn zstd_raw(input: &[u8]) -> Vec<u8> {
-    assert!(input.len() < 128 * 1024, "one Raw_Block's maximum size");
-    let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
-    out.push(0xa0); // Single_Segment_flag, and a four-byte Frame_Content_Size
-    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
-    let block_header: u32 = ((input.len() as u32) << 3) | 1; // last block, Raw_Block
-    out.extend_from_slice(&block_header.to_le_bytes()[..3]);
-    out.extend_from_slice(input);
-    out
 }
 
 /// The **cumulative** half of the same criterion, on the subblock axis: what a decode
