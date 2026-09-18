@@ -44,13 +44,19 @@ class SpecToMarkdown(HTMLParser):
         self.table_has_header = False
         self.href = None
         self.link_text = None
+        # One entry per open <em>/<strong>: the buffer it opened into, the index its marker
+        # sits at, and the marker. An empty span is unwound at its close, which is the only
+        # point where emptiness is knowable. Collapsing `* *` afterwards cannot work: the same
+        # three characters sit between two adjacent non-empty spans, and removing them there
+        # fuses the words -- `*shall* *not*` becomes `*shallnot*`.
+        self.emphasis = []
 
     # ---- helpers -------------------------------------------------------
+    def buffer(self):
+        return self.cell if self.cell is not None else self.out
+
     def emit(self, s):
-        if self.cell is not None:
-            self.cell.append(s)
-        else:
-            self.out.append(s)
+        self.buffer().append(s)
 
     def text_so_far(self):
         return "".join(self.out)
@@ -80,10 +86,11 @@ class SpecToMarkdown(HTMLParser):
             self.emit("#" * int(tag[1]) + " ")
         elif tag == "p":
             self.ensure_blank_line()
-        elif tag in ("strong", "b"):
-            self.emit("**")
-        elif tag in ("em", "i"):
-            self.emit("*")
+        elif tag in ("strong", "b", "em", "i"):
+            marker = "**" if tag in ("strong", "b") else "*"
+            buf = self.buffer()
+            self.emphasis.append((buf, len(buf), marker))
+            self.emit(marker)
         elif tag == "code" and self.pre_depth == 0:
             self.emit("`")
         elif tag == "pre":
@@ -143,10 +150,18 @@ class SpecToMarkdown(HTMLParser):
 
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6", "p"):
             self.emit("\n\n")
-        elif tag in ("strong", "b"):
-            self.emit("**")
-        elif tag in ("em", "i"):
-            self.emit("*")
+        elif tag in ("strong", "b", "em", "i"):
+            marker = "**" if tag in ("strong", "b") else "*"
+            if self.emphasis:
+                buf, at, opened = self.emphasis.pop()
+                # Only unwind a span still being written into: a cell boundary between the
+                # tags leaves the opening marker in a buffer that has moved on, and the
+                # closing marker is then written normally.
+                if opened == marker and buf is self.buffer() and at < len(buf):
+                    if "".join(buf[at + 1:]).strip() == "":
+                        del buf[at:]
+                        return
+            self.emit(marker)
         elif tag == "code" and self.pre_depth == 0:
             self.emit("`")
         elif tag == "pre":
@@ -223,8 +238,6 @@ def tidy(md: str) -> str:
     md = html.unescape(md)
     md = re.sub(r"[ \t]+\n", "\n", md)          # trailing spaces (keep md breaks below)
     md = re.sub(r"\n{3,}", "\n\n", md)          # collapse blank runs
-    md = re.sub(r"\*\*\s*\*\*", "", md)         # empty bold
-    md = re.sub(r"\*\s*\*", "", md)             # empty italic
     md = re.sub(r"\[\]\([^)]*\)", "", md)         # empty anchors from <a name=...>
     md = re.sub(r"[ \t]{2,}", " ", md)          # runs of spaces
     md = re.sub(r"\n +", "\n", md)              # leading indent noise

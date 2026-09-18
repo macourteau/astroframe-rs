@@ -50,12 +50,13 @@ tests that make all of it checkable.
 Local copies: FITS Standard 4.0 is public
 (<https://fits.gsfc.nasa.gov/fits_standard.html>); the XISF specification is converted
 to `reference/xisf-1.0-spec.md` by `tools/xisf-spec-to-md.py` and is **not
-redistributed** — see `reference/README.md` for how to regenerate it. Two converter
-artifacts matter when reading that copy: equations are stripped to empty image
-references (so §8.5.5's Equation [4] and the shuffle transform's [19]–[21] are legible
-only from surrounding prose), and normative negations are fused — `shall not`, `must not`
-and `should not` appear as `shallnot`, `mustnot` and `shouldnot`. Grepping the local copy
-for the spaced forms silently misses almost every prohibition in the specification.
+redistributed** — see `reference/README.md` for how to regenerate it. One converter
+artifact matters when reading that copy: equations are stripped to empty image references,
+so §8.5.5's Equation [4] and the shuffle transform's [19]–[21] are legible only from the
+surrounding prose, and Annex A and Annex B — the second of which is normative — are best
+read in the HTML. Which build the copy is comes from its compiler stamp, the only version
+marker the document carries; `reference/README.md` records the one these citations were
+checked against, and the fetch script reports a mismatch.
 
 ### Licensing boundary
 
