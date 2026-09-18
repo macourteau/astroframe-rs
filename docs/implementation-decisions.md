@@ -80,7 +80,7 @@ axis length this version does not represent, which is what `Unsupported` means.
 
 ### The identity `DisplayFunction`'s literal values are reconstructed, not quoted
 
-§11.9 gives the identity display function only as Equation [23], and the converted local copy
+§11.9 gives the identity display function only as Equation [9], and the converted local copy
 of the specification strips every equation to an empty image reference — so the literal
 parameter values cannot be read from `reference/xisf-1.0-spec.md` at all.
 
