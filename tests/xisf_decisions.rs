@@ -130,11 +130,11 @@ fn located_u16(location: impl Fn(u64, u64) -> String, stored: &[u8]) -> Vec<u8> 
 
 /// A zstd frame built from **raw** (stored) blocks.
 ///
-/// `zstd` appears nowhere in XISF 1.0 and this crate's support for it is corpus-derived, so
-/// the fixture is a frame written here byte by byte rather than one produced by an encoder
+/// The fixture is a frame written here byte by byte rather than one produced by an encoder
 /// the crate does not depend on: magic, a single-segment frame header with a one-byte content
 /// size, then one last raw block. It exercises exactly what the decision is about — that a
-/// `zstd` block is *framed* and is fed to a streaming decoder.
+/// `zstd` block is *framed* and is fed to a streaming decoder, one frame per subblock as
+/// §10.6.9 requires.
 fn zstd_raw(input: &[u8]) -> Vec<u8> {
     assert!(input.len() < 256, "the one-byte frame content size field");
     let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
@@ -1326,11 +1326,12 @@ fn item_size_one_is_a_no_op_and_a_trailing_partial_item_is_copied_through() {
 // ------------------------------------------------------------------ checksums
 
 /// Row *Checksums are verified for every block whose contents are actually read* and row
-/// *All five algorithms are supported, not the mandatory one alone*.
+/// *All five algorithms are supported, not the mandatory three alone*.
 ///
-/// §10.5 makes SHA-1 mandatory for a decoder claiming checksum support and the other four
-/// optional, so a cheaper sha1-only build would be conformant — which is exactly why the four
-/// need a test.
+/// §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder and leaves the two SHA-3
+/// algorithms optional, so the optional pair is exactly what needs a test: the three mandatory
+/// ones would be missed by no implementation, and a file's decodability must not depend on
+/// which digest its writer chose.
 // Verification needs the hashes, so these grade the default build. Without the `checksum`
 // feature the same fixtures decline as `Unsupported` before any digest is computed, which is
 // §7's rule rather than §10.5's and is graded in `tests/checksum_feature_off.rs`.
@@ -1339,7 +1340,7 @@ fn item_size_one_is_a_no_op_and_a_trailing_partial_item_is_copied_through() {
 fn every_checksum_algorithm_verifies_an_attached_block() {
     let levels = samples();
     let stored = le_u16(&levels);
-    // Both spellings of each name, since §10.5 Table 9 gives every algorithm two.
+    // Both spellings of each name, since §10.5 Table 9 gives three of the five algorithms two.
     for algorithm in [
         "sha-1", "sha1", "sha-256", "sha256", "sha-512", "sha512", "sha3-256", "sha3-512",
     ] {
@@ -1572,8 +1573,8 @@ fn the_declined_elements_never_fail_the_frame_and_the_two_reported_ones_are_reac
             r#"<DisplayFunction m="0.25:0.25:0.25:0.25" s="0.1:0.1:0.1:0.1" "#,
             r#"h="1:1:1:1" l="0:0:0:0" r="1:1:1:1"/>"#,
         ),
-        // An element no version of the specification defines: ignored, which is the only
-        // reading under which a 1.0 decoder survives a later revision.
+        // An element no version of the specification defines: ignored, which §7 requires
+        // and is the only reading under which a 1.0 decoder survives a later revision.
         r#"<SomethingFromTheFuture answer="42"/>"#,
     );
     let header = decodes_to(

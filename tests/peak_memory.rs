@@ -236,9 +236,8 @@ fn subblocked_lz4_row() {
 
 /// A zstd frame built from **raw** (stored) blocks, with a four-byte content size.
 ///
-/// `zstd` appears nowhere in XISF 1.0 and this crate's support for it is corpus-derived, so
-/// the fixture is a frame written here byte by byte rather than one produced by an encoder the
-/// crate does not depend on. `Single_Segment_flag` makes the declared window the content size,
+/// The fixture is a frame written here byte by byte rather than one produced by an encoder
+/// the crate does not depend on. `Single_Segment_flag` makes the declared window the content size,
 /// which keeps every split below the `zstd_window_bytes` cap.
 fn zstd_raw(input: &[u8]) -> Vec<u8> {
     assert!(input.len() < 128 * 1024, "one Raw_Block's maximum size");

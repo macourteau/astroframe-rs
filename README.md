@@ -188,9 +188,9 @@ a floating-point image, so one without it has no normalized output either.
 | `subblocks`, beside any of the above | CI + corpus |
 | any other codec name | declined, `Unsupported` (CI) |
 
-`zstd` appears nowhere in XISF 1.0 and is read because production writers emit it. `+sh` is the
-byte-shuffling modifier, and the unshuffle is computed per byte on the way out rather than by
-materializing an unshuffled copy of the block.
+`zstd` is the codec §10.6 recommends, and §7.2 makes reading it and its shuffled variant an
+ability every baseline decoder has. `+sh` is the byte-shuffling modifier, and the unshuffle is
+computed per byte on the way out rather than by materializing an unshuffled copy of the block.
 
 The corpus half of the `subblocks` row is 79 frames carrying a genuine `subblocks` attribute;
 see § Where the corpus evidence comes from for what they span and where the streams inside them
@@ -198,10 +198,12 @@ were produced.
 
 ### XISF block checksums
 
-The `checksum` feature is on by default. §10.5 makes SHA-1 the only algorithm a decoder
-claiming checksum support must implement; all five are read, each under both of the spellings
-Table 9 gives it. A block that declares a checksum is verified before anything decompresses it,
-and with the feature off such a block is declined rather than trusted.
+The `checksum` feature is on by default, and §7.2 is why: §10.5 requires SHA-1, SHA-256 and
+SHA-512 of every decoder, so a build without the feature is not a baseline XISF decoder. All
+five algorithms are read, the three Table 9 gives two spellings for under both of them. A
+block that declares a checksum is verified before anything decompresses it, and with the
+feature off such a block declines its own position rather than being trusted — §7 requires an
+unsupported feature to leave the rest of the unit accessible.
 
 | `checksum` algorithm | Tested |
 | --- | --- |

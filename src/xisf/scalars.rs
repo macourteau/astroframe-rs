@@ -28,9 +28,8 @@ pub(crate) fn trim(text: &str) -> &str {
 
 /// Parse a §8.3.1/§8.3.2 integer.
 ///
-/// One specification defect is tolerated rather than reproduced: §8.3.1's regex is
-/// `\s*[+-]?[1-9][0-9]*\s*`, which admits no decimal spelling of zero at all — yet
-/// `attachment:0:…` is a real and necessary location. So `0`, `+0` and `-0` are accepted.
+/// §8.3.1's regex is `\s*[+-]?(0|[1-9][0-9]*)\s*`, so `0`, `+0` and `-0` are accepted —
+/// which they must be, `attachment:0:…` being a real and necessary location.
 ///
 /// Leading zeros on a nonzero decimal value are *not* accepted, the regex being explicit
 /// that the first digit is `[1-9]`; a value like `007` would otherwise read as octal to some
