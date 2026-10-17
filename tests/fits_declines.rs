@@ -602,7 +602,7 @@ fn bintable_with_zimage_is_unsupported_with_geometry_from_the_z_keywords() {
 // --------------------------------------------------------- the *Neither* rows
 
 /// Row *Primary `NAXIS = 0`, no image extension found*: **Neither** — the walk ends normally
-/// with no error, and `header()` is `None`.
+/// with no error, and `current_header()` is an error.
 #[test]
 fn primary_naxis_zero_with_no_image_extension_ends_the_walk_normally() {
     for (name, bytes) in [

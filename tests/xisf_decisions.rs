@@ -4,10 +4,10 @@
 //! prefix*. Baseline decoder conformance is graded in `tests/conformance.rs`, bullet by
 //! bullet against XISF §7.2.
 //!
-//! Everything here drives `Reader` → `next_image` → `header()` → pixels. `src/xisf/image.rs`
-//! already unit-tests the header walk directly; where a unit test pins a mapping, the test
-//! here pins the observable end-to-end consequence instead — decoded samples, compared with
-//! `f32::to_bits()`.
+//! Everything here drives `Reader` → `next_image` → `current_header()` → pixels.
+//! `src/xisf/image.rs` already unit-tests the header walk directly; where a unit test pins a
+//! mapping, the test here pins the observable end-to-end consequence instead — decoded
+//! samples, compared with `f32::to_bits()`.
 //!
 //! Fixtures are synthetic and built byte by byte. Nothing here carries a real frame header.
 //!

@@ -11,6 +11,10 @@
 
 /// The crate version as `(major, minor)`, from Cargo's own environment rather than a parse of
 /// the manifest — the two cannot disagree.
+#[expect(
+    dead_code,
+    reason = "no item is deprecated at this version; the next entry's removal-line test calls it"
+)]
 fn version() -> (u32, u32) {
     (
         env!("CARGO_PKG_VERSION_MAJOR")
@@ -20,20 +24,4 @@ fn version() -> (u32, u32) {
             .parse()
             .expect("cargo reports a numeric minor version"),
     )
-}
-
-/// `Reader::header`, deprecated in 0.2.1 in favour of `Reader::current_header`.
-///
-/// Its `None` reports a caller error, which `current_header` states as `Error::InvalidRequest`.
-/// Both spellings ship through the 0.2 series so a consumer can migrate against a compiler
-/// warning rather than a build failure; at 0.3 the deprecated one goes.
-#[test]
-fn reader_header_is_removed_at_0_3() {
-    assert!(
-        version() < (0, 3),
-        "version {} has reached the removal line: delete the deprecated `Reader::header` \
-         (deprecated since 0.2.1), migrate any remaining caller to `Reader::current_header`, \
-         and delete this test",
-        env!("CARGO_PKG_VERSION"),
-    );
 }
