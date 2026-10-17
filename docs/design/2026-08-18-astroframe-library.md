@@ -456,7 +456,6 @@ bytes have been turned into.
         │    · limits() -> &Limits                         │
         │                                                  │
         │  header phase — parsed at construction           │
-        │    · header() -> Option<Header>         [tier 1] │
         │    · current_header() -> Result<Header> [tier 1] │
         │        · geometry · keywords · properties        │
         │        · row_order() · granularity()             │
@@ -563,7 +562,7 @@ exposes them as typed accessors, format-independent where the two formats agree:
 | Group | Accessors | Notes |
 | --- | --- | --- |
 | Container | `format()` | `Fits` or `Xisf`. A fact about the file, so § The organizing principle puts it here rather than leaving a caller to infer it from an accessor reported for another purpose — `scaling().is_some()` was that inference. `Reader::format()` answers the same question before any advance |
-| Geometry | `width`, `height`, `channels`, `sample_format` | Typed fields, never keyword lookups — an XISF frame need not carry `NAXIS1` at all. All four are `Option`, and the three geometry accessors are reported **as a unit** — all `Some` or all `None`, since a partial geometry is not a state this crate produces. The rule over all four is that `Header` reports `None` for any geometry or sample-format fact whose declared value has no representable form in this crate's model; that is the whole of the collision between a closed output type and `header()` still reporting what it can, and the `None` set is enumerated below |
+| Geometry | `width`, `height`, `channels`, `sample_format` | Typed fields, never keyword lookups — an XISF frame need not carry `NAXIS1` at all. All four are `Option`, and the three geometry accessors are reported **as a unit** — all `Some` or all `None`, since a partial geometry is not a state this crate produces. The rule over all four is that `Header` reports `None` for any geometry or sample-format fact whose declared value has no representable form in this crate's model; that is the whole of the collision between a closed output type and `current_header()` still reporting what it can, and the `None` set is enumerated below |
 | Provenance | `bounds()`, `scaling()` | The range actually in force and where it came from; enumerated below |
 | Orientation | `row_order()`, `orientation()` | FITS `ROWORDER` and XISF `orientation`, reported, applied to nothing |
 | Pedestal | `offset()` | XISF `offset`; the FITS `PEDESTAL` analogue stays a keyword, being a keyword |
@@ -583,9 +582,9 @@ does not hold, and plenty of declined positions report full geometry — a `BITP
 missing, unparseable or outside the standard set, a tile-compressed `BINTABLE` reporting the
 geometry its `Z*` keywords declare, and the two spellings of an empty axis, FITS
 `NAXISn = 0` and an XISF `geometry` naming a zero-length axis. Those last two report alike
-because both geometries *read*, which is all `header()` turns on; their classes still
-differ, and are settled in § Errors → Where a decline surfaces and in § XISF decisions
-respectively. The `None` set is exactly:
+because both geometries *read*, which is all `current_header()` turns on; their classes
+still differ, and are settled in § Errors → Where a decline surfaces and in § XISF
+decisions respectively. The `None` set is exactly:
 
 | Accessor | Reports `None` at |
 | --- | --- |
@@ -613,7 +612,7 @@ accessor whose format does not define the concept returns `None` rather than a f
 value — `orientation()` on a FITS frame, `scaling()` on an XISF one — and `format()` is what
 a caller asks which format it is holding, rather than reading that off one of these `None`s.
 
-**`header()` returns an owned `Option<Header>`, not a borrow.** A borrow would hold
+**`current_header()` returns an owned `Header`, not a borrow.** A borrow would hold
 `Reader` immutably while every pixel-phase method needs `&mut self`, so the obvious
 usage — read the geometry, size a buffer, decode into it — would not compile, and the
 implementer would discover that only after building the whole API. `Header`'s geometry
@@ -677,23 +676,23 @@ while reader.next_image()? {
 }
 ```
 
-`header()` returns `None` until the first successful advance, and construction reads only
-enough to identify the format and parse the first header unit. Selecting nothing is what
-holds across every file layout, including the multi-extension and tile-compressed files
-whose primary carries `NAXIS = 0` and which therefore have no first image to select at
-all; the two selection models that do not hold, and why, are in § Alternatives. It also
-makes the tile-compressed case ordinary: `next_image()` advances to the `ZIMAGE = T`
-extension and reports a declined position there. Two consequences, neither guessable: a
-single-image source returns `true` then `false`, and the images-per-source cap counts
-**advances**, not HDUs — a FITS file with three hundred tables between two images is
+`current_header()` is an `InvalidRequest` until the first successful advance, and
+construction reads only enough to identify the format and parse the first header unit.
+Selecting nothing is what holds across every file layout, including the multi-extension and
+tile-compressed files whose primary carries `NAXIS = 0` and which therefore have no first
+image to select at all; the two selection models that do not hold, and why, are in
+§ Alternatives. It also makes the tile-compressed case ordinary: `next_image()` advances to
+the `ZIMAGE = T` extension and reports a declined position there. Two consequences, neither
+guessable: a single-image source returns `true` then `false`, and the images-per-source cap
+counts **advances**, not HDUs — a FITS file with three hundred tables between two images is
 nowhere near it.
 
 **`select_channel(k)` narrows the reported geometry.** `channels()` returns `Some(1)`
 afterwards and the expected destination length is `width * height` — the header describes
 what the reader will *produce*, not what the file happens to hold, so a caller sizing a
-buffer from `header()` is right by construction, **provided it fetches the header after
-configuring the reader**. `header()` returns an owned value, so a header taken *before*
-`select_channel` still describes the file's full channel count and would size a buffer
+buffer from `current_header()` is right by construction, **provided it fetches the header
+after configuring the reader**. `current_header()` returns an owned value, so a header taken
+*before* `select_channel` still describes the file's full channel count and would size a buffer
 the narrowed reader then rejects as `InvalidRequest`. Configure, then read the header,
 then size. `channel_index()` reports which channel of the file was selected — `None` until
 `select_channel` is called, rather than `Some(0)`, so "no selection" and "selected channel
@@ -766,16 +765,17 @@ seekable source; on a sequential one it is `Unsupported`.
 - `offset()` reports §11.5.2's `0` default when the attribute is absent, in the same way
   `resolution()` and `display_function()` report theirs. All three defaults belong to XISF,
   so all three accessors report `None` on a FITS frame rather than the number.
-- `current_header()` is `header()` as a `Result`. `header()` keeps its `Option`, which is a
-  fact about a reader *before* its first advance; inside the documented
-  `while next_image()? { … }` loop that `None` is unreachable, and a library whose headline
-  snippet opens with an `expect` on its own invariant teaches callers to panic on one. The
-  error is the `InvalidRequest` the pixel-phase entry points already produce for the same
-  mistake. A borrow-guard typestate was considered and rejected: every misuse — reading
-  before the first advance, reading after the walk ends, a stale header across
-  `select_channel`, retrying a failed decode, rewinding a sequential source — already returns
-  a precise `InvalidRequest` rather than misbehaving, and `next_image()` returning
-  `Ok(false)` cannot hand back a differently-typed reader without wrecking the loop.
+- `current_header()` reports the header as a `Result`, not an `Option`. Having no selected
+  image is a fact about a reader *before* its first advance or after its last; inside the
+  documented `while next_image()? { … }` loop it is unreachable, and an `Option` there would
+  make a library whose headline snippet opens with an `expect` on its own invariant teach
+  callers to panic on one. The error is the `InvalidRequest` the pixel-phase entry points
+  already produce for the same mistake. A borrow-guard typestate was considered and
+  rejected: every misuse — reading before the first advance, reading after the walk ends, a
+  stale header across `select_channel`, retrying a failed decode, rewinding a sequential
+  source — already returns a precise `InvalidRequest` rather than misbehaving, and
+  `next_image()` returning `Ok(false)` cannot hand back a differently-typed reader without
+  wrecking the loop.
 - `destination_len()` and `normalizer()` are the two numbers a tier-3 caller needs and would
   otherwise reconstruct. Both read the reader's **current** header rather than taking one, so
   both fold `select_channel` and `set_bounds` in; a caller-supplied header could be a stale
@@ -1323,11 +1323,12 @@ and the difference is observable:
 | --- | --- | --- |
 | **Construction** | The source is not something this crate can read at all | No `Reader` exists; the caller has nothing to walk |
 | **`next_image()`** | The source is readable but advancing failed | `Err`, distinct from the `Ok(false)` that means end of source |
-| **Declined position** | The reader sits on an image it will not decode | Construction and advancing both succeed; `header()` reports what it can, `decline_reason()` is `Some`, any pixel call is `Err` |
+| **Declined position** | The reader sits on an image it will not decode | Construction and advancing both succeed; `current_header()` reports what it can, `decline_reason()` is `Some`, any pixel call is `Err` |
 
-The last column below says what `header()` reports for the geometry three at a declined
-position, because "reports what it can" is not the same answer everywhere: § The API fixes
-the `None` set, and a row landing on either side of it is a different observable outcome.
+The last column below says what `current_header()` reports for the geometry three at a
+declined position, because "reports what it can" is not the same answer everywhere:
+§ The API fixes the `None` set, and a row landing on either side of it is a different
+observable outcome.
 
 | Case | Class | Surfaces at | Geometry reported |
 | --- | --- | --- | --- |
@@ -1345,7 +1346,7 @@ the `None` set, and a row landing on either side of it is a different observable
 | `GROUPS = T` (random groups, with `NAXIS1 = 0`) | `Unsupported` | Declined position | Full |
 | `BINTABLE` with `ZIMAGE = T` (tile-compressed) | `Unsupported` | Declined position | Full, from the `Z*` keywords |
 | Any XISF per-`<Image>` attribute fault, or an unreadable `ColorFilterArray`, `Resolution` or `DisplayFunction` child | per the class rules | Declined position on that image | Full whenever `geometry` reads as a width, a height and a channel count — a zero-length axis included; `None` when it does not |
-| Primary `NAXIS = 0`, no image extension found | — | **Neither**: no image is found, `header()` is `None`, and the walk ends normally | — no `Header` |
+| Primary `NAXIS = 0`, no image extension found | — | **Neither**: no image is found, `current_header()` is an error, and the walk ends normally | — no `Header` |
 | `XTENSION = 'IMAGE'` with `NAXIS = 0` | — | **Neither**: not an image position, so it is skipped inside `next_image()` exactly as a non-image extension is | — no `Header` |
 | XISF unit whose walk finds no image occurrence | — | **Neither**: the same as a `NAXIS = 0` primary, for the same reason | — no `Header` |
 | HDU-traversal cap tripped while advancing | `LimitExceeded` | `next_image()` | — no `Header` |
@@ -1398,7 +1399,7 @@ The one rule surfaces in two places, and the only difference is whether the call
 position first:
 
 - At an **image position**, the reader sits on it and reports it like any other decline —
-  `header()` reports what it can, `decline_reason()` is `Some` — and the **next**
+  `current_header()` reports what it can, `decline_reason()` is `Some` — and the **next**
   `next_image()` returns `Err(Malformed)` rather than `Ok(false)` or a guessed skip. An
   unparseable `NAXIS` or `NAXISn` lands here too, with geometry reported as `None`
   (§ The API).
@@ -2624,7 +2625,7 @@ FITS decision* criterion.
 | --- | --- |
 | **FITS is a multi-image format here, like XISF.** `next_image()` starts at the primary when it holds an image and otherwise advances to the first `XTENSION = 'IMAGE'` that holds one; each call advances to the next | A file may legitimately interleave tables between images, so non-image extensions are **skipped**, not errors — refusing the source over one would reject ordinary MEF files. An `IMAGE` extension declaring `NAXIS = 0` is skipped with them, since it holds no image either; § Errors → Where a decline surfaces settles that against the `NAXIS = 0` primary and against `NAXISn = 0` |
 | **Data units are skipped using the full size formula**, `\|BITPIX\|/8 × GCOUNT × (PCOUNT + Π NAXISᵢ)`, rounded up to the 2880-byte block boundary, taking `PCOUNT = 0`, `GCOUNT = 1` in the primary | Named because the naive `BITPIX × NAXIS*` form lands mid-file on any heap-carrying `BINTABLE` and misparses everything after it. `PCOUNT` is mandatory in every extension header and carries a `BINTABLE`'s heap size. This is also the prerequisite for recognizing a tile-compressed file at all. The primary's `PCOUNT = 0`, `GCOUNT = 1` holds everywhere except under `GROUPS = T`, where §6.1.1 makes both mandatory and runs the axis product over `NAXIS2`…`NAXISn` — `NAXIS1` is fixed at 0 there, so the ordinary product is zero and the ordinary reading sizes the random-groups data unit at nothing. That position is declined, but the walk still steps over it to reach what follows, and a zero-sized step lands inside the group data |
-| **A `BINTABLE` with `ZIMAGE = T` is a declined position, not an aborted source.** `header()` reports the geometry the `Z*` keywords declare, `granularity()` reports `WholeImage`, any pixel call is `Unsupported` | Commits v1 to lexing `ZIMAGE`, `ZBITPIX`, `ZNAXIS` and `ZNAXISn` — a small contained cost, accepted so the second-pass dispatch point in § The extension path has somewhere to attach. A real tile-compressed file is the ordinary shape of this: primary `NAXIS = 0`, no image extension, one such `BINTABLE` |
+| **A `BINTABLE` with `ZIMAGE = T` is a declined position, not an aborted source.** `current_header()` reports the geometry the `Z*` keywords declare, `granularity()` reports `WholeImage`, any pixel call is `Unsupported` | Commits v1 to lexing `ZIMAGE`, `ZBITPIX`, `ZNAXIS` and `ZNAXISn` — a small contained cost, accepted so the second-pass dispatch point in § The extension path has somewhere to attach. A real tile-compressed file is the ordinary shape of this: primary `NAXIS = 0`, no image extension, one such `BINTABLE` |
 | **Signed `BITPIX` is handled entirely by the `BSCALE`/`BZERO` step**; there is no separate signed path, and the unsigned convention is not special-cased — it falls out | Its mirror image, the signed-byte convention (`BITPIX = 8`, `BZERO = -128`), is *not* the unsigned convention and so gets no normalized output; native samples decode normally and `set_bounds` covers the rest. Named because it is the one adjacent convention a reader will look for |
 | **FITS pixel data is big-endian two's-complement, always** | The format carries no attribute to read and no default to infer, so it is pinned here for the same reason XISF's little-endian default is: getting it wrong corrupts every sample silently rather than raising an error |
 | **`ROWORDER` is read into `{TopDown, BottomUp, Unspecified, Other(Arc<str>)}` and applied to nothing.** Recognition is case-insensitive and trims surrounding whitespace | `ROWORDER` is a convention, not part of FITS 4.0, so unrecognized values are expected and `Other` reports them verbatim; `Unspecified` means the keyword was absent, which is a different fact. The spelling normalization is a correctness rule, not a convenience: it is what stops the consumer's envelope predicate from admitting a flipped frame through a spelling variant |

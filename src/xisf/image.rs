@@ -65,7 +65,7 @@ pub(crate) struct BlockPlan {
 /// already `Arc`s inside `Header`.
 #[derive(Clone, Debug)]
 pub(crate) struct Occurrence {
-    /// What `Reader::header()` reports at this position.
+    /// What `Reader::current_header()` reports at this position.
     pub(crate) header: Header,
     /// How to reach the pixels; `None` at a declined position.
     pub(crate) plan: Option<BlockPlan>,

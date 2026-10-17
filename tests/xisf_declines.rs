@@ -8,8 +8,9 @@
 //! asserted explicitly.
 //!
 //! A **declined position** means all four of: construction succeeds, `next_image()` returns
-//! `Ok(true)`, `header()` reports what it can with `decline_reason()` set, and any pixel call
-//! returns `Err`. [`declined`] asserts all four at once so no row can grade three of them.
+//! `Ok(true)`, `current_header()` reports what it can with `decline_reason()` set, and any
+//! pixel call returns `Err`. [`declined`] asserts all four at once so no row can grade three of
+//! them.
 //!
 //! Fixtures are built byte by byte through `tests/common/xisf.rs`, and every class is derived
 //! from § Errors' rules rather than from a case name.
@@ -658,7 +659,8 @@ fn an_unreadable_referenced_element_declines_every_image_that_reaches_it() {
 // ------------------------------------------------------------------ the Neither row
 
 /// Row *XISF unit whose walk finds no image occurrence*: **neither** a construction failure nor
-/// a `next_image()` failure. The walk ends normally with no error and `header()` is `None`.
+/// a `next_image()` failure. The walk ends normally with no error, and `current_header()` is an
+/// error.
 ///
 /// The same answer the FITS side gives a `NAXIS = 0` primary, and deliberately so: a decoder
 /// whose two formats disagreed about "this file holds no images" is the inconsistency this

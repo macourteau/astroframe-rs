@@ -217,9 +217,9 @@ So the rule is structural rather than per-field:
   pixel call that actually raises it, which happens once — not once per occurrence.
 
 One reported text is deliberately still owned, and it is not an oversight.
-`Bounds::CallerSupplied::declared` is built by `Reader::header()` when the caller has set
-`set_bounds`, so it is one allocation per call the caller made, not one per occurrence the file
-declares; it is also a public field, which `Arc<str>` would change for no gain.
+`Bounds::CallerSupplied::declared` is built by `Reader::current_header()` when the caller has
+set `set_bounds`, so it is one allocation per call the caller made, not one per occurrence the
+file declares; it is also a public field, which `Arc<str>` would change for no gain.
 
 `RowOrder::Other` **was** the second, on the reasoning that FITS has no element reachable twice
 — a card belongs to the header it was read from. That was wrong twice over. The primary

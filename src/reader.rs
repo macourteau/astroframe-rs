@@ -563,16 +563,17 @@ impl<S: Source> Reader<S> {
     /// The current image's header, or the [`Error::InvalidRequest`] that says no image is
     /// selected.
     ///
-    /// The same value [`Reader::header`] reports, in the shape the documented loop wants:
-    /// inside `while reader.next_image()? { … }` a header always exists, and the `Option`
-    /// there is a fact about the reader before the first advance rather than about the
-    /// position.
+    /// Inside `while reader.next_image()? { … }` a header always exists: the error is a fact
+    /// about the reader before the first advance or after the last, not about the position.
     ///
     /// It reports a **declined** position like any other — the decline is on
     /// [`Header::decline_reason`], which is where a walk checks it. Only a pixel call turns
     /// that into an error.
     ///
-    /// **Fetch it after configuring the reader**, exactly as [`Reader::header`] describes.
+    /// **Fetch it after configuring the reader.** The header is an owned value describing what
+    /// the reader will produce, so one taken before [`Reader::select_channel`] still carries
+    /// the file's full channel count and sizes a buffer the narrowed reader rejects as
+    /// [`Error::InvalidRequest`].
     ///
     /// # Errors
     ///
@@ -595,19 +596,6 @@ impl<S: Source> Reader<S> {
     pub fn current_header(&self) -> Result<Header> {
         self.header_inner()
             .ok_or_else(|| Error::invalid_request("no image is selected; call next_image first"))
-    }
-
-    /// The current image's header, or `None` before the first [`Reader::next_image`].
-    ///
-    /// `None` reports a caller error — asking before an image is selected — which
-    /// [`Reader::current_header`] states as [`Error::InvalidRequest`] instead. The two
-    /// otherwise return the same value.
-    #[deprecated(
-        since = "0.2.1",
-        note = "use `current_header`, which reports \"no image is selected\" as an error rather than as `None`"
-    )]
-    pub fn header(&self) -> Option<Header> {
-        self.header_inner()
     }
 
     /// Advance to the next image, uniformly across both formats and every file layout.
@@ -1349,48 +1337,6 @@ mod tests {
     /// text verbatim, not a numeric pair re-rendered through a formatter — `1.500e+03` becomes
     /// `1500` that way, which is precisely the "re-rendering a number through a formatter can
     /// lose digits" failure § Decisions the implementer must not silently change bans for keyword values.
-    /// `header` is deprecated but still shipped, so its agreement with `current_header` is
-    /// asserted rather than assumed: the two must not drift while both exist. `Header` is not
-    /// `PartialEq`, so the comparison is over what a caller can observe.
-    #[cfg(feature = "fits")]
-    #[test]
-    #[allow(deprecated)]
-    fn the_deprecated_header_spelling_agrees_with_current_header() {
-        let mut bytes = Vec::new();
-        for text in [
-            "SIMPLE  =                    T",
-            "BITPIX  =                    8",
-            "NAXIS   =                    2",
-            "NAXIS1  =                    1",
-            "NAXIS2  =                    1",
-            "END",
-        ] {
-            let mut card = text.as_bytes().to_vec();
-            card.resize(80, b' ');
-            bytes.extend_from_slice(&card);
-        }
-        bytes.resize(2880, b' ');
-        bytes.resize(5760, 0);
-
-        let mut reader = Reader::seekable(std::io::Cursor::new(bytes)).unwrap();
-        assert!(reader.header().is_none(), "no image is selected yet");
-        assert!(
-            reader.current_header().is_err(),
-            "and the same question answered as an error rather than as a value"
-        );
-
-        assert!(reader.next_image().unwrap());
-        let old = reader
-            .header()
-            .expect("the deprecated spelling still answers");
-        let new = reader
-            .current_header()
-            .expect("and so does the current one");
-        assert_eq!(old.width(), new.width());
-        assert_eq!(old.height(), new.height());
-        assert_eq!(old.sample_format(), new.sample_format());
-    }
-
     #[cfg(feature = "xisf")]
     #[test]
     fn overriding_a_declared_bounds_preserves_the_files_verbatim_text() {
