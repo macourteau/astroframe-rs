@@ -224,7 +224,7 @@ pub fn walk_headers(data: &[u8]) {
             Ok(true) => {}
             Ok(false) | Err(_) => return,
         }
-        let _ = reader.header();
+        let _ = reader.current_header();
         advances += 1;
     }
 }
