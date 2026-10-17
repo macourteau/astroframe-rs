@@ -156,19 +156,31 @@ impl<R: Read> sealed::Sealed for Sequential<R> {
 }
 
 /// Skipping is a seek; block order does not matter, and the length is known.
+///
+/// The source begins where the stream's cursor stood at construction, as a sequential one
+/// does, so a frame that is a member of a larger stream is read in its own coordinates.
+/// `pos` and `len` are measured from `origin`, and only `seek_to` translates back to the
+/// stream's own offsets.
 #[derive(Debug)]
 pub struct Seekable<R> {
     inner: R,
+    origin: u64,
     pos: u64,
     len: u64,
 }
 
 impl<R: Read + Seek> Seekable<R> {
     pub(crate) fn new(mut inner: R) -> Result<Self> {
-        let pos = inner.stream_position()?;
-        let len = inner.seek(SeekFrom::End(0))?;
-        inner.seek(SeekFrom::Start(pos))?;
-        Ok(Seekable { inner, pos, len })
+        let origin = inner.stream_position()?;
+        let end = inner.seek(SeekFrom::End(0))?;
+        inner.seek(SeekFrom::Start(origin))?;
+        Ok(Seekable {
+            inner,
+            origin,
+            pos: 0,
+            // A cursor parked past the end leaves nothing to read, not a negative length.
+            len: end.saturating_sub(origin),
+        })
     }
 }
 
@@ -213,8 +225,18 @@ impl<R: Read + Seek> sealed::Sealed for Seekable<R> {
         if pos == self.pos {
             return Ok(());
         }
+        // `pos` derives from offsets the file declares, so the translation to the stream's own
+        // offsets is checked like the rest of the size arithmetic rather than resting on each
+        // caller's earlier bound.
+        let target = self.origin.checked_add(pos).ok_or_else(|| {
+            Error::malformed(format!(
+                "offset {pos} from a source that begins at stream offset {} overflows the \
+                 stream's address space",
+                self.origin
+            ))
+        })?;
         // The cap bounds a read, not a seek: nothing is transferred here.
-        self.inner.seek(SeekFrom::Start(pos))?;
+        self.inner.seek(SeekFrom::Start(target))?;
         self.pos = pos;
         Ok(())
     }

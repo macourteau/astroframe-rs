@@ -1059,6 +1059,77 @@ fn every_source_mode_decodes_the_same_bits() {
     }
 }
 
+/// A stream whose first `filler` bytes are not part of the frame, with the cursor parked on the
+/// frame's first byte — a member of a larger buffer, or a source a caller has read a prefix of.
+///
+/// The filler is longer than any fixture's header and is not a plausible sample, so an offset
+/// resolved from the stream's start lands inside it and decodes as something visibly wrong
+/// rather than tripping a bound.
+fn mid_stream(frame: &[u8]) -> Cursor<Vec<u8>> {
+    let filler = 4096;
+    let mut stream = vec![0xEE; filler];
+    stream.extend_from_slice(frame);
+    let mut cursor = Cursor::new(stream);
+    cursor.set_position(filler as u64);
+    cursor
+}
+
+/// A source begins where its `Reader` is built, in both source modes, so every offset a frame
+/// declares is measured from there. Measured from the stream's start instead, an XISF
+/// attachment position lands in whatever precedes the frame, and those bytes decode as pixels
+/// with `Ok`.
+#[test]
+fn a_frame_mid_stream_decodes_the_same_bits_in_every_source_mode() {
+    let data = levels(32);
+    for (what, bytes) in [
+        ("FITS", fits_unsigned_u16(8, 4, 1, &data)),
+        ("XISF", xisf_uncompressed(8, 4, 1, &data)),
+    ] {
+        let at_zero = decode_first(&bytes);
+
+        let mut reader = Reader::seekable(mid_stream(&bytes)).expect("construct mid-stream");
+        let header = first_image(&mut reader);
+        let seekable = whole_buffer(&mut reader, expected_len(&header));
+
+        let mut reader = Reader::sequential(mid_stream(&bytes)).expect("construct mid-stream");
+        let header = first_image(&mut reader);
+        let sequential = whole_buffer(&mut reader, expected_len(&header));
+
+        assert_same_bits(&seekable, &at_zero, &format!("{what}: seekable mid-stream"));
+        assert_same_bits(
+            &sequential,
+            &at_zero,
+            &format!("{what}: sequential mid-stream"),
+        );
+    }
+}
+
+/// The length a seekable source checks geometry against is the length from where its `Reader`
+/// was built. A frame cut short mid-stream fails exactly as the same cut frame does at offset
+/// 0, reason text included — the bytes in front of it do not make up the shortfall.
+#[test]
+fn a_truncated_frame_mid_stream_fails_as_it_does_at_offset_zero() {
+    let data = levels(32);
+    let fits = fits_unsigned_u16(8, 4, 1, &data);
+    // The 64-byte data unit opens the last 2880-byte block; cut its final two bytes.
+    let fits_cut = fits.len() - 2880 + 64 - 2;
+    let xisf = xisf_uncompressed(8, 4, 1, &data);
+    // The attachment is the unit's last bytes.
+    let xisf_cut = xisf.len() - 2;
+    for (what, frame) in [("FITS", &fits[..fits_cut]), ("XISF", &xisf[..xisf_cut])] {
+        let refused = |mut reader: Reader<astroframe::Seekable<Cursor<Vec<u8>>>>| {
+            let header = first_image(&mut reader);
+            reader
+                .read_image_into(&mut vec![0.0; expected_len(&header)])
+                .expect_err("the cut frame decodes nothing")
+        };
+        let at_zero = refused(Reader::seekable(Cursor::new(frame.to_vec())).expect("construct"));
+        let mid = refused(Reader::seekable(mid_stream(frame)).expect("construct mid-stream"));
+        assert_eq!(kind(&at_zero), "Malformed", "{what}: {at_zero}");
+        assert_eq!(mid.to_string(), at_zero.to_string(), "{what}");
+    }
+}
+
 /// Criterion *Multi-image and source-mode behaviour*, reset half.
 ///
 /// The reset has to change the decoded **pixels**, not merely the reported header: carrying an
