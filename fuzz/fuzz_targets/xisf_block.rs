@@ -18,7 +18,9 @@ fuzz_target!(|input: (&[u8], &[u8])| {
     let run = start_counting();
     if let Ok(mut reader) = Reader::seekable_with_limits(std::io::Cursor::new(&unit), limits()) {
         while matches!(reader.next_image(), Ok(true)) {
-            let Some(h) = reader.header() else { break };
+            let Ok(h) = reader.current_header() else {
+                break;
+            };
             let (Some(w), Some(ht), Some(c), Some(f)) =
                 (h.width(), h.height(), h.channels(), h.sample_format())
             else {

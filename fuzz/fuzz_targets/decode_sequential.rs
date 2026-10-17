@@ -31,7 +31,9 @@ fuzz_target!(|data: &[u8]| {
     let source = Forward { data, at: 0 };
     if let Ok(mut reader) = Reader::sequential_with_limits(source, limits()) {
         while matches!(reader.next_image(), Ok(true)) {
-            let Some(h) = reader.header() else { break };
+            let Ok(h) = reader.current_header() else {
+                break;
+            };
             let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) else {
                 continue;
             };
