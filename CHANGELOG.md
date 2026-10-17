@@ -16,6 +16,57 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.3.0] — 2026-10-17
+
+**Decoded output moves, for one shape only:** an XISF unit with an attached block, read through
+`Reader::seekable` from a cursor that is not at offset 0. Such a unit decoded the bytes in front
+of it as its pixels; it decodes its own. That shape is pinned by two regression tests that failed
+before the fix. Every other input decodes the same bits, and every comparison that would show
+movement agrees: the exhaustive `tests/normalization.rs`, the XISF-against-FITS differential over
+the `xisf_variants` set, and `corpus_native_samples_match_fitsrs`, which grades native samples
+against an independent decoder. The corpus is read from offset 0, the shape that does not move,
+and both differentials grade against references outside this crate, so agreement there is
+agreement with what 0.2.3 produced.
+
+The corpus sweep reads 1566 files: 1446 decode and 120 decline, every decline a tile-compressed
+image this version states it refuses. The 120 `fpack_variants` are each a clean `Unsupported`,
+the masters walk their images, 66 files agree across the open, sequential and seekable entry
+points, and the 1080 XISF variants agree with the 6 FITS frames they came from within the stated
+tolerances. Peak resident memory was measured on Linux rather than skipped: 40 KiB above baseline
+for a 25 MP FITS against the 25 MiB allowed, and 8.4 MiB for a compressed XISF against 26.8 MiB,
+both as in 0.2.3. The second is the maximum over repeated runs: the test samples every 2 ms and
+can miss the decode's short-lived scratch buffer, reading about 80 KiB instead, at 0.2.3 as here.
+
+Minor rather than patch on two counts, either of which would be enough: the fix moves decoded
+output for an input a previous release decoded, and the deprecated `Reader::header` reaches its
+removal line.
+
+### Breaking
+
+- **`Reader::header` is removed**, as its 0.2.1 deprecation stated. `Reader::current_header`
+  returns the same header, and reports asking before the first `next_image`, or after the walk
+  ends, as `Error::InvalidRequest` rather than `None`. Where an `Option` is still wanted,
+  `reader.current_header().ok()` is the same value; inside the documented
+  `while reader.next_image()? { … }` loop, `?` is.
+
+### Fixed
+
+- **A seekable source begins where its `Reader` is built.** `Reader::seekable` measured
+  positions from the underlying stream's first byte, while `Reader::sequential` counts from the
+  cursor it is handed. For a frame that is one member of a larger stream — a container member,
+  or a source the caller has read a prefix of — an XISF attachment position, which is an offset
+  within the unit, was read from that offset of the stream: whatever preceded the unit decoded
+  as pixels, with `Ok`, past both the header-region rule and the length cross-check. Both source
+  modes measure positions and the length from the construction cursor. **This moves decoded
+  output** for that shape. `Reader::open` and a fresh `Cursor` start at offset 0 and are
+  unaffected. FITS decodes the same bits from any origin; its error text reports offsets from the
+  frame's start rather than the stream's.
+
+### Added
+
+- **`SECURITY.md`.** Vulnerabilities go to `security@macourteau.dev`, and the threat model the
+  crate is reviewed against is linked from it.
+
 ## [0.2.3] — 2026-09-17
 
 Decoded output does not move. No change in this release touches the normalization primitive or
@@ -222,6 +273,8 @@ documented cap, a frame the crate cannot decode under its stated rules is an err
 best guess, and a position this version does not handle is *declined* with a class and a reason
 while the walk continues.
 
+[0.3.0]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.3.0
+[0.2.3]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.3
 [0.2.2]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.2
 [0.2.1]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.1
 [0.2.0]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.0
