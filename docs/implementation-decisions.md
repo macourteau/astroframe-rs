@@ -259,6 +259,24 @@ unsizable, where the size formula previously stepped over it by starting the axi
 table had already refused. §6.1.1 makes `NAXIS1` mandatory and fixes it at 0, so a conforming
 random-groups header is unaffected.
 
+### A source begins where its `Reader` is built
+
+§ Sources has XISF locate attached blocks "by absolute file offset" and does not say where the
+file begins when the cursor a caller hands over is not at the stream's first byte — a frame that
+is one member of a larger buffer, or a source the caller has read a prefix of. Both source modes
+answer the same way: the source begins at that cursor. Every position the file declares — an
+XISF attachment, a FITS data unit and its rows — is measured from there, and so is the length
+the geometry cross-check compares against. A frame mid-stream decodes exactly as it would alone,
+error text included (`pipeline::a_frame_mid_stream_decodes_the_same_bits_in_every_source_mode`,
+`pipeline::a_truncated_frame_mid_stream_fails_as_it_does_at_offset_zero`).
+
+Measuring from the stream's first byte instead is not a neutral alternative. A unit's attachment
+positions are offsets within the unit, so resolved against the stream they land in whatever
+precedes it, and those bytes decode as pixels with `Ok` — past the header-region rule, which
+compares positions the file declares, and past the length cross-check, which would be lenient
+by exactly the bytes in front. Refusing a cursor that is not at 0 would lock out the container
+case a sequential source has always handled.
+
 ## Dependency policy: one reviewed exception
 
 § Dependencies of the design assumes the runtime graph is clean of the banned numeric helpers.

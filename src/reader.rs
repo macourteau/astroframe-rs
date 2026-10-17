@@ -345,6 +345,10 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
     /// separate constructor exists, because a `Cursor` already is a seekable source and a
     /// third entry point would only be an alias.
     ///
+    /// **The source begins at the cursor's current position**, as a sequential one does: every
+    /// offset the file declares is measured from there, so a frame that is one member of a
+    /// larger stream decodes as it would alone.
+    ///
     /// **Buffer a source that is not already in memory.** Only [`Reader::open`] wraps what it
     /// is given in a [`std::io::BufReader`]; a bare [`std::fs::File`] handed here pays one
     /// syscall per 2880-byte FITS header block and one per pixel row. A `Cursor` needs none.
