@@ -16,6 +16,56 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.3.1] — 2026-10-18
+
+**Decoded output does not move.** No change in this release touches the normalization primitive
+or any sample path: the fix changes only the class of error a failing source is reported with,
+and the rest adds an options type and deprecates three constructors. Compared: the full suite
+under `--all-features` and under `fits,xisf`, and the corpus. The sweep reads 1566 files: 1446
+decode and 120 decline, every decline the tile-compressed image 0.3.0 declines. The 120
+`fpack_variants` are each a clean `Unsupported`, the masters walk their images, 66 files agree
+across the open, sequential and seekable entry points, the XISF variants agree with the FITS
+frames they came from, and `corpus_native_samples_match_fitsrs` agrees with the independent
+decoder. Every example ran clean over 32 corpus frames. Peak resident memory, measured on Linux:
+40 KiB above baseline for a 25 MP FITS against the 25 MiB allowed, and 8.4 MiB for a compressed
+XISF against 26.8 MiB, the maximum over ten runs — both as in 0.3.0.
+
+### Fixed
+
+- **A source failing mid-block is reported in its own class.** The zlib, zstd and
+  LZ4-by-subblocks paths pull the source through the codec, which turned a failed read into its
+  own complaint about its input: a broken pipe partway through a compressed block came out
+  `Error::Malformed`, so a batch loop following § Errors skipped the frame and walked on into a
+  source that had already failed. It is `Error::Io` carrying the source's own `std::io::Error`,
+  kind and text intact, as uncompressed rows, materialized blocks and FITS already reported it.
+  A seek inside the block that the source refuses keeps that class too. A truncated block is
+  still `Malformed`.
+
+### Added
+
+- **`DecodeOptions`**, everything a `Reader` is told at construction, in one `Copy`,
+  `#[non_exhaustive]` value. It carries the `Limits`, is built from `DecodeOptions::default()`
+  or `From<Limits>` and chained through `with_limits`, and is finished by its source in the
+  manner of `std::fs::OpenOptions`: `options.open(path)`, `options.sequential(source)`,
+  `options.seekable(source)`. The finishers take `&self`, so one value serves a batch.
+  `Reader::options` reports what is in force. `Limits` derives `Hash`.
+
+### Changed
+
+- **`Reader::open_with_limits`, `Reader::sequential_with_limits` and
+  `Reader::seekable_with_limits` are deprecated** in favour of
+  `DecodeOptions::from(limits).open(path)` and its two siblings. Each is a one-line wrapper over
+  the finisher, so the spellings cannot disagree while both ship, and a test asserts they apply
+  the same options. They are removed at 0.4, which `tests/deprecations.rs` enforces.
+
+### Documentation
+
+- The design document's dispatch passage stated that the specification says nothing about
+  byte-level framing and never mentions `zstd`. Revision 1 fixes all three container shapes —
+  the zlib format, the LZ4 block format without frame headers, and one Zstandard frame per
+  subblock — and the passage cites them, keeping the attachment bytes as corroboration. Its
+  `item-size` row gains `zstd+sh` beside the other three shuffled codecs.
+
 ## [0.3.0] — 2026-10-17
 
 **Decoded output moves, for one shape only:** an XISF unit with an attached block, read through
