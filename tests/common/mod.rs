@@ -397,6 +397,10 @@ impl<R: std::io::Seek> std::io::Seek for CountingRead<R> {
 }
 
 /// A source whose reads fail after `ok_bytes`, for the `Io` classification case.
+///
+/// The failure is a broken pipe rather than `io::Error::other`, so a test can assert that the
+/// caller's own [`std::io::ErrorKind`] reaches it unchanged: `Other` is also what a
+/// relabelling wrapper produces, and would let one pass.
 pub struct FailingRead {
     pub data: Vec<u8>,
     pub pos: usize,
@@ -406,7 +410,10 @@ pub struct FailingRead {
 impl std::io::Read for FailingRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.ok_bytes {
-            return Err(std::io::Error::other("simulated device failure"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated device failure",
+            ));
         }
         let n = buf
             .len()

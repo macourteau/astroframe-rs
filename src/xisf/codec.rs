@@ -305,6 +305,13 @@ pub(crate) fn decode_text(text: &str, encoding: crate::xisf::block::Encoding) ->
 /// A reader that borrows the source for the duration of the call cannot be starved. It returns
 /// zero exactly where the block ends, which is the one place a codec is right to conclude the
 /// stream is over.
+///
+/// **A failed read keeps the source's error, and the caller reports that one.** The codec sees
+/// only an `io::Error`, and what it hands back is its own complaint about its input: a broken
+/// pipe mid-block comes out as "zlib block does not decompress", which § Errors would class as
+/// a damaged file — skip and walk on — when the move a failing source calls for is abort.
+/// Neither the codec's error nor the `io::ErrorKind` can tell the two apart, so the reader
+/// records what the source raised and [`BlockReader::failure_or`] puts it back.
 struct BlockReader<'a, S: Source> {
     src: &'a mut S,
     limits: &'a Limits,
@@ -312,6 +319,33 @@ struct BlockReader<'a, S: Source> {
     left: &'a mut u64,
     /// Where the next of them sits in the file.
     at: &'a mut u64,
+    /// The source's own error, when a read failed because the source did.
+    failure: Option<Error>,
+}
+
+impl<'a, S: Source> BlockReader<'a, S> {
+    fn new(src: &'a mut S, limits: &'a Limits, left: &'a mut u64, at: &'a mut u64) -> Self {
+        BlockReader {
+            src,
+            limits,
+            left,
+            at,
+            failure: None,
+        }
+    }
+
+    /// The error to report for a codec failure: the source's, when a read through this reader
+    /// failed, since that is what the codec was reacting to, and `codec_error` otherwise.
+    fn failure_or(&mut self, codec_error: Error) -> Error {
+        self.failure.take().unwrap_or(codec_error)
+    }
+
+    fn read_source(&mut self, out: &mut [u8]) -> Result<()> {
+        if self.src.position() != *self.at {
+            self.src.seek_to(*self.at, self.limits)?;
+        }
+        self.src.read_exact(out)
+    }
 }
 
 impl<S: Source> Read for BlockReader<'_, S> {
@@ -320,14 +354,12 @@ impl<S: Source> Read for BlockReader<'_, S> {
             return Ok(0);
         }
         let want = (*self.left).min(out.len() as u64) as usize;
-        if self.src.position() != *self.at {
-            self.src
-                .seek_to(*self.at, self.limits)
-                .map_err(std::io::Error::other)?;
+        if let Err(e) = self.read_source(&mut out[..want]) {
+            // The text the codec wraps; the error itself is what `failure_or` returns.
+            let relayed = std::io::Error::other(e.to_string());
+            self.failure = Some(e);
+            return Err(relayed);
         }
-        self.src
-            .read_exact(&mut out[..want])
-            .map_err(std::io::Error::other)?;
         *self.left -= want as u64;
         *self.at += want as u64;
         Ok(want)
@@ -466,18 +498,13 @@ impl Stream {
                 z.fd.set_max_window_size(limits.zstd_window_bytes);
                 z.pending = Vec::new();
                 z.at = 0;
-                let reader = BlockReader {
-                    src,
-                    limits,
-                    left,
-                    at,
-                };
+                let mut reader = BlockReader::new(src, limits, left, at);
                 // A zstd decoder allocates the window the frame header declares before
                 // producing a byte -- the precise shape of an allocation sized from an
                 // unvalidated declared size -- so the cap is enforced here, before the
                 // allocation, and a trip is LimitExceeded like any other cap.
-                z.fd.reset(reader)
-                    .map_err(|e| zstd_header_error(e, limits))?;
+                z.fd.reset(&mut reader)
+                    .map_err(|e| reader.failure_or(zstd_header_error(e, limits)))?;
                 *self = Stream::Zstd(z);
                 Ok(())
             }
@@ -492,14 +519,11 @@ impl Stream {
                 let compressed_len = check_materialized(*left, limits, "an LZ4 subblock's stored")?;
                 let out_len = check_materialized(uncompressed, limits, "an LZ4 subblock's")?;
                 let mut stored = vec![0u8; compressed_len];
-                let mut reader = BlockReader {
-                    src,
-                    limits,
-                    left,
-                    at,
-                };
+                let mut reader = BlockReader::new(src, limits, left, at);
                 reader.read_exact(&mut stored).map_err(|e| {
-                    Error::malformed(format!("LZ4 subblock's stored bytes are unreadable: {e}"))
+                    reader.failure_or(Error::malformed(format!(
+                        "LZ4 subblock's stored bytes are unreadable: {e}"
+                    )))
                 })?;
                 let mut buf = vec![0u8; out_len];
                 decompress_lz4(&stored, &mut buf)?;
@@ -632,15 +656,10 @@ impl ZlibState {
         let mut filled = 0usize;
         while filled < out.len() {
             if self.at >= self.end {
-                let mut reader = BlockReader {
-                    src,
-                    limits,
-                    left,
-                    at,
-                };
-                let got = reader
-                    .read(&mut self.buf)
-                    .map_err(|e| Error::malformed(format!("reading a compressed block: {e}")))?;
+                let mut reader = BlockReader::new(src, limits, left, at);
+                let got = reader.read(&mut self.buf).map_err(|e| {
+                    reader.failure_or(Error::malformed(format!("reading a compressed block: {e}")))
+                })?;
                 self.at = 0;
                 self.end = got;
             }
@@ -715,18 +734,17 @@ impl ZstdState {
             // last bytes sit inside that window. Reading zero is how the decoder learns the
             // frame ended, and finishing is what releases the retained bytes.
             let want = out.len() - filled;
-            let reader = BlockReader {
-                src,
-                limits,
-                left,
-                at,
-            };
+            let mut reader = BlockReader::new(src, limits, left, at);
             self.fd
                 .decode_blocks(
-                    reader,
+                    &mut reader,
                     ruzstd::decoding::BlockDecodingStrategy::UptoBytes(want),
                 )
-                .map_err(|e| Error::malformed(format!("zstd block does not decompress: {e}")))?;
+                .map_err(|e| {
+                    reader.failure_or(Error::malformed(format!(
+                        "zstd block does not decompress: {e}"
+                    )))
+                })?;
 
             match self.fd.collect() {
                 Some(v) if !v.is_empty() => {

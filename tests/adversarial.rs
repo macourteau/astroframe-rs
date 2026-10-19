@@ -1353,3 +1353,130 @@ fn a_row_offset_past_u64_is_refused_rather_than_computed() {
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert_names("row offset above u64", &err, "row offset");
 }
+
+// ------------------------------------------------------- the source failing mid-block
+
+/// Assert `err` is the source's own failure: `Io`, carrying the [`FailingRead`] error with its
+/// kind and text intact. A broken pipe reported as a damaged file tells a batch loop to skip
+/// the frame and walk on into a source that has already failed.
+fn assert_source_failure(what: &str, err: &Error) {
+    let Error::Io(io) = err else {
+        panic!("{what}: expected Io, got {}: {err}", kind(err));
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe, "{what}: {io}");
+    assert!(
+        io.to_string().contains("simulated device failure"),
+        "{what}: the source's own error, not a rewording of it: {io}"
+    );
+}
+
+/// Decode the one image `bytes` holds from a sequential source that fails `into` bytes past
+/// the first stored byte of its attached block, and return the pixel call's error.
+///
+/// The builder appends the attachment last, so the block starts `stored_len` from the end.
+fn fails_mid_block(bytes: Vec<u8>, stored_len: usize, into: usize) -> Error {
+    assert!(into < stored_len, "the failure lands inside the block");
+    let start = bytes.len() - stored_len;
+    let mut reader = Reader::sequential(FailingRead {
+        data: bytes,
+        pos: 0,
+        ok_bytes: start + into,
+    })
+    .expect("the header region reads");
+    assert!(reader.next_image().expect("the position is reached"));
+    match reader.read_image() {
+        Ok(_) => panic!("the source fails mid-block, so the decode must not succeed"),
+        Err(e) => e,
+    }
+}
+
+/// An 8 × 8 `UInt16` image over `stored`, with `attrs` on the `<Image>`.
+fn image_8x8(attrs: &str, stored: Vec<u8>) -> Vec<u8> {
+    Unit::new()
+        .attached(
+            &format!(r#"<Image geometry="8:8:1" sampleFormat="UInt16" {attrs} {{loc}}/>"#),
+            stored,
+        )
+        .build()
+}
+
+/// The 64 samples every case below stores, as plain little-endian bytes.
+fn plain_8x8() -> Vec<u8> {
+    le_u16(&repeating_u16(64))
+}
+
+/// One case: the source fails halfway through the stored block.
+fn fails_halfway(what: &str, attrs: &str, stored: Vec<u8>) {
+    let len = stored.len();
+    let err = fails_mid_block(image_8x8(attrs, stored), len, len / 2);
+    assert_source_failure(what, &err);
+}
+
+/// Every path a pixel decode reads the source through reports the source's failure as `Io`,
+/// one test per path. The codec paths read through an adapter the codec drives, and a source
+/// error crossing it must arrive as itself rather than as the codec's complaint about its
+/// input. Rows straight from the source are the baseline.
+#[test]
+fn a_source_failing_mid_block_is_io_uncompressed() {
+    fails_halfway("uncompressed, streamed", "", plain_8x8());
+}
+
+/// zlib streams, the codec pulling stored bytes as it asks for them.
+#[test]
+fn a_source_failing_mid_block_is_io_zlib() {
+    let plain = plain_8x8();
+    let attrs = format!(r#"compression="zlib:{}""#, plain.len());
+    fails_halfway("zlib, streamed", &attrs, zlib(&plain));
+}
+
+/// zstd streams likewise, and its reads cross the codec's own error type on the way back.
+#[test]
+fn a_source_failing_mid_block_is_io_zstd() {
+    let plain = plain_8x8();
+    let attrs = format!(r#"compression="zstd:{}""#, plain.len());
+    let stored = common::xisf::zstd_raw(&plain);
+    fails_halfway("zstd, streamed", &attrs, stored.clone());
+
+    // Inside the frame header, which `Stream::open` parses before the first row.
+    let len = stored.len();
+    let err = fails_mid_block(image_8x8(&attrs, stored), len, 2);
+    assert_source_failure("zstd, the frame header", &err);
+}
+
+/// A byte-shuffled block is materialized whole before it decodes.
+#[test]
+fn a_source_failing_mid_block_is_io_shuffled() {
+    let plain = plain_8x8();
+    let attrs = format!(r#"compression="zlib+sh:{}:2""#, plain.len());
+    fails_halfway("zlib+sh, materialized", &attrs, zlib(&shuffle(&plain, 2)));
+}
+
+/// LZ4 split by `subblocks` holds one subblock whole at a time. The failure lands in the
+/// second, so the first has already been read and decoded through the same adapter.
+#[test]
+fn a_source_failing_mid_block_is_io_lz4_subblocks() {
+    let plain = plain_8x8();
+    let (a, b) = plain.split_at(plain.len() / 2);
+    let (ca, cb) = (lz4(a), lz4(b));
+    let subblocks = format!("{},{}:{},{}", ca.len(), a.len(), cb.len(), b.len());
+    let mut stored = ca.clone();
+    stored.extend_from_slice(&cb);
+    let len = stored.len();
+    let attrs = format!(
+        r#"compression="lz4:{}" subblocks="{subblocks}""#,
+        plain.len()
+    );
+    let err = fails_mid_block(image_8x8(&attrs, stored), len, ca.len() + cb.len() / 2);
+    assert_source_failure("LZ4 by subblocks, the held subblock", &err);
+}
+
+/// A checksummed block is materialized for verification, the other path that holds a block
+/// whole, and the source failing inside it is `Io` rather than a digest mismatch or a
+/// truncation.
+#[cfg(feature = "checksum")]
+#[test]
+fn a_source_failing_mid_block_is_io_checksummed() {
+    let plain = plain_8x8();
+    let attrs = checksum_attr("sha-256", &plain);
+    fails_halfway("checksummed, materialized", &attrs, plain);
+}
