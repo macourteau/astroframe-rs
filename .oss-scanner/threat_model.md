@@ -62,7 +62,11 @@ finding is strongest when it falsifies one of these:
   geometry is `Malformed` before any allocation. Every compressed subblock inflates to exactly its
   declared length and then requires end of stream — XISF Revision 2's per-subblock *shall*
   (§10.6.1), on both subblock walks and including pairs owed no bytes after the last row; a pair
-  whose two lengths differ is compressed, `c > u` included. A pair whose lengths are equal is an
+  whose two lengths differ is compressed, `c > u` included. The streaming walk checks the pairs a
+  decode reads: a planar `select_channel` decode deliberately stops at the selected channel's last
+  row and never opens the pairs after it (§ Hardening; `next_chunk` in `src/xisf/decoder.rs`), so
+  a bad trailing pair there is `Ok` attached and `Malformed` embedded or checksummed. That is
+  documented behaviour, not a finding. A pair whose lengths are equal is an
   uncompressed subblock and is copied from the stored bytes, never handed to a codec, so its
   length is exact by construction. The zstd window is checked before it is allocated. The XML header is read in 64 KiB chunks under its cap, never pre-sized.
 - **Allocation proportional to input.** The fuzz oracle (`fuzz/src/lib.rs`, § Fuzzing) bounds

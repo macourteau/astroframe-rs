@@ -1946,8 +1946,10 @@ fn granularity_is_the_worst_floor_not_the_first() {
             Streams::Rows,
         ),
         (
-            // `Block` is reachable *only* this way: zlib and zstd already stream by rows, and
-            // shuffling or a checksum forces `WholeImage`.
+            // Under the default reading `Block` is reachable *only* this way: zlib and zstd
+            // already stream by rows, and shuffling or a checksum forces `WholeImage`.
+            // `TryDecompress` adds a split zlib or zstd block holding an equal-length subblock,
+            // graded in `tests/uncompressed_subblocks.rs`.
             "lz4 + subblocks, no shuffling, no checksum",
             attached_u16(
                 &format!(r#"compression="lz4:{size}" subblocks="{lz4_list}""#),

@@ -242,10 +242,12 @@ impl Codecs {
 /// error at all — it falls back to its stored bytes — and a subblock list holds up to
 /// `Subblock count` of them. A message formatted per refusal, or a codec error boxed into an
 /// `io::Error` to pass through a `Read` adapter, is a per-occurrence allocation multiplied by
-/// a cap (`docs/intentional-patterns.md`), paid on every refusal and thrown away. Measured
-/// that way, a zlib block alternating uncompressed and compressed subblocks under
-/// `TryDecompress` allocated 2.32× as much split 4096 ways as split 8 — 306 458 bytes to
-/// 711 104 — where `tests/peak_memory.rs` allows 2×, against a flat 1.00× without it.
+/// a cap (`docs/intentional-patterns.md`), paid on every refusal and thrown away. Measured on
+/// a zlib block alternating uncompressed and compressed subblocks under `TryDecompress`, split
+/// 8 ways and then 4096: the message and the box together took the streaming decode from
+/// 306 458 bytes to 711 104, 2.32×, and the message alone to 1.43× — under the 2× each shape in
+/// `tests/peak_memory.rs` asserts, which is why that file also asserts what the option costs
+/// over the default on the same block, which a refusal allocating anything at all exceeds.
 enum Fault {
     /// The stored bytes are not a stream of the declared codec that ends after exactly the
     /// subblock's uncompressed length. `Malformed` when reported, and the one failure a

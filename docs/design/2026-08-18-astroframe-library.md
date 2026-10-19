@@ -1002,8 +1002,10 @@ having never supported the codec.
 
 Two mitigations are real and are taken. XISF's `subblocks` attribute (§10.6) splits a
 block into independently-read pieces, which restores block-granularity streaming
-to LZ4 files that use it — `Block` granularity is reachable *only* that way, since `zlib`
-and `zstd` already stream by rows and shuffling or a checksum forces `WholeImage`. No
+to LZ4 files that use it — under the default reading `Block` granularity is reachable *only*
+that way, since `zlib` and `zstd` already stream by rows and shuffling or a checksum forces
+`WholeImage`; `EqualLengthSubblocks::TryDecompress` adds the one other route, a split `zlib`
+or `zstd` block holding a subblock of equal lengths, held for its attempt. No
 frame a production writer emits at ordinary sizes uses `subblocks` — the writer splits
 only above the codec's own multi-GB input ceiling — so that row is graded by hand-built
 fixtures and by 79 corpus frames assembled around streams the writer's own compressor
@@ -1539,7 +1541,14 @@ XISF Revision 2's own *shall* (§10.6.1): every compressed subblock — every pa
 lengths differ, `c > u` included — decompresses to exactly its declared `u` bytes and the
 codec must end there, or the block is `Malformed`, on whichever walk reads it and including
 pairs owed no bytes after the last row. An uncompressed subblock is copied, and is exactly as
-long as it says by construction.
+long as it says by construction. **One exemption is deliberate:** the streaming walk checks the
+pairs a decode reads, and a `select_channel` decode of a `Planar` block stops at the last row of
+the channel it selected, so the pairs holding later channels — and any owed no bytes after them
+— are never opened. A trailing pair that is not a stream decodes `Ok` attached under such a
+decode and is `Malformed` embedded or checksummed, where the materializing walk reads the whole
+block; the rows a selection never asks for are not evidence of anything, and reading them to
+grade them would undo what the selection is for (`next_chunk`'s end-of-decode gate in
+`src/xisf/decoder.rs`).
 
 The one deliberate exception to the rule is the XML header itself, which has no geometry
 to be checked against. It is read **incrementally up to its cap** rather than pre-allocated

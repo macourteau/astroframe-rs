@@ -82,17 +82,52 @@ fn peak_decode_memory_meets_the_stated_target() {
     a_held_subblock_is_one_subblock_and_not_the_image();
     // Both framed codecs, because each carries a codec state of its own across the split; and
     // each again with every other subblock uncompressed, under both readings of one.
-    for split in [
-        Split::Compressed,
-        Split::RawEveryOther(Strict),
-        Split::RawEveryOther(Try),
-    ] {
-        a_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib, split);
-        a_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw, split);
-        // And both again on the materializing path, which is a second walk over the same split.
-        a_materialized_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib, split);
-        a_materialized_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw, split);
+    type Compress = dyn Fn(&[u8]) -> Vec<u8>;
+    type Shape = fn(&str, &Compress, Split) -> (usize, usize);
+    let codecs: [(&str, &Compress); 2] = [("zlib", &zlib), ("zstd", &zstd_raw)];
+    let paths: [(&str, Shape); 2] = [
+        ("streaming", a_subblock_costs_the_subblock_and_not_the_cap),
+        // The materializing path, which is a second walk over the same split.
+        (
+            "materialized",
+            a_materialized_subblock_costs_the_subblock_and_not_the_cap,
+        ),
+    ];
+    for (path, shape) in paths {
+        for (codec, compress) in codecs {
+            shape(codec, compress, Split::Compressed);
+            let strict = shape(codec, compress, Split::RawEveryOther(Strict));
+            let attempted = shape(codec, compress, Split::RawEveryOther(Try));
+            the_attempts_cost_nothing_per_refusal(path, codec, strict, attempted);
+        }
     }
+}
+
+/// What `TryDecompress` adds over the default on the same block must not grow with the split.
+///
+/// The 2× bound in each shape is too loose to see a failed attempt that allocates a little:
+/// formatting a refusal's message alone, with no `io::Error` box beside it, took the streaming
+/// zlib shape to 1.43× and the materialized one from 1.13× to 1.43× — both under 2×. The
+/// difference between the two readings is exact instead. Under the option every uncompressed
+/// subblock is held, stored and decompressed, which costs the same bytes however the block is
+/// split; a refused attempt costs nothing. So the extra allocation at 4096 subblocks may exceed
+/// the extra at 8 by less than one byte per subblock, and a per-refusal allocation of any size
+/// is over it 2048 times.
+fn the_attempts_cost_nothing_per_refusal(
+    path: &str,
+    codec: &str,
+    (strict_narrow, strict_wide): (usize, usize),
+    (try_narrow, try_wide): (usize, usize),
+) {
+    let narrow = try_narrow.saturating_sub(strict_narrow);
+    let wide = try_wide.saturating_sub(strict_wide);
+    let allowed = narrow + 4096;
+    assert!(
+        wide <= allowed,
+        "on the {path} {codec} shape, TryDecompress cost {narrow} bytes over the default split 8 \
+         ways and {wide} split 4096 ways, above the {allowed} one byte per subblock allows. A \
+         refused attempt that allocates — a formatted message, a boxed io::Error — lands here."
+    );
 }
 
 use EqualLengthSubblocks::{TryDecompress as Try, Uncompressed as Strict};
@@ -233,8 +268,9 @@ fn compressed_xisf_row() {
     );
 }
 
-/// The `lz4` **+ `subblocks`** row, which is the only way `Block` granularity is reachable at
-/// all: LZ4 has no framing, so the split is what makes anything smaller than the whole block
+/// The `lz4` **+ `subblocks`** row, which under the default reading is the only way `Block`
+/// granularity is reachable at all — `a_held_subblock_is_one_subblock_and_not_the_image` is the
+/// other, under `EqualLengthSubblocks::TryDecompress`. LZ4 has no framing, so the split is what makes anything smaller than the whole block
 /// decodable, and § Streaming puts this row's peak at *one subblock, compressed and
 /// decompressed* rather than the whole image.
 ///
@@ -391,7 +427,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(
     codec: &str,
     compress: &dyn Fn(&[u8]) -> Vec<u8>,
     split: Split,
-) {
+) -> (usize, usize) {
     // 4096 is the `Subblock count` cap, so the wide point is the worst a file may ask for.
     const SPLITS: [usize; 2] = [8, 4096];
     const PER_SUBBLOCK: usize = 64;
@@ -455,6 +491,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(
         SPLITS[0],
         SPLITS[1]
     );
+    (narrow, wide)
 }
 
 /// The same cumulative bound on the **materializing** path, which walks the subblock list a
@@ -477,7 +514,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
     codec: &str,
     compress: &dyn Fn(&[u8]) -> Vec<u8>,
     split: Split,
-) {
+) -> (usize, usize) {
     // 4096 is the `Subblock count` cap, so the wide point is the worst a file may ask for.
     const SPLITS: [usize; 2] = [8, 4096];
     const PER_SUBBLOCK: usize = 64;
@@ -555,4 +592,5 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
         SPLITS[0],
         SPLITS[1]
     );
+    (narrow, wide)
 }

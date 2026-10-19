@@ -301,9 +301,11 @@ otherwise the subblock is read as stored. "Succeeds" is resolved to the end-of-s
 compressed subblock is already held to: the codec yields exactly `u` bytes and then has nothing
 further to give. Every way that test fails is a refusal and falls back — an LZ4 block that does
 not decode or decodes to another length, a zlib stream the inflater rejects or that ends short of
-or runs past `u`, a zstd frame whose header or blocks do not decode. Bytes after a zlib stream's
-end are ignored, as they are for every compressed zlib subblock, so they do not make an attempt
-fail. One failure is not a refusal: a zstd frame header declaring a window above
+or runs past `u`, a zstd frame whose header or blocks do not decode. Bytes after the end of a
+zlib stream, or of a complete zstd frame, are ignored, as they are for every compressed subblock
+of those codecs on every route — a `zstd_raw` frame of 256 bytes with eight bytes of filler
+after it decodes — so they do not make an attempt fail either. A bare LZ4 block has no end
+marker to stop at, and refuses the same filler. One failure is not a refusal: a zstd frame header declaring a window above
 `zstd_window_bytes` is a cap the attempt tripped on what may be a valid stream, and it is
 reported as `LimitExceeded`.
 
