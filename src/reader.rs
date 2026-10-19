@@ -297,16 +297,6 @@ impl Reader<Seekable<std::io::BufReader<std::fs::File>>> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         DecodeOptions::default().open(path)
     }
-
-    /// [`Reader::open`] with the caller's caps.
-    ///
-    /// # Errors
-    ///
-    /// As [`Reader::open`], against `limits` rather than the defaults.
-    #[deprecated(since = "0.3.1", note = "use `DecodeOptions::from(limits).open(path)`")]
-    pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
-        DecodeOptions::from(limits).open(path)
-    }
 }
 
 impl<R: std::io::Read> Reader<Sequential<R>> {
@@ -331,19 +321,6 @@ impl<R: std::io::Read> Reader<Sequential<R>> {
     /// Under the default [`DecodeOptions`]; [`DecodeOptions::sequential`] takes the caller's.
     pub fn sequential(source: R) -> Result<Self> {
         DecodeOptions::default().sequential(source)
-    }
-
-    /// [`Reader::sequential`] with the caller's caps.
-    ///
-    /// # Errors
-    ///
-    /// As [`Reader::sequential`], against `limits` rather than the defaults.
-    #[deprecated(
-        since = "0.3.1",
-        note = "use `DecodeOptions::from(limits).sequential(source)`"
-    )]
-    pub fn sequential_with_limits(source: R, limits: Limits) -> Result<Self> {
-        DecodeOptions::from(limits).sequential(source)
     }
 }
 
@@ -371,19 +348,6 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
     /// Under the default [`DecodeOptions`]; [`DecodeOptions::seekable`] takes the caller's.
     pub fn seekable(source: R) -> Result<Self> {
         DecodeOptions::default().seekable(source)
-    }
-
-    /// [`Reader::seekable`] with the caller's caps.
-    ///
-    /// # Errors
-    ///
-    /// As [`Reader::seekable`], against `limits` rather than the defaults.
-    #[deprecated(
-        since = "0.3.1",
-        note = "use `DecodeOptions::from(limits).seekable(source)`"
-    )]
-    pub fn seekable_with_limits(source: R, limits: Limits) -> Result<Self> {
-        DecodeOptions::from(limits).seekable(source)
     }
 }
 
