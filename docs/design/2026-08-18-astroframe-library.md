@@ -1211,8 +1211,10 @@ program is wrong. `decline_class()` reports the middle row as the same `DeclineC
 `decline_reason()` carries, so one skip path serves both surfaces. Truncation is classified
 `Malformed`, not `Io` — a short file is bad data, not a failing disk. The converse holds on
 every pixel path: a source that fails while a codec is pulling a compressed block through it
-is `Io` with the source's own `std::io::Error`, not the codec's report that its input broke
-off. The class is the source's, so what the codec makes of a failed read never reaches it.
+is reported in the source's own class — `Io` with its `std::io::Error` for a failing read, and
+whatever a seek within the block raises (`LimitExceeded`, `Unsupported`) for that — not as the
+codec's report that its input broke off. The class is the source's, so what the codec makes of
+a failed read never reaches it.
 
 `InvalidRequest` exists deliberately: a wrong-sized destination slice, `select_channel(k)`
 beyond the channel count, or `set_bounds` after the pixel phase has begun are caller
