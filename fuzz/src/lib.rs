@@ -12,7 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use astroframe::{Limits, Reader};
+use astroframe::{DecodeOptions, Limits};
 
 /// Where the general allocation bound comes from.
 ///
@@ -215,7 +215,7 @@ pub fn assert_within(run: &AllocationRun, bound: usize, target: &str, input_len:
 /// Errors are outcomes, not failures — the contract being that malformed input produces an
 /// `Err` rather than a panic, a hang, or unbounded allocation.
 pub fn walk_headers(data: &[u8]) {
-    let Ok(mut reader) = Reader::seekable_with_limits(std::io::Cursor::new(data), limits()) else {
+    let Ok(mut reader) = DecodeOptions::from(limits()).seekable(std::io::Cursor::new(data)) else {
         return;
     };
     let mut advances = 0;

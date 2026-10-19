@@ -9,7 +9,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{Limits, Reader, Sequential};
+use astroframe::{DecodeOptions, Limits, Reader, Sequential};
 
 use common::{
     Hdu, STORED_2X2, assert_same_bits, empty_primary, file, kind, table_extension, unsigned_2x2,
@@ -21,7 +21,7 @@ use common::{
 type SeqReader = Reader<Sequential<Cursor<Vec<u8>>>>;
 
 fn sequential(bytes: Vec<u8>, limits: Limits) -> astroframe::Result<SeqReader> {
-    Reader::sequential_with_limits(Cursor::new(bytes), limits)
+    DecodeOptions::from(limits).sequential(Cursor::new(bytes))
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -181,7 +181,8 @@ fn the_pixel_phase_evaluates_the_total_samples_cap_first() {
     limits.decoded_output_bytes = 8;
 
     // Tier 3 has no destination at all, so this grades the cap against the cross-check alone.
-    let mut reader = Reader::seekable_with_limits(Cursor::new(header_only.clone()), limits)
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(header_only.clone()))
         .expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
     let err = reader
@@ -192,8 +193,9 @@ fn the_pixel_phase_evaluates_the_total_samples_cap_first() {
     assert!(format!("{err}").contains("total samples"), "{err}");
 
     // Tier 2 adds a destination, and the byte cap that measures it must still run second.
-    let mut reader =
-        Reader::seekable_with_limits(Cursor::new(header_only), limits).expect("the header parses");
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(header_only))
+        .expect("the header parses");
     assert!(reader.next_image().expect("advancing succeeds"));
     let mut dst = [0.0f32; 16];
     let err = reader
@@ -308,7 +310,8 @@ fn skipped_block_bytes_bounds_a_read_and_not_a_seek() {
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert!(format!("{err}").contains("skipped block bytes"), "{err}");
 
-    let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), limits)
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(bytes))
         .expect("the primary header parses");
     assert!(
         reader.next_image().expect("the seek is not a read"),
@@ -409,7 +412,7 @@ fn geometry_beyond_a_known_length_is_malformed_only_in_the_pixel_phase() {
 #[cfg(target_pointer_width = "32")]
 #[test]
 fn a_cap_raised_past_what_usize_addresses_is_limit_exceeded_not_a_panic() {
-    use astroframe::{Error, Limits, Reader};
+    use astroframe::{DecodeOptions, Error, Limits, Reader};
     use std::io::Cursor;
 
     // A geometry whose sample count exceeds u32::MAX, so the narrowing cannot succeed.
@@ -425,7 +428,9 @@ fn a_cap_raised_past_what_usize_addresses_is_limit_exceeded_not_a_panic() {
     limits.decoded_output_bytes = u64::MAX;
     limits.materialized_bytes = u64::MAX;
 
-    let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), limits).expect("construct");
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(bytes))
+        .expect("construct");
     assert!(reader.next_image().expect("advance"));
 
     // The destination length is computed before it is checked against the slice, so an empty

@@ -13,7 +13,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{DeclineClass, Error, Limits, Reader, Samples, Sequential, Source};
+use astroframe::{DeclineClass, DecodeOptions, Error, Limits, Reader, Samples, Sequential, Source};
 
 use common::{
     FailingRead, Hdu, STORED_2X2, STORED_2X2X3, assert_same_bits, empty_primary, expected_sample,
@@ -30,7 +30,7 @@ fn sequential(bytes: Vec<u8>) -> astroframe::Result<SeqReader> {
 }
 
 fn sequential_with(bytes: Vec<u8>, limits: Limits) -> astroframe::Result<SeqReader> {
-    Reader::sequential_with_limits(Cursor::new(bytes), limits)
+    DecodeOptions::from(limits).sequential(Cursor::new(bytes))
 }
 
 /// Both pixel entry points at a declined position, since the table says *any* pixel call is

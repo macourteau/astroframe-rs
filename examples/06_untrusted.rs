@@ -1,4 +1,4 @@
-//! Input you did not produce — `Limits`, and reading the error classes.
+//! Input you did not produce — `Limits` through `DecodeOptions`, and reading the error classes.
 //!
 //! The guarantee is that malformed input produces an `Err`, never a panic, a hang, or
 //! unbounded allocation. Every size a header declares is a cross-check rather than an
@@ -16,7 +16,7 @@
 //! cargo run --example 06_untrusted -- suspect.fits
 //! ```
 
-use astroframe::{Error, Limits, Reader};
+use astroframe::{DecodeOptions, Error, Limits};
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
@@ -77,7 +77,9 @@ fn main() {
 }
 
 fn decode(path: &str, limits: Limits) -> astroframe::Result<usize> {
-    let mut reader = Reader::open_with_limits(path, limits)?;
+    // A reader takes its caps inside `DecodeOptions`, which is `OpenOptions`-shaped: build the
+    // options, then let the source finish them. `Reader::open` is this on the defaults.
+    let mut reader = DecodeOptions::from(limits).open(path)?;
     let mut decoded = 0usize;
     let mut buffer: Vec<f32> = Vec::new();
 

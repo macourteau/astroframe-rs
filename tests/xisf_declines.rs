@@ -21,7 +21,9 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{DeclineClass, Error, Header, Limits, Reader, Seekable, Sequential, Source};
+use astroframe::{
+    DeclineClass, DecodeOptions, Error, Header, Limits, Reader, Seekable, Sequential, Source,
+};
 use common::xisf::{Unit, expected_u16, le_u16, raw_unit, repeating_u16, samples, with_header};
 #[cfg(feature = "checksum")]
 use common::xisf::{base64, checksum_attr};
@@ -214,11 +216,11 @@ fn a_unit_level_fault_fails_at_construction_rather_than_declining_a_position() {
     // self-consistent and tripped a configured cap.
     let mut limits = Limits::default();
     limits.xml_header_bytes = 32;
-    let err = Reader::seekable_with_limits(
-        Cursor::new(Unit::new().image_u16(4, 3, 1, &samples()).build()),
-        limits,
-    )
-    .expect_err("the header cap trips");
+    let err = DecodeOptions::from(limits)
+        .seekable(Cursor::new(
+            Unit::new().image_u16(4, 3, 1, &samples()).build(),
+        ))
+        .expect_err("the header cap trips");
     assert_eq!(kind(&err), "LimitExceeded", "{err}");
     assert!(format!("{err}").contains("XML header length"), "{err}");
 }

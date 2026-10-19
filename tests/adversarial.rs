@@ -44,7 +44,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{Error, Image, Limits, Reader, SampleFormat, Samples};
+use astroframe::{DecodeOptions, Error, Image, Limits, Reader, SampleFormat, Samples};
 
 #[cfg(feature = "checksum")]
 use common::xisf::checksum_attr;
@@ -62,7 +62,7 @@ fn decode(bytes: &[u8]) -> astroframe::Result<Image> {
 }
 
 fn decode_with(bytes: &[u8], limits: Limits) -> astroframe::Result<Image> {
-    let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), limits)?;
+    let mut reader = DecodeOptions::from(limits).seekable(Cursor::new(bytes))?;
     assert!(
         reader.next_image()?,
         "the fixture must reach an image position; only `no image element` walks empty, and \
@@ -497,8 +497,9 @@ fn a_geometry_whose_byte_extent_exceeds_u64_under_a_raised_cap() {
     // The chunked entry point reaches the staging-row arithmetic by a different route -- it
     // starts the decoder rather than sizing a destination -- so it is gated separately and
     // graded separately. This is the path the defect was first observed on.
-    let mut reader =
-        Reader::seekable_with_limits(Cursor::new(&bytes), raised).expect("construction succeeds");
+    let mut reader = DecodeOptions::from(raised)
+        .seekable(Cursor::new(&bytes))
+        .expect("construction succeeds");
     assert!(reader.next_image().expect("the position is reached"));
     let e = reader
         .chunks()
@@ -990,8 +991,9 @@ fn image_count_cap() {
     // shows the cap rather than the fixture is what stopped the walk.
     let mut raised = Limits::default();
     raised.images_per_source = count;
-    let mut reader =
-        Reader::seekable_with_limits(Cursor::new(&bytes), raised).expect("construction succeeds");
+    let mut reader = DecodeOptions::from(raised)
+        .seekable(Cursor::new(&bytes))
+        .expect("construction succeeds");
     let mut walked = 0u32;
     while reader.next_image().expect("advance under a raised cap") {
         walked += 1;
@@ -1336,7 +1338,9 @@ fn a_row_offset_past_u64_is_refused_rather_than_computed() {
     raised.stored_block_floor_bytes = u64::MAX;
 
     let source = Sparse { at: 0, head: unit };
-    let mut reader = Reader::seekable_with_limits(source, raised).expect("the unit constructs");
+    let mut reader = DecodeOptions::from(raised)
+        .seekable(source)
+        .expect("the unit constructs");
     assert!(reader.next_image().expect("the position is reached"));
     // The last channel, so the first chunk already sits at `(C - 1) x H` rows in.
     reader

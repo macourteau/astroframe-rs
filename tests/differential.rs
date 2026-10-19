@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use astroframe::{Limits, Reader, SampleFormat, Samples, Source};
+use astroframe::{DecodeOptions, Limits, Reader, SampleFormat, Samples, Source};
 use common::{Hdu, file};
 use fitsrs::{Fits, HDU, Pixels};
 
@@ -396,7 +396,7 @@ fn corpus_native_samples_match_fitsrs() {
     for path in &files {
         let name = path.display().to_string();
 
-        let mut reader = match Reader::open_with_limits(path, limits) {
+        let mut reader = match DecodeOptions::from(limits).open(path) {
             Ok(reader) => reader,
             Err(e) => {
                 skipped_ours += 1;

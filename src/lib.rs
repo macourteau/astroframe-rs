@@ -97,6 +97,19 @@
 //! Malformed input produces an `Err`, never a panic, a hang, or unbounded allocation. Every
 //! size the header declares is a cross-check rather than an allocation size, and [`Limits`]
 //! bounds the geometry that is not. The crate sets `#![forbid(unsafe_code)]`.
+//!
+//! A reader takes its caps inside [`DecodeOptions`], whose finishers stand in for the
+//! [`Reader`] constructors:
+//!
+//! ```no_run
+//! use astroframe::{DecodeOptions, Limits};
+//!
+//! # fn main() -> astroframe::Result<()> {
+//! let untrusted = Limits::default().with_total_samples(64 << 20);
+//! let mut reader = DecodeOptions::from(untrusted).open("upload.fits")?;
+//! # let _ = reader.next_image()?;
+//! # Ok(()) }
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -117,6 +130,7 @@ pub(crate) mod image;
 pub(crate) mod limits;
 pub(crate) mod metadata;
 pub(crate) mod normalize;
+pub(crate) mod options;
 pub(crate) mod reader;
 pub(crate) mod samples;
 pub(crate) mod source;
@@ -139,6 +153,7 @@ pub use metadata::{
     ResolutionUnit, ValueKind,
 };
 pub use normalize::{Normalizer, Sample, SampleRange, Scaling};
+pub use options::DecodeOptions;
 pub use reader::{Chunk, Chunks, Reader};
 pub use samples::{F64Iter, SampleFormat, SampleSlice, Samples};
 pub use source::{Seekable, Sequential, Source};
