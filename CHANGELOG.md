@@ -16,6 +16,87 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.4.0] — 2026-10-18
+
+Revision 2 of the XISF 1.0 specification document (version 1.02, October 2026) defines how a
+compressed data block stores a subblock that cannot be reduced: a pair in `subblocks` whose
+compressed and uncompressed lengths are equal holds its bytes uncompressed, and every other pair
+decompresses to exactly its uncompressed length. The format version is still 1.0. This release
+reads blocks as Revision 2 states, and its citations follow Revision 2's numbering.
+
+**Decoded output moves, for one input shape only:** a compressed block holding a subblock whose
+two lengths are equal, or an unsplit compressed block stored at exactly its uncompressed size.
+0.3.1 decompressed such a pair; 0.4.0 copies it, as §10.6.1 requires. A pair a Revision 2 encoder
+stored uncompressed — which PixInsight 1.9.6 and later write for incompressible data, and which
+0.3.1 refused as `Malformed` — decodes. A pair an earlier encoder compressed to exactly its own
+length decodes to its stored bytes under the default, and to its decompressed bytes under the
+opt-in `EqualLengthSubblocks::TryDecompress`. Every other pair is read as before. That shape is
+graded by `tests/uncompressed_subblocks.rs` on every codec, shuffled variant and route under both
+readings, and nowhere else does output move. A cross-version digest comparison decoded every
+corpus position with 0.3.1 and with this release, under each reading: 1574 positions, 1443 of
+them decoded, 0 classifications, 0 digests and 0 reported granularities changed. The corpus holds
+no equal-length pair, all 1157 compressed files having been written by PixInsight 1.9.4 or by no
+named writer, so that comparison shows that no other block shape moved rather than grading the
+shape that did. The exhaustive `tests/normalization.rs`, the XISF-against-FITS differential over
+the `xisf_variants` set and `corpus_native_samples_match_fitsrs` agree as in 0.3.1.
+
+The sweep reads 1566 files: 1446 decode and 120 decline, every decline the tile-compressed image
+0.3.1 declines. The 120 `fpack_variants` are each a clean `Unsupported`, the masters walk their
+images, 66 files agree across the open, sequential and seekable entry points, and every example
+ran clean over 32 corpus frames. Peak resident memory, measured on Linux: 40 KiB above baseline
+for a 25 MP FITS against the 25 MiB allowed, and 8.4 MiB for a compressed XISF against
+26.8 MiB, the maximum over ten runs — both as in 0.3.1. Each XISF fuzz target ran two minutes
+under both readings without a finding.
+
+Minor rather than patch on two counts, either of which would be enough: decoded output moves
+for the shape above, and the deprecated `*_with_limits` constructors reach their removal line.
+
+### Breaking
+
+- **Equal-length subblocks are read as uncompressed** (above). A caller holding files an
+  encoder compressed every subblock of, where one happened to compress to exactly its own
+  length, sets `DecodeOptions::with_equal_length_subblocks(EqualLengthSubblocks::TryDecompress)`.
+- **`Reader::open_with_limits`, `Reader::sequential_with_limits` and
+  `Reader::seekable_with_limits` are removed**, as their 0.3.1 deprecation stated.
+  `DecodeOptions::from(limits)` finished by `open`, `sequential` or `seekable` builds the same
+  reader under the same caps.
+
+### Added
+
+- **`EqualLengthSubblocks`** and `DecodeOptions::equal_length_subblocks`, set through
+  `with_equal_length_subblocks`. `Uncompressed`, the default, is Revision 2's reading.
+  `TryDecompress` is §10.6.1's *may* for files earlier encoders wrote: a non-empty equal-length
+  pair is held whole and decompressed, its result used only if the codec ends after exactly the
+  pair's uncompressed length, and its stored bytes used otherwise; a cap the attempt trips is
+  `LimitExceeded`. It is a repair, and the one place the crate chooses between two readings of
+  the same bytes, so it is opt-in: a damaged pair of equal lengths reads as stored bytes without
+  an error unless the block declares a checksum. A framed block holding such a pair reports
+  `Granularity::Block` — `WholeImage` when unsplit — and costs one held subblock rather than the
+  block, and a failed attempt allocates nothing.
+
+### Fixed
+
+- **A subblock list's trailing pairs are decompressed on the streaming walk.** The streaming walk
+  opened a subblock only when it needed output, so a trailing pair owed no bytes was never
+  checked, while the walk an embedded, checksummed or shuffled block takes refused one that was
+  not a stream. **This changes what is accepted:** such a block is `Malformed` on every route,
+  which is what the other walk already answered. The planar `select_channel` early stop, which
+  reads only the selected channel's rows, is unchanged.
+- **An empty `(0,0)` subblock decodes on every codec.** It is an uncompressed subblock of zero
+  bytes. zstd and LZ4 refused it as `Malformed`, except as a trailing pair on the streaming walk,
+  which never opened it.
+
+### Documentation
+
+- **Citations retargeted.** Revision 2 inserts §10.6.1 and renumbers §10.6.1–§10.6.10 to
+  §10.6.2–§10.6.11, and inserts §2.1. Every citation in the crate, its tests and its documents
+  follows, and `reference/README.md` records the Revision 2 build as the one they were checked
+  against. Released entries below keep their Revision 1 numbers, marked as such.
+- The design document, implementation decisions, intentional patterns, README, crate docs and
+  threat model state the Revision 2 rules, and the design document records the option's
+  carve-out from report, don't interpret, with the two rejected alternatives: the repair on by
+  default, and holding the whole block rather than one subblock.
+
 ## [0.3.1] — 2026-10-18
 
 **Decoded output does not move.** No change in this release touches the normalization primitive
