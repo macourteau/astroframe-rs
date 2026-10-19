@@ -764,7 +764,7 @@ fn header_length_overruns_file() {
 #[test]
 fn shuffle_item_size_mismatch() {
     // The original fixture compresses 32 zero bytes, whose shuffle is the identity — which would let
-    // a decoder that skipped the unshuffle pass. The block here holds the real §10.6.2
+    // a decoder that skipped the unshuffle pass. The block here holds the real §10.6.3
     // transform of real samples, so the reverse transform is actually exercised.
     let levels = repeating_u16(16);
     let raw = le_u16(&levels);

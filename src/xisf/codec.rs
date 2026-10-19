@@ -26,7 +26,7 @@ use crate::xisf::block::{Algorithm, Checksum};
 /// Verify a stored block against its declared digest.
 ///
 /// The digest covers the *entire* contents of the block as stored — for a compressed block
-/// that is the compressed bytes, never the original (§10.6.1). §10.5 tells a decoder to warn
+/// that is the compressed bytes, never the original (§10.6.2). §10.5 tells a decoder to warn
 /// and let *the user* choose whether to continue; for a library the caller is that user, and
 /// the same section adds that an unattended batch decoder should not load a failing unit,
 /// which is this crate's primary setting.

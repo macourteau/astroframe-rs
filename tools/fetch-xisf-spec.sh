@@ -12,10 +12,11 @@
 # repository, is the C++ reference implementation and is NOT to be consulted: this crate is
 # written from the specifications alone, which is what keeps it permissively licensable.
 #
-# The document has moved under this fixed URL before — Revision 1 replaced the April 2017 text
-# at the same path with the same filename — so the compiler stamp is compared against the build
-# reference/README.md records, and a mismatch is reported loudly. Section, table and equation
-# numbers have all moved across a revision before.
+# The document has moved under this fixed URL twice — Revision 1 replaced the April 2017 text
+# at the same path with the same filename, and Revision 2 (version 1.02, October 2026) replaced
+# Revision 1 the same way, inserting §10.6.1 and §2.1 — so the compiler stamp is compared
+# against the build reference/README.md records, and a mismatch is reported loudly. Section,
+# table and equation numbers have all moved across a revision before.
 #
 # Output is gitignored: it is Pleiades Astrophoto's documentation, format-shifted, and this
 # repository does not redistribute it.

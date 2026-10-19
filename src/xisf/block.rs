@@ -4,7 +4,7 @@
 //!
 //! > read the stored block → **verify** → decompress → unshuffle → de-interleave → normalize
 //!
-//! §10.6.1 is explicit that decompressing a block that failed verification is exploitable.
+//! §10.6.2 is explicit that decompressing a block that failed verification is exploitable.
 
 use crate::error::{Error, Result};
 use crate::limits::Limits;
@@ -99,7 +99,7 @@ pub(crate) fn parse_encoding(text: &str) -> Result<Encoding> {
     }
 }
 
-/// A compression codec (§10.6.3–§10.6.10).
+/// A compression codec (§10.6.4–§10.6.11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Codec {
     /// zlib-wrapped, not raw deflate. A framed stream, so it decompresses incrementally.
@@ -110,7 +110,7 @@ pub(crate) enum Codec {
     Lz4Hc,
     /// Framed, and the only one of the three with a real magic number.
     ///
-    /// §10.6.9/§10.6.10 give the attribute syntax as `zstd:<size>` and
+    /// §10.6.10/§10.6.11 give the attribute syntax as `zstd:<size>` and
     /// `zstd+sh:<size>:<item-size>`, and §7.2 makes support for both an ability every baseline
     /// decoder has. §10.6 recommends this codec over the others.
     Zstd,
@@ -367,13 +367,13 @@ fn hex_digit(b: u8) -> std::result::Result<u8, ()> {
 
 /// One byte of the **unshuffled** block, read without materializing an unshuffled copy.
 ///
-/// The §10.6.2 transform stores the `item_size` subsets of equally significant bytes as
+/// The §10.6.3 transform stores the `item_size` subsets of equally significant bytes as
 /// compact subsequences in ascending order, so byte `j` of item `i` sits at `j·N + i` for
 /// `N = size / item_size` items. Reconstructing one sample therefore needs bytes spread
 /// across the entire block and no prefix yields any complete sample — which is why shuffling
 /// forces `WholeImage` granularity, ignoring any subblock split.
 ///
-/// A **trailing partial item** is copied through unshuffled, which §10.6.2 states outright:
+/// A **trailing partial item** is copied through unshuffled, which §10.6.3 states outright:
 /// bytes at the end of a block that do not form a complete item "are not shuffled and shall be
 /// stored unaltered after the shuffled bytes". The planes are defined over "subsets of
 /// equally significant bytes", which exist only for complete items, so a partial
@@ -462,7 +462,7 @@ mod tests {
         assert!(c.shuffled);
         assert_eq!(c.item_size, Some(2));
 
-        // The §10.6.9/§10.6.10 zstd syntax.
+        // The §10.6.10/§10.6.11 zstd syntax.
         assert_eq!(parse_compression("zstd:64").unwrap().codec, Codec::Zstd);
         assert_eq!(
             parse_compression("zstd+sh:64:4").unwrap().item_size,

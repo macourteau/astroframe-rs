@@ -132,7 +132,7 @@ path or URL named inside an input is Critical.**
 The API has no "verified" flag: a successful read is the verification. A block declaring
 `checksum="alg:digest"` is hashed over its *stored* (compressed) bytes, and the digest must match
 before anything decompresses, unshuffles or delivers it (§ Decisions the implementer must not
-silently change, "Checksum before decompression, always"; XISF §10.6.1). A mismatch is
+silently change, "Checksum before decompression, always"; XISF §10.6.2). A mismatch is
 `ChecksumMismatch`: at construction for an `embedded` block, at the first pixel call for an
 attachment. A checksummed block is never streamed (`is_streamable`), so no chunk precedes
 verification. With the feature **off**, `codec::verify` returns `Unsupported` and the position

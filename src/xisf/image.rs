@@ -472,7 +472,7 @@ fn read_compression(
         Some(Ok(compression)) => Some(compression),
         Some(Err(e)) => return (None, None, Some(decline_from(e))),
     };
-    // §10.6.2's planes are subsets of equally significant bytes of the *uncompressed* block,
+    // §10.6.3's planes are subsets of equally significant bytes of the *uncompressed* block,
     // so an `item-size` larger than that block describes a transform with no complete item in
     // it at all. `parse_compression` cannot see this: the length comes from the geometry, not
     // from the attribute. Skipped when the geometry or the sample format did not read, where
@@ -486,7 +486,7 @@ fn read_compression(
             None,
             Some(malformed(format!(
                 "compression item size {item} exceeds the {implied_bytes} bytes the geometry \
-                 implies, so §10.6.2's transform has no complete item to define a plane over"
+                 implies, so §10.6.3's transform has no complete item to define a plane over"
             ))),
         );
     }

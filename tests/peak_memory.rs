@@ -365,7 +365,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
     let height = SPLITS[1] as u32;
     let levels = repeating_u16(samples);
     let raw = common::xisf::le_u16(&levels);
-    // §10.6.2 shuffles the block as a whole, *before* the split, so the fixture shuffles once
+    // §10.6.3 shuffles the block as a whole, *before* the split, so the fixture shuffles once
     // and then divides the result — which is exactly why the split buys the decoder nothing
     // and the granularity floor is `WholeImage`.
     let shuffled = shuffle(&raw, 2);

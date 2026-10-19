@@ -679,7 +679,7 @@ fn refuse_attachments_inside_the_header(occurrences: &mut [Occurrence], header_e
 
 /// Whether this block's samples can be pulled a row at a time straight from the source.
 ///
-/// A checksum covers the whole **stored** block (§10.5) and §10.6.1 forbids using any of it
+/// A checksum covers the whole **stored** block (§10.5) and §10.6.2 forbids using any of it
 /// before verification, so a checksummed block is never streamable however it is compressed.
 fn is_streamable(block: &BlockPlan) -> bool {
     if !matches!(block.location, Location::Attachment { .. }) || block.checksum.is_some() {
@@ -687,7 +687,7 @@ fn is_streamable(block: &BlockPlan) -> bool {
     }
     match &block.compression {
         None => true,
-        // Byte shuffling cannot stream: §10.6.2 spreads one sample's bytes across the entire
+        // Byte shuffling cannot stream: §10.6.3 spreads one sample's bytes across the entire
         // block, so no prefix yields any complete sample.
         Some(c) if c.shuffled => false,
         // A bare LZ4 block has no framing and decompresses only as a whole -- so it streams
@@ -811,7 +811,7 @@ fn decode_row(
                         *dst = convert(a);
                     }
                 }
-                // §10.6.2 spreads one sample's bytes across the whole block, so this one is
+                // §10.6.3 spreads one sample's bytes across the whole block, so this one is
                 // irreducibly per byte. It is also always a materialized block, since the
                 // shuffle floor forbids streaming.
                 Some(item) => {
@@ -862,7 +862,7 @@ fn decode_row(
 
 /// Read the stored block, verify it, decompress it, and hand back the still-shuffled result.
 ///
-/// The pipeline order is fixed and nothing may be reordered to save a pass: §10.6.1 is
+/// The pipeline order is fixed and nothing may be reordered to save a pass: §10.6.2 is
 /// explicit that decompressing a block that failed verification is exploitable.
 fn materialize<S: Source>(
     block: &BlockPlan,
@@ -908,7 +908,7 @@ fn materialize<S: Source>(
         }
     };
 
-    // 2. Verify, before anything touches the bytes. §10.6.1 is explicit that decompressing a
+    // 2. Verify, before anything touches the bytes. §10.6.2 is explicit that decompressing a
     //    block that failed verification is exploitable, so nothing may be reordered here to
     //    save a pass. The digest covers the entire *stored* block (§10.5).
     if let Some(checksum) = &block.checksum {

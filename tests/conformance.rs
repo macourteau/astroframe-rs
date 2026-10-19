@@ -30,9 +30,9 @@
 //! inconsistency rather than a gap here.** §7.2 lists inline among the block locations a
 //! baseline decoder reads pixel data from, while §11.5 states that "An Image element cannot
 //! serialize pixel data as an inline XISF data block", the restriction being that Image
-//! elements can have child XML elements. Revision 1 did not resolve it. This crate follows
-//! §11.5 — inline pixel data is `Malformed`, graded in `tests/xisf_decisions.rs` — and reads
-//! inline blocks everywhere else they are legal.
+//! elements can have child XML elements. Neither Revision 1 nor Revision 2 resolved it. This
+//! crate follows §11.5 — inline pixel data is `Malformed`, graded in `tests/xisf_decisions.rs` —
+//! and reads inline blocks everywhere else they are legal.
 //!
 //! §7.1's baseline **encoder** bullets are not graded anywhere: this crate is decode-only and
 //! claims no encoder conformance.
@@ -406,7 +406,7 @@ fn data_blocks_in_both_byte_orders() {
 
 /// §7.2's *verify data block checksums computed with SHA-1, SHA-256 and SHA-512* bullet.
 ///
-/// Revision 1 requires these three of **every** decoder — §10.5's "claiming support" qualifier
+/// Revision 2 requires these three of **every** decoder — §10.5's "claiming support" qualifier
 /// applies to encoders — so they are the conformance-bearing ones. The two SHA-3 algorithms
 /// are optional and are graded with the rest of the checksum surface in
 /// `tests/xisf_decisions.rs`.
@@ -497,8 +497,9 @@ fn an_unsupported_feature_leaves_the_rest_of_the_unit_accessible() {
 ///
 /// All three kinds at once, because the obligation is one rule and a decoder can fail it
 /// separately for each: an element the specification does not define, an attribute on the
-/// `Image` element itself, and an element in a foreign namespace at the root — which Revision
-/// 1's extension-element note says is where an extension belongs. None may disturb the decode.
+/// `Image` element itself, and an element in a foreign namespace at the root — which §9.5's
+/// extension-element rule, added in Revision 1, says is where an extension belongs. None may
+/// disturb the decode.
 #[test]
 fn unrecognized_elements_and_attributes_are_ignored() {
     let levels = samples();

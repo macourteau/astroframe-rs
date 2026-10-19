@@ -71,7 +71,7 @@ the decision.
 
 1. **No code transliterated from any specification's sample implementation.** The XISF
    specification embeds a C++ reference implementation of the byte-shuffling transform
-   alongside its mathematical description (§10.6.2). A specification that ships sample
+   alongside its mathematical description (§10.6.3). A specification that ships sample
    code is still someone's copyrighted code. Every algorithm here is implemented from
    the *described* transform.
 2. **The normalization convention is measured from output, never read out of an
@@ -726,7 +726,7 @@ refusing a hostile declaration that early is the whole of what it is for. The
 construction. `Materialized bytes` is measured at each buffer's own size, so narrowing
 shrinks it exactly where the narrowed decode allocates less and not otherwise — a
 compressed or checksummed single block is materialized whole however few channels the caller
-asked for, since §10.6.1 forbids using any of it before the digest covering all of it is
+asked for, since §10.6.2 forbids using any of it before the digest covering all of it is
 verified.
 
 **Abandoning a chunk stream leaves the reader positioned mid-image, and that is
@@ -914,7 +914,7 @@ compressed frames.
 The shape of the remaining 6% is worth recording, because getting it wrong once cost a
 measured 2x. The XISF row decoder originally resolved *per byte* which of three sources a
 sample byte came from — a streamed row, a materialized block, or a materialized block needing
-the §10.6.2 unshuffle. All three facts are constant for a whole row. Worse, because one helper
+the §10.6.3 unshuffle. All three facts are constant for a whole row. Worse, because one helper
 served all three, the shuffled arm's codegen governed the other two: giving that arm a
 bounds-check panic path slowed the *unshuffled* case by half, on a branch it never executes.
 Hoisting the decision to once per row, so the dominant case (unit stride, no shuffle — every
@@ -934,18 +934,18 @@ the buffering the granularity describes is on the input side. A tier-3 caller re
 chunks receives borrowed views over that same work, not a private copy.
 
 The reasons for the floors are structural, not implementation laziness. Byte unshuffling
-cannot stream: §10.6.2 stores the byte of significance `j` of sample `i` at offset
+cannot stream: §10.6.3 stores the byte of significance `j` of sample `i` at offset
 `j·N + i` for `N` samples, so reconstructing one sample needs `n` bytes spread across the
 entire block and no prefix yields any complete sample. Checksums cover the whole stored
-block (§10.5), and §10.6.1 forbids decompressing a block whose checksum failed, so
+block (§10.5), and §10.6.2 forbids decompressing a block whose checksum failed, so
 verification completes before any sample is delivered. And the three codecs have three
 different container shapes:
 
 **Dispatch on the declared `compression` name, never on the bytes** — only `zstd` has a
 real magic number, so sniffing is not available even in principle. The specification fixes
-each container shape: the zlib format for `zlib` (§10.6.3), the LZ4 block format without
-the frame format's headers for `lz4` and `lz4hc` (§10.6.5, §10.6.7), and the Zstandard
-frame format, one frame per subblock, for `zstd` (§10.6.9). The corpus agrees on all
+each container shape: the zlib format for `zlib` (§10.6.4), the LZ4 block format without
+the frame format's headers for `lz4` and `lz4hc` (§10.6.6, §10.6.8), and the Zstandard
+frame format, one frame per subblock, for `zstd` (§10.6.10). The corpus agrees on all
 three, read directly from attachment bytes:
 
 | Declared codec | Container shape | Evidence |
@@ -1194,7 +1194,7 @@ them. How much *reading* that saves depends on the layout **and** on compression
 uncompressed `Planar` storage the unwanted channels are contiguous runs that can be
 skipped outright; with `Normal` storage every sample must still be read and discarded;
 and with any compressed single block, or any block carrying a checksum, the whole block is
-read regardless — the digest covers all of it and §10.6.1 forbids using any of it before
+read regardless — the digest covers all of it and §10.6.2 forbids using any of it before
 verification. The memory saving is the same either way; the I/O saving is not, and the API
 does not pretend otherwise. No colour-space conversion is performed, so an RGB frame yields
 three channels and never a computed intensity — that is a consumer's policy decision, and
@@ -2121,7 +2121,7 @@ reader who does not find the argument here will reach for them again.
 | **Require `Read + Seek` everywhere** | Locks out pipes, sockets and decompressed streams — precisely the callers streaming exists to serve. FITS never needs it, and monolithic XISF needs it only for out-of-order blocks. |
 | **License under MIT alone** | MIT alone is permissive enough and would satisfy every constraint this crate is under. It buys nothing the dual licence does not, and gives up Apache-2.0's explicit patent grant for consumers that want it, against an ecosystem that expects the pair. § Licensing boundary. |
 | **Verify block checksums only on request** | XISF §10.5 makes verification mandatory when the attribute is present, so skipping it silently is a conformance gap. The `checksum` cargo feature governs only whether the verification code and its three hash dependencies are *compiled in*. Building without it does not weaken the safety guarantee — a block that declares a checksum is declined as `Unsupported` rather than trusted, and §7 requires that decline to leave the rest of the unit accessible — but it does give up conformance: §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder, so such a build is not a baseline XISF decoder. One consequence is worth stating because it is not obvious: §9.5 and §10.5 require every block of a **digitally signed** unit that is not serialized directly in the header to carry a checksum, so an `xisf`-without-`checksum` build cannot decode a signed unit whose pixels are attached — and with the feature on, every signed unit is forced to `WholeImage` granularity by the checksum floor. |
-| **Decline `zstd`-compressed blocks** | §10.6.9/§10.6.10 specify the codec and its attribute syntax, §10.6 recommends it over the others, and §7.2 lists reading it among the abilities a baseline decoder has — so declining it would be a conformance gap, not a conservative reading. The cost is concrete besides: PixInsight writes `zstd` blocks, and the local corpus contains 240 such files. |
+| **Decline `zstd`-compressed blocks** | §10.6.10/§10.6.11 specify the codec and its attribute syntax, §10.6 recommends it over the others, and §7.2 lists reading it among the abilities a baseline decoder has — so declining it would be a conformance gap, not a conservative reading. The cost is concrete besides: PixInsight writes `zstd` blocks, and the local corpus contains 240 such files. |
 | **Eagerly enumerate all images/HDUs at header time** | Free for XISF (they are all in the XML header) but for FITS it means reading past every data unit, which would make tier-1 header decode cost a full pass over the file. Forward-only `next_image()` keeps tier 1 cheap for both. |
 | **Select the first image at construction** | Every multi-extension FITS file and every tile-compressed file has a primary with `NAXIS = 0`, so on those files there is no first image to select and the constructor has nothing to sit on. Selecting nothing at construction and advancing with `next_image()` holds for every file layout instead (§ The API). |
 | **Have construction sit on the declined image** | The other way to give the constructor something to select: on a file whose primary is `NAXIS = 0`, advance to the first position even when it is one this version declines. Reaching a `BINTABLE` past that primary means skipping a data unit, which contradicts the criterion that construction touches only a header region. |
@@ -2586,7 +2586,7 @@ Phase order is a decision; sequencing *inside* a phase is the implementer's.
 § Normalization, which is its single home. No `mul_add`. No division per sample. No
 separate whole-image fast path.
 
-**Checksum before decompression, always.** XISF §10.6.1 is explicit that decompressing a
+**Checksum before decompression, always.** XISF §10.6.2 is explicit that decompressing a
 block that failed verification is exploitable. The pipeline order is fixed: read the stored
 block → verify → decompress → unshuffle → de-interleave → normalize. Nothing may be
 reordered to save a pass.
@@ -2718,7 +2718,7 @@ criterion.
 | **Three checks are added to the subblock list**: the count is capped, the declared compressed lengths must sum to the stored block size, and the declared uncompressed lengths must sum to the geometry-implied size. All three run before any allocation | §10.6 requires no validation of the list and explicitly sets no upper limit on the number of subblocks. Without these the attribute is a cheap amplification vector the element-count cap does not cover, because the whole list is one attribute string rather than elements |
 | **Checksums are verified for every block whose contents are actually read** — which makes tier 1 free for `attachment` blocks and **not** free for `embedded` ones, whose contents are read during header parse and whose digest is therefore verified at construction | §10.5 permits on-demand verification. A mismatch returns `ChecksumMismatch`: §10.5 tells a decoder to warn and let *the user* choose whether to continue, and for a library the caller is that user; the same section adds that an unattended batch decoder should not load a failing unit, which is this crate's primary setting |
 | **All five algorithms are supported, not the mandatory three alone**: `sha-1` (also `sha1`), `sha-256` (`sha256`), `sha-512` (`sha512`), `sha3-256`, `sha3-512`, digests lowercase Base16 | §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder — the "claiming support" qualifier applies to encoders — and leaves the two SHA-3 algorithms optional. One more hash crate is a small price beside a feature matrix where a file's decodability depends on which digest its writer chose |
-| **`item-size` comes from the compression attribute's mandatory third field and is never derived from `sampleFormat`.** `0` is rejected; `1` is a valid no-op; a value exceeding the block length is `Malformed`; a trailing partial item is copied through unshuffled | §10.6.4/§10.6.6/§10.6.8/§10.6.10 make the field mandatory, so a `+sh` codec missing it is `Malformed` rather than a case for inference — and §10.6 defines `item-size` only as "the length in bytes of a data item", never tying it to the sample width. That decoupling is what makes a trailing partial item reachable on a conforming file (a three-sample `UInt16` block with a legal `item-size="4"` is six bytes with two left over), and §10.6.2 says what becomes of it: bytes that do not form a complete item "are not shuffled and shall be stored unaltered after the shuffled bytes". The planes are defined over "subsets of equally significant bytes", which exist only for complete items, so a partial item belongs to no plane. Rejecting it would refuse a file this design has just called conforming |
+| **`item-size` comes from the compression attribute's mandatory third field and is never derived from `sampleFormat`.** `0` is rejected; `1` is a valid no-op; a value exceeding the block length is `Malformed`; a trailing partial item is copied through unshuffled | §10.6.5/§10.6.7/§10.6.9/§10.6.11 make the field mandatory, so a `+sh` codec missing it is `Malformed` rather than a case for inference — and §10.6 defines `item-size` only as "the length in bytes of a data item", never tying it to the sample width. That decoupling is what makes a trailing partial item reachable on a conforming file (a three-sample `UInt16` block with a legal `item-size="4"` is six bytes with two left over), and §10.6.3 says what becomes of it: bytes that do not form a complete item "are not shuffled and shall be stored unaltered after the shuffled bytes". The planes are defined over "subsets of equally significant bytes", which exist only for complete items, so a partial item belongs to no plane. Rejecting it would refuse a file this design has just called conforming |
 | **The unshuffle is fused into the per-sample read**, so no separate unshuffled buffer exists | A decision, not an optimization detail: it is what keeps `Block` granularity's peak at one block rather than two |
 | **For an embedded block, `compression` and `subblocks` live on the child `<Data>` element**, not on the element that serializes the block (§10.6) | For every other location mode they live on the serializing element itself. Reading them from the wrong element yields a block that looks uncompressed and decodes to noise — a failure no synthetic round-trip catches unless a fixture exercises embedded-plus-compressed. One does |
 | **Embedded blocks come in two encodings, `base64` and lowercase `hex`** (§10.3), and both are supported. An unknown encoding is `Malformed`; an uppercase Base16 spelling is rejected rather than accepted leniently | The Base16 half is net-new work rather than a port — that decoder implements `base64` only — so its test is the only evidence it will get. The specification is not silent on digit case, so there is nothing to guess at |

@@ -283,7 +283,7 @@ pub fn repeating_u16(len: usize) -> Vec<u16> {
 
 // ------------------------------------------------------------------ block transforms
 
-/// The §10.6.2 byte-shuffling transform, written from the description: the `item_size`
+/// The §10.6.3 byte-shuffling transform, written from the description: the `item_size`
 /// subsets of equally significant bytes stored as compact subsequences in ascending order,
 /// with a trailing partial item copied through unshuffled.
 pub fn shuffle(input: &[u8], item_size: usize) -> Vec<u8> {
@@ -335,7 +335,7 @@ pub fn hex(input: &[u8]) -> String {
 }
 
 /// A `checksum` attribute value over the **stored** bytes — compressed ones when the block is
-/// compressed (§10.6.1).
+/// compressed (§10.6.2).
 pub fn checksum_attr(algorithm: &str, stored: &[u8]) -> String {
     use sha1::Digest as _;
     let digest = match algorithm {
