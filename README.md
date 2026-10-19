@@ -15,7 +15,7 @@ crate itself sets `#![forbid(unsafe_code)]`.
 
 ```toml
 [dependencies]
-astroframe = "0.3"
+astroframe = "0.4"
 ```
 
 Release history, and what each release did to the decoded bits, is in
