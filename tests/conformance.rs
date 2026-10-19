@@ -16,7 +16,7 @@
 //! | Read multiple `Image` elements from one file | `reads_several_images_of_different_shapes_from_one_monolithic_file` |
 //! | Read inline, embedded and attachment block locations | `reads_both_pixel_locations_that_an_image_may_use` — partial, see below |
 //! | Read little-endian and big-endian data blocks | `data_blocks_in_both_byte_orders` |
-//! | Decompress all standard codecs | `reads_every_standard_codec_and_its_shuffled_variant` |
+//! | Decompress all standard codecs, including blocks with uncompressed subblocks | `reads_every_standard_codec_and_its_shuffled_variant`, `reads_data_blocks_with_uncompressed_subblocks` |
 //! | Verify SHA-1, SHA-256 and SHA-512 checksums | `the_three_checksum_algorithms_every_decoder_must_verify` |
 //! | Read planar and normal pixel storage | `reads_planar_and_normal_storage_in_gray_and_rgb` |
 //! | Read `UInt8`, `UInt16` and `Float32` samples | `reads_uint8_uint16_and_float32_samples` |
@@ -30,9 +30,9 @@
 //! inconsistency rather than a gap here.** §7.2 lists inline among the block locations a
 //! baseline decoder reads pixel data from, while §11.5 states that "An Image element cannot
 //! serialize pixel data as an inline XISF data block", the restriction being that Image
-//! elements can have child XML elements. Revision 1 did not resolve it. This crate follows
-//! §11.5 — inline pixel data is `Malformed`, graded in `tests/xisf_decisions.rs` — and reads
-//! inline blocks everywhere else they are legal.
+//! elements can have child XML elements. Neither Revision 1 nor Revision 2 resolved it. This
+//! crate follows §11.5 — inline pixel data is `Malformed`, graded in `tests/xisf_decisions.rs` —
+//! and reads inline blocks everywhere else they are legal.
 //!
 //! §7.1's baseline **encoder** bullets are not graded anywhere: this crate is decode-only and
 //! claims no encoder conformance.
@@ -74,14 +74,20 @@ fn property<'a>(header: &'a astroframe::Header, id: &str) -> &'a astroframe::Pro
 
 // ------------------------------------------------------------------ §7.2, bullet by bullet
 
-/// §7.2's *every standard compression codec* bullet, plus the `zstd` this crate adds.
+/// §7.2's *every standard compression codec* bullet.
 ///
 /// The three container shapes are the point: LZ4 and zstd fail in **opposite** directions, so
 /// a decoder reaching for a framed LZ4 reader breaks LZ4 and one reaching for a bare-block
 /// zstd reader breaks zstd. Every row here decodes to asserted pixels.
+///
+/// The image is 8 × 8 so that every codec's block is shorter than its data. A block stored at
+/// exactly its uncompressed size is an *uncompressed* subblock under Revision 2's §10.6.1 and
+/// is copied rather than decompressed, so a fixture that happened to land there would grade
+/// the copy instead of the codec; the compressing helpers refuse to build one. The `zstd` rows
+/// are raw-block frames, longer than their data, which §10.6.1 decompresses like any other.
 #[test]
 fn reads_every_standard_codec_and_its_shuffled_variant() {
-    let levels = samples();
+    let levels = repeating_u16(64);
     let plain = le_u16(&levels);
     let size = plain.len();
     let shuffled = shuffle(&plain, 2);
@@ -109,7 +115,118 @@ fn reads_every_standard_codec_and_its_shuffled_variant() {
     ];
 
     for (attribute, stored) in cases {
-        decodes_to(attached_u16(&attribute, stored), &levels, &attribute);
+        let unit = attached_image(
+            &format!(r#"geometry="8:8:1" sampleFormat="UInt16" {attribute}"#),
+            stored,
+        );
+        let (_, got) = read_one(unit);
+        assert_same_bits(&got, &expected_u16(&levels), &attribute);
+    }
+}
+
+/// The same bullet's Revision 2 clause: *including data blocks with uncompressed subblocks*.
+///
+/// One block per codec and `+sh` variant, split into an uncompressed subblock and a compressed
+/// one. For a shuffled block the uncompressed subblock holds bytes of the *shuffled* block,
+/// since the shuffle is applied before the split (§10.6.1).
+#[test]
+fn reads_data_blocks_with_uncompressed_subblocks() {
+    let levels = repeating_u16(64);
+    let plain = le_u16(&levels);
+    let size = plain.len();
+    type Compress = fn(&[u8]) -> Vec<u8>;
+    let codecs: [(&str, Compress); 4] = [
+        ("zlib", zlib),
+        ("lz4", lz4),
+        ("lz4hc", lz4),
+        ("zstd", zstd_raw),
+    ];
+    for (codec, compress) in codecs {
+        for shuffled in [false, true] {
+            let block = if shuffled {
+                shuffle(&plain, 2)
+            } else {
+                plain.clone()
+            };
+            let (raw, rest) = block.split_at(size / 2);
+            let packed = compress(rest);
+            let mut stored = raw.to_vec();
+            stored.extend_from_slice(&packed);
+            let name = if shuffled {
+                format!("{codec}+sh:{size}:2")
+            } else {
+                format!("{codec}:{size}")
+            };
+            let attribute = format!(
+                r#"compression="{name}" subblocks="{},{}:{},{}""#,
+                raw.len(),
+                raw.len(),
+                packed.len(),
+                rest.len()
+            );
+            let unit = attached_image(
+                &format!(r#"geometry="8:8:1" sampleFormat="UInt16" {attribute}"#),
+                stored,
+            );
+            let (_, got) = read_one(unit);
+            assert_same_bits(&got, &expected_u16(&levels), &attribute);
+        }
+    }
+}
+
+/// Revision 2's §2.1: a decoder *may* read a compressed subblock of equal lengths, written
+/// under an earlier revision by an encoder that compressed every subblock, by attempting to
+/// decompress it first — `EqualLengthSubblocks::TryDecompress`.
+///
+/// The standard 4 × 3 fixture shuffled and LZ4-compressed is exactly such a block: 24 stored
+/// bytes for 24 bytes of data. Under the default, §10.6.1 reads it as an uncompressed subblock,
+/// so it decodes to its own compressed bytes; under the option it decodes to its pixels.
+#[test]
+fn a_pre_revision_2_block_as_long_as_its_data_decodes_under_try_decompress() {
+    use astroframe::{DecodeOptions, EqualLengthSubblocks};
+    let levels = samples();
+    let plain = le_u16(&levels);
+    let shuffled = shuffle(&plain, 2);
+    let size = plain.len();
+    for codec in ["lz4", "lz4hc"] {
+        let stored = lz4_flex::block::compress(&shuffled);
+        assert_eq!(stored.len(), size, "the fixture is a 24 == 24 block");
+        let unit = attached_u16(
+            &format!(r#"compression="{codec}+sh:{size}:2""#),
+            stored.clone(),
+        );
+
+        let legacy = DecodeOptions::default()
+            .with_equal_length_subblocks(EqualLengthSubblocks::TryDecompress);
+        let mut reader = legacy
+            .seekable(std::io::Cursor::new(unit.clone()))
+            .expect("constructs");
+        assert!(reader.next_image().expect("advances"));
+        let got = reader.read_image().expect("decodes").into_samples();
+        assert_same_bits(
+            &got,
+            &expected_u16(&levels),
+            &format!("{codec}+sh, TryDecompress"),
+        );
+
+        // The stored bytes, unshuffled as the codec says, are what the default reads.
+        let mut as_samples = vec![0u8; size];
+        for (i, slot) in as_samples.iter_mut().enumerate() {
+            let (item, byte) = (i / 2, i % 2);
+            *slot = stored[byte * (size / 2) + item];
+        }
+        let stored_levels: Vec<u16> = as_samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        let (_, got) = read_one(unit);
+        assert_same_bits(
+            &got,
+            &expected_u16(&stored_levels),
+            &format!("{codec}+sh, default"),
+        );
     }
 }
 
@@ -406,7 +523,7 @@ fn data_blocks_in_both_byte_orders() {
 
 /// §7.2's *verify data block checksums computed with SHA-1, SHA-256 and SHA-512* bullet.
 ///
-/// Revision 1 requires these three of **every** decoder — §10.5's "claiming support" qualifier
+/// Revision 2 requires these three of **every** decoder — §10.5's "claiming support" qualifier
 /// applies to encoders — so they are the conformance-bearing ones. The two SHA-3 algorithms
 /// are optional and are graded with the rest of the checksum surface in
 /// `tests/xisf_decisions.rs`.
@@ -497,8 +614,9 @@ fn an_unsupported_feature_leaves_the_rest_of_the_unit_accessible() {
 ///
 /// All three kinds at once, because the obligation is one rule and a decoder can fail it
 /// separately for each: an element the specification does not define, an attribute on the
-/// `Image` element itself, and an element in a foreign namespace at the root — which Revision
-/// 1's extension-element note says is where an extension belongs. None may disturb the decode.
+/// `Image` element itself, and an element in a foreign namespace at the root — which §9.5's
+/// extension-element rule, added in Revision 1, says is where an extension belongs. None may
+/// disturb the decode.
 #[test]
 fn unrecognized_elements_and_attributes_are_ignored() {
     let levels = samples();

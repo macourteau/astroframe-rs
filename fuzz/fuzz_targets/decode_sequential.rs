@@ -7,8 +7,7 @@
 //! otherwise be entirely unfuzzed.
 #![no_main]
 
-use astroframe::DecodeOptions;
-use astroframe_fuzz::{assert_within, bound, limits, start_counting};
+use astroframe_fuzz::{assert_within, bound, options, start_counting};
 use libfuzzer_sys::fuzz_target;
 
 /// A `Read` with no `Seek`, so the reader takes the sequential source.
@@ -29,7 +28,7 @@ impl std::io::Read for Forward<'_> {
 fuzz_target!(|data: &[u8]| {
     let run = start_counting();
     let source = Forward { data, at: 0 };
-    if let Ok(mut reader) = DecodeOptions::from(limits()).sequential(source) {
+    if let Ok(mut reader) = options(data).sequential(source) {
         while matches!(reader.next_image(), Ok(true)) {
             let Ok(h) = reader.current_header() else {
                 break;

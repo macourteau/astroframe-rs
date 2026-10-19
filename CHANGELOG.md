@@ -163,17 +163,18 @@ document remains valid.
 - **Documentation throughout states the rules Revision 1 settles**, in place of the gaps they
   were argued from. `zstd` is a standard codec that §10.6 recommends and §7.2 requires of a
   baseline decoder, rather than an extension read because writers emit it — and the attribute
-  syntax this crate established by reading attachment bytes is what §10.6.9/§10.6.10 specify.
-  §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder, its "claiming support" qualifier
-  applying to encoders, so a build without the `checksum` feature is not a baseline decoder;
-  this is now stated rather than described as a free narrowing. Ignoring unrecognized elements
-  and attributes is §7's rule rather than this crate's reading of a silence.
-- **Citations retargeted.** Revision 1 renumbers three things: white space from §8.3.4 to
-  §8.3.5, the CFA `pattern` table from Table 15 to Table 18, and — because the colour-space
-  transformations moved to the new normative Annex B — every equation after §8.5.4, downward.
-  The range map is Equation [4] where it was [18], the identity display function [9] where it
-  was [23], the byte-shuffling transform [19]-[21] where it was [33]-[35]. The top-level
-  sections did not move.
+  syntax this crate established by reading attachment bytes is what §10.6.9/§10.6.10
+  (Revision 1 numbering) specify. §10.5 requires SHA-1, SHA-256 and SHA-512 of every
+  decoder, its "claiming support" qualifier applying to encoders, so a build without the
+  `checksum` feature is not a baseline decoder; this is now stated rather than described as a
+  free narrowing. Ignoring unrecognized elements and attributes is §7's rule rather than this
+  crate's reading of a silence.
+- **Citations retargeted** (Revision 1 numbering). Revision 1 renumbers three things: white
+  space from §8.3.4 to §8.3.5, the CFA `pattern` table from Table 15 to Table 18, and —
+  because the colour-space transformations moved to the new normative Annex B — every
+  equation after §8.5.4, downward. The range map is Equation [4] where it was [18], the
+  identity display function [9] where it was [23], the byte-shuffling transform [19]-[21]
+  where it was [33]-[35]. The top-level sections did not move.
 
 ## [0.2.2] — 2026-08-28
 

@@ -4,10 +4,11 @@
 //!
 //! > read the stored block → **verify** → decompress → unshuffle → de-interleave → normalize
 //!
-//! §10.6.1 is explicit that decompressing a block that failed verification is exploitable.
+//! §10.6.2 is explicit that decompressing a block that failed verification is exploitable.
 
 use crate::error::{Error, Result};
 use crate::limits::Limits;
+use crate::options::EqualLengthSubblocks;
 use crate::xisf::scalars::{parse_u64, split_fields, trim};
 
 /// How an embedded or inline block's bytes are spelled as text (§10.3).
@@ -99,7 +100,7 @@ pub(crate) fn parse_encoding(text: &str) -> Result<Encoding> {
     }
 }
 
-/// A compression codec (§10.6.3–§10.6.10).
+/// A compression codec (§10.6.4–§10.6.11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Codec {
     /// zlib-wrapped, not raw deflate. A framed stream, so it decompresses incrementally.
@@ -110,7 +111,7 @@ pub(crate) enum Codec {
     Lz4Hc,
     /// Framed, and the only one of the three with a real magic number.
     ///
-    /// §10.6.9/§10.6.10 give the attribute syntax as `zstd:<size>` and
+    /// §10.6.10/§10.6.11 give the attribute syntax as `zstd:<size>` and
     /// `zstd+sh:<size>:<item-size>`, and §7.2 makes support for both an ability every baseline
     /// decoder has. §10.6 recommends this codec over the others.
     Zstd,
@@ -198,6 +199,72 @@ pub(crate) fn parse_compression(text: &str) -> Result<Compression> {
 
 /// One entry of a `subblocks` list: `(compressed, uncompressed)` lengths in bytes.
 pub(crate) type Subblock = (u64, u64);
+
+/// How one subblock is read — the per-pair decision of §10.6.1, made here and only here.
+///
+/// Both subblock walks act on it: `codec::decompress`, which materializes a block, and
+/// `Stream::open`, which streams one. A block's route is the header's choice for reasons of
+/// its own — a checksum, a shuffle, an embedded location — so a rule each walk restated could
+/// make the same block decode differently by route, which is the drift this keeps out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairKind {
+    /// An uncompressed subblock (`c == u`): its stored bytes are its data, copied unmodified.
+    Raw,
+    /// Every other subblock, `c > u` included: decompressed to exactly `u` bytes, and the
+    /// codec must end there.
+    Compressed,
+    /// `c == u` under [`EqualLengthSubblocks::TryDecompress`]: decompressed if the codec takes
+    /// it and ends at exactly `u` bytes, copied otherwise. The attempt needs the subblock
+    /// resident.
+    Probe,
+}
+
+/// Classify one `(compressed, uncompressed)` pair.
+///
+/// An empty pair is raw under either reading: there is nothing to attempt, and building a
+/// codec state to learn that zero bytes are zero bytes is work a subblock list of 4096 empty
+/// pairs would multiply.
+pub(crate) fn classify(
+    (compressed, uncompressed): Subblock,
+    reading: EqualLengthSubblocks,
+) -> PairKind {
+    if compressed != uncompressed {
+        return PairKind::Compressed;
+    }
+    match reading {
+        _ if compressed == 0 => PairKind::Raw,
+        EqualLengthSubblocks::Uncompressed => PairKind::Raw,
+        EqualLengthSubblocks::TryDecompress => PairKind::Probe,
+    }
+}
+
+/// Whether a block's codec has to hold a whole subblock resident to produce any of it.
+///
+/// This is the one predicate both `granularity()` and the decoder's `is_streamable` read, so
+/// the floor a header reports and the path its pixels take cannot disagree. A bare LZ4 block
+/// has no framing and decompresses only as a whole; zlib and zstd are framed streams that
+/// decompress incrementally, unless a pair is a [`PairKind::Probe`], whose attempt needs it
+/// resident.
+///
+/// `stored` is the block's stored length, which an unsplit block's one pair is made of
+/// (§10.6.1); it is `None` only where the header phase does not know it, and such a block is
+/// never streamed.
+pub(crate) fn holds_whole_subblocks(
+    codec: Codec,
+    subblocks: Option<&[Subblock]>,
+    stored: Option<u64>,
+    implied: u64,
+    reading: EqualLengthSubblocks,
+) -> bool {
+    if matches!(codec, Codec::Lz4 | Codec::Lz4Hc) {
+        return true;
+    }
+    let probe = |pair: Subblock| classify(pair, reading) == PairKind::Probe;
+    match subblocks {
+        Some(list) => list.iter().copied().any(probe),
+        None => stored.is_some_and(|stored| probe((stored, implied))),
+    }
+}
 
 /// Parse a `subblocks` attribute — `c_1,u_1:c_2,u_2:…:c_N,u_N`.
 ///
@@ -367,13 +434,13 @@ fn hex_digit(b: u8) -> std::result::Result<u8, ()> {
 
 /// One byte of the **unshuffled** block, read without materializing an unshuffled copy.
 ///
-/// The §10.6.2 transform stores the `item_size` subsets of equally significant bytes as
+/// The §10.6.3 transform stores the `item_size` subsets of equally significant bytes as
 /// compact subsequences in ascending order, so byte `j` of item `i` sits at `j·N + i` for
 /// `N = size / item_size` items. Reconstructing one sample therefore needs bytes spread
 /// across the entire block and no prefix yields any complete sample — which is why shuffling
 /// forces `WholeImage` granularity, ignoring any subblock split.
 ///
-/// A **trailing partial item** is copied through unshuffled, which §10.6.2 states outright:
+/// A **trailing partial item** is copied through unshuffled, which §10.6.3 states outright:
 /// bytes at the end of a block that do not form a complete item "are not shuffled and shall be
 /// stored unaltered after the shuffled bytes". The planes are defined over "subsets of
 /// equally significant bytes", which exist only for complete items, so a partial
@@ -462,7 +529,7 @@ mod tests {
         assert!(c.shuffled);
         assert_eq!(c.item_size, Some(2));
 
-        // The §10.6.9/§10.6.10 zstd syntax.
+        // The §10.6.10/§10.6.11 zstd syntax.
         assert_eq!(parse_compression("zstd:64").unwrap().codec, Codec::Zstd);
         assert_eq!(
             parse_compression("zstd+sh:64:4").unwrap().item_size,

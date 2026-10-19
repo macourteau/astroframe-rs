@@ -277,6 +277,68 @@ compares positions the file declares, and past the length cross-check, which wou
 by exactly the bytes in front. Refusing a cursor that is not at 0 would lock out the container
 case a sequential source has always handled.
 
+### The equal-length reading is an enum on `DecodeOptions`, named after the specification
+
+§ XISF decisions fixes what Revision 2's §10.6.1 requires and that the attempt it permits is
+opt-in; the shape of the knob is left open. It is `DecodeOptions::equal_length_subblocks`, of
+type `EqualLengthSubblocks { Uncompressed, TryDecompress }`, `#[non_exhaustive]`, `Copy`, `Eq`,
+`Hash`, `Default` (`Uncompressed`) and `Debug`, set through `with_equal_length_subblocks`.
+
+An enum rather than a `bool`, because `with_equal_length_subblocks(TryDecompress)` reads at the
+call site where `with_try_decompress(true)` reads as a mode switch with no subject, and because a
+third reading — refusing such a subblock, say — is an addition to a `#[non_exhaustive]` enum and
+a break to a `bool`. `Uncompressed` is §10.6.1's own term for what the default makes of the
+subblock; `TryDecompress` is what the option does, in the order it does it. A field of
+`DecodeOptions` rather than of `Limits`, because a cap decides only whether a file is refused
+and this decides which bytes a block decodes to (§ The API). FITS has no subblocks and ignores
+it, and the type exists in every feature configuration so that `DecodeOptions` is one type
+whichever formats are built.
+
+### What counts as the codec refusing an attempt
+
+§10.6.1's attempt succeeds if "the decompression succeeds and generates exactly *u*_i bytes";
+otherwise the subblock is read as stored. "Succeeds" is resolved to the end-of-stream test every
+compressed subblock is already held to: the codec yields exactly `u` bytes and then has nothing
+further to give. Every way that test fails is a refusal and falls back — an LZ4 block that does
+not decode or decodes to another length, a zlib stream the inflater rejects or that ends short of
+or runs past `u`, a zstd frame whose header or blocks do not decode. Bytes after the end of a
+zlib stream, or of a complete zstd frame, are ignored, as they are for every compressed subblock
+of those codecs on every route — a `zstd_raw` frame of 256 bytes with eight bytes of filler
+after it decodes — so they do not make an attempt fail either. A bare LZ4 block has no end
+marker to stop at, and refuses the same filler. One failure is not a refusal: a zstd frame header declaring a window above
+`zstd_window_bytes` is a cap the attempt tripped on what may be a valid stream, and it is
+reported as `LimitExceeded`.
+
+Two consequences follow and are accepted. A *stored* subblock whose bytes happen to be a valid
+stream of the codec yielding exactly `u` bytes is read as compressed under the option — the
+false positive the specification's wording admits, negligible for pixel data behind a zlib
+header check or a zstd magic, and never reached under the default. And a damaged compressed
+subblock of equal lengths falls back silently, which is the carve-out § XISF decisions
+records.
+
+### An empty pair is never attempted
+
+`(0, 0)` is an uncompressed subblock under both readings. There is nothing to attempt: no codec
+yields zero bytes from zero bytes in a way that could differ from copying them, and building or
+resetting a codec state to learn that would be per-pair work a list of 4096 empty pairs
+multiplies. It also keeps an empty pair out of the granularity decision, so it never moves a
+framed block off `Rows`.
+
+### One held pair moves the whole block's floor
+
+Granularity is reported per block, so a `zlib` or `zstd` block whose list holds a single
+non-empty equal-length pair reports `Block` under `TryDecompress`, although its other pairs still
+stream incrementally between the held one's boundaries. A per-pair floor would describe the
+decode more finely and is not something `Granularity` can say; `Block` is the honest worst case
+of the block, which is what the floors compose to everywhere else.
+
+### A held subblock's stored bytes are read for no codec
+
+The stored bytes of a subblock held whole — a bare LZ4 subblock, or one attempted under the
+option — are read from the source before any codec sees them, so a source failing there is
+`Io`, as it is for an uncompressed block's rows, and never a codec's complaint about bytes it
+did not get.
+
 ## Dependency policy: one reviewed exception
 
 § Dependencies of the design assumes the runtime graph is clean of the banned numeric helpers.

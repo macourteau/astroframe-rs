@@ -59,19 +59,32 @@ finding is strongest when it falsifies one of these:
 - **I4: no allocation from an unvalidated declared size** (§ Hardening: "Geometry is the ceiling;
   every other size the header declares is only ever a cross-check"). Buffers are sized from
   validated geometry bounded by the caps. A declared uncompressed size that disagrees with the
-  geometry is `Malformed` before any allocation. Every codec inflates to exactly the
-  geometry-implied length and then requires end of stream. The zstd window is checked before it is
-  allocated. The XML header is read in 64 KiB chunks under its cap, never pre-sized.
+  geometry is `Malformed` before any allocation. Every compressed subblock inflates to exactly its
+  declared length and then requires end of stream — XISF Revision 2's per-subblock *shall*
+  (§10.6.1), on both subblock walks and including pairs owed no bytes after the last row; a pair
+  whose two lengths differ is compressed, `c > u` included. The streaming walk checks the pairs a
+  decode reads: a planar `select_channel` decode deliberately stops at the selected channel's last
+  row and never opens the pairs after it (§ Hardening; `next_chunk` in `src/xisf/decoder.rs`), so
+  a bad trailing pair there is `Ok` attached and `Malformed` embedded or checksummed. That is
+  documented behaviour, not a finding. A pair whose lengths are equal is an
+  uncompressed subblock and is copied from the stored bytes, never handed to a codec, so its
+  length is exact by construction. The zstd window is checked before it is allocated. The XML header is read in 64 KiB chunks under its cap, never pre-sized.
 - **Allocation proportional to input.** The fuzz oracle (`fuzz/src/lib.rs`, § Fuzzing) bounds
   *cumulative* allocation at `32 × input_len + 8 MiB` under tightened `Limits` (2¹⁸ samples, 1 MiB
   output). The rule behind it, from `docs/intentional-patterns.md`: **no per-occurrence allocation
-  may be sized by a cap**. Anything allocated per image, per `<Reference>`, per subblock or per
-  extension must be sized by that occurrence's own bytes, not multiplied by a cap the input chooses
-  freely. This class has been found and fixed many times (gigabytes from headers of about a
-  megabyte), and it is the most productive place to look.
+  may be sized by a cap**. Anything allocated per image, per `<Reference>`, per subblock (an
+  uncompressed one, and a failed `TryDecompress` attempt, included) or per extension must be sized
+  by that occurrence's own bytes, not multiplied by a cap the input chooses freely. This class has
+  been found and fixed many times (gigabytes from headers of about a megabyte), and it is the most
+  productive place to look.
 - **No silent repair** (§ The organizing principle). A frame that cannot be decoded under the
   documented rules is an error, never a best guess. Returning `Ok` with pixels that did not come
-  from the bytes the header declares for that image violates this.
+  from the bytes the header declares for that image violates this. **One documented, opt-in
+  exception**: under `DecodeOptions::with_equal_length_subblocks(EqualLengthSubblocks::TryDecompress)`
+  a subblock of equal lengths that the codec refuses is read as its stored bytes, so a damaged one
+  decodes without an error unless a checksum is declared. That is the option working as specified,
+  not a finding; the same fallback under the default `Uncompressed` reading (which never attempts
+  the codec), on any pair whose lengths differ, or on a cap tripped during the attempt, is one.
 - **Error classes and their order are specified** (§ Errors, § Errors → Validation order) and
   asserted by tests. **Decoded bits are public API** (§ Normalization).
 
@@ -94,7 +107,7 @@ normative home of the caps.
 | `hdus_per_advance` | 4096 | HDUs stepped over inside one `next_image()` |
 | `total_samples` | 2³⁰ | The **file's** `w × h × c`, checked first in the pixel phase, before any buffer, regardless of `select_channel` |
 | `decoded_output_bytes` | 2³⁰ | Bytes written to a tier-2 destination. Narrowed by `select_channel`; tier 3 is exempt |
-| `materialized_bytes` | 2³⁰ | Each buffer the crate allocates for itself, at that buffer's own size: whole-image scratch, stored block, staging row, LZ4 subblock |
+| `materialized_bytes` | 2³⁰ | Each buffer the crate allocates for itself, at that buffer's own size: whole-image scratch, stored block, staging row, a subblock held whole (LZ4, or attempted under `TryDecompress`) |
 | `skipped_block_bytes` | 2³⁰ | One read-and-discard on a sequential source. Not consulted where skipping is a seek |
 | `images_per_source` | 256 | `next_image()` advances. Occurrences past it are not built |
 
@@ -132,7 +145,7 @@ path or URL named inside an input is Critical.**
 The API has no "verified" flag: a successful read is the verification. A block declaring
 `checksum="alg:digest"` is hashed over its *stored* (compressed) bytes, and the digest must match
 before anything decompresses, unshuffles or delivers it (§ Decisions the implementer must not
-silently change, "Checksum before decompression, always"; XISF §10.6.1). A mismatch is
+silently change, "Checksum before decompression, always"; XISF §10.6.2). A mismatch is
 `ChecksumMismatch`: at construction for an `embedded` block, at the first pixel call for an
 attachment. A checksummed block is never streamed (`is_streamable`), so no chunk precedes
 verification. With the feature **off**, `codec::verify` returns `Unsupported` and the position

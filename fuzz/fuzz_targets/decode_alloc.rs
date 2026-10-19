@@ -4,14 +4,13 @@
 //! geometry-implied size on top of the general bound — the one place the extra room belongs.
 #![no_main]
 
-use astroframe::DecodeOptions;
-use astroframe_fuzz::{accumulate_implied, assert_within, bound, limits, start_counting};
+use astroframe_fuzz::{accumulate_implied, assert_within, bound, options, start_counting};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let run = start_counting();
     let mut implied: usize = 0;
-    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(std::io::Cursor::new(data)) {
+    if let Ok(mut reader) = options(data).seekable(std::io::Cursor::new(data)) {
         while matches!(reader.next_image(), Ok(true)) {
             if let Ok(h) = reader.current_header()
                 && let (Some(w), Some(ht), Some(c), Some(f)) =
