@@ -461,6 +461,16 @@ impl Decoder {
                 PixelStorage::Normal => height,
             };
             if p.stream_row >= input_rows {
+                // Every pair is decompressed, including those after the last output byte.
+                // `stream_fill` opens a subblock only when it needs output, so a trailing pair
+                // owed nothing would otherwise never be opened — and `codec::decompress`, the
+                // walk the same block takes embedded or checksummed, refuses one that is not a
+                // stream. The sums already match, so each pair opened here is owed zero bytes,
+                // and `open_next_subblock` requires the end of the one before it.
+                let pairs = p.plan.subblocks.as_deref().map_or(1, <[_]>::len);
+                while p.subblock_index + 1 < pairs {
+                    open_next_subblock(p, src, limits)?;
+                }
                 let PixelState {
                     stream,
                     stored_left,
