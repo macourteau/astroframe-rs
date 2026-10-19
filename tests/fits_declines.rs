@@ -829,6 +829,9 @@ fn a_source_whose_reads_fail_is_io() {
         .expect_err("the source fails mid-data-unit");
     assert_eq!(kind(&err), "Io", "{err}");
     assert!(err.is_io(), "{err}");
+    // The source's own error, not a relabelling of it: `FailingRead` fails with a broken pipe.
+    let Error::Io(io) = &err else { unreachable!() };
+    assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe, "{io}");
 }
 
 /// Criterion *Declining is catchable, and distinguishable from failing*: a tile-compressed
