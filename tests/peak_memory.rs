@@ -31,7 +31,7 @@
 mod alloc;
 mod common;
 
-use astroframe::Reader;
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Reader};
 use common::Hdu;
 use common::xisf::{Unit, lz4, repeating_u16, shuffle, zlib, zstd_raw};
 use std::io::Cursor;
@@ -79,12 +79,79 @@ fn peak_decode_memory_meets_the_stated_target() {
     fits_row();
     compressed_xisf_row();
     subblocked_lz4_row();
-    // Both framed codecs, because each carries a codec state of its own across the split.
-    a_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib);
-    a_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw);
-    // And both again on the materializing path, which is a second walk over the same split.
-    a_materialized_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib);
-    a_materialized_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw);
+    a_held_subblock_is_one_subblock_and_not_the_image();
+    // Both framed codecs, because each carries a codec state of its own across the split; and
+    // each again with every other subblock uncompressed, under both readings of one.
+    for split in [
+        Split::Compressed,
+        Split::RawEveryOther(Strict),
+        Split::RawEveryOther(Try),
+    ] {
+        a_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib, split);
+        a_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw, split);
+        // And both again on the materializing path, which is a second walk over the same split.
+        a_materialized_subblock_costs_the_subblock_and_not_the_cap("zlib", &zlib, split);
+        a_materialized_subblock_costs_the_subblock_and_not_the_cap("zstd", &zstd_raw, split);
+    }
+}
+
+use EqualLengthSubblocks::{TryDecompress as Try, Uncompressed as Strict};
+
+/// How a cumulative shape divides its block.
+///
+/// Every subblock compressed is the shape the rule was found on. Every other one uncompressed
+/// (§10.6.1) is the alternation a decoder that rebuilt its codec state around a raw subblock
+/// would pay for at each boundary — 2048 times at the cap — and under
+/// `EqualLengthSubblocks::TryDecompress` each of those raw subblocks is also an *attempt* that
+/// fails, which is free only if a failed attempt allocates nothing.
+#[derive(Clone, Copy, Debug)]
+enum Split {
+    Compressed,
+    RawEveryOther(EqualLengthSubblocks),
+}
+
+impl Split {
+    fn options(self) -> DecodeOptions {
+        match self {
+            Split::Compressed => DecodeOptions::default(),
+            Split::RawEveryOther(reading) => {
+                DecodeOptions::default().with_equal_length_subblocks(reading)
+            }
+        }
+    }
+
+    /// The stored bytes and the `subblocks` list of `block` cut into `parts`.
+    fn build(
+        self,
+        block: &[u8],
+        parts: usize,
+        compress: &dyn Fn(&[u8]) -> Vec<u8>,
+    ) -> (Vec<u8>, String) {
+        // Split over the *compression*, per §10.6: each piece is compressed on its own.
+        let part = block.len() / parts;
+        let mut stored = Vec::new();
+        let mut list = Vec::new();
+        for (i, chunk) in block.chunks(part).enumerate() {
+            let c = match self {
+                Split::RawEveryOther(_) if i % 2 == 0 => chunk.to_vec(),
+                _ => compress(chunk),
+            };
+            list.push(format!("{},{}", c.len(), chunk.len()));
+            stored.extend_from_slice(&c);
+        }
+        (stored, list.join(":"))
+    }
+
+    /// The streaming floor such a split reports: `Rows`, unless an attempt needs its subblock
+    /// held.
+    fn streaming_floor(self, parts: usize) -> astroframe::Granularity {
+        match self {
+            Split::RawEveryOther(Try) => astroframe::Granularity::Block {
+                subblocks: parts as u32,
+            },
+            _ => astroframe::Granularity::Rows,
+        }
+    }
 }
 
 fn fits_row() {
@@ -234,6 +301,65 @@ fn subblocked_lz4_row() {
     );
 }
 
+/// The row `EqualLengthSubblocks::TryDecompress` adds: a framed codec's block holding equal-length
+/// subblocks, each of which the attempt needs resident, reports `Block` — and the peak has to be
+/// what that promises, one subblock compressed and decompressed, as `subblocked_lz4_row`
+/// measures for LZ4. Materializing the block for one such subblock would decode the same pixels
+/// and cost about the destination's half again.
+fn a_held_subblock_is_one_subblock_and_not_the_image() {
+    const PARTS: usize = 8;
+    let width = 2048u32;
+    let height = 2048u32;
+    let samples = width as usize * height as usize;
+    let levels = repeating_u16(samples);
+    let raw = common::xisf::le_u16(&levels);
+
+    // Every subblock stored uncompressed, so every one is attempted and falls back.
+    let part = raw.len() / PARTS;
+    let list = vec![format!("{part},{part}"); PARTS].join(":");
+    let template = format!(
+        r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" compression="zlib:{}" subblocks="{list}" {{loc}}/>"#,
+        raw.len()
+    );
+    let unit = Unit::new().attached(&template, raw.clone()).build();
+
+    let mut dst = vec![0.0f32; samples];
+    let destination_bytes = dst.len() * 4;
+
+    let options = DecodeOptions::default().with_equal_length_subblocks(Try);
+    let mut reader = options.seekable(Cursor::new(&unit)).expect("open");
+    assert!(reader.next_image().expect("advance"));
+    assert_eq!(
+        reader.current_header().expect("a header").granularity(),
+        astroframe::Granularity::Block {
+            subblocks: PARTS as u32
+        },
+        "the fixture must reach the Block floor for the bound below to mean anything"
+    );
+
+    alloc::reset();
+    reader.read_image_into(&mut dst).expect("decode");
+    // The peak, for the reason `subblocked_lz4_row` gives.
+    let used = alloc::peak();
+
+    // The same bound as the LZ4 row: one decompressed subblock is destination_bytes / 16, and
+    // the held stored copy beside it is the same size again here, every subblock being stored
+    // at its own length.
+    let allowed = destination_bytes * 3 / 16;
+    assert!(
+        used <= allowed,
+        "a zlib block of {PARTS} held subblocks allocated {used} bytes above a \
+         {destination_bytes}-byte destination; holding one at a time allows {allowed}"
+    );
+    let expect = common::xisf::expected_u16(&levels);
+    assert!(
+        dst.iter()
+            .zip(&expect)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the held subblocks did not decode to their stored bytes"
+    );
+}
+
 /// The **cumulative** half of the same criterion, on the subblock axis: what a decode
 /// allocates over a block must be sized by that block's stored bytes, never by
 /// `Subblock count`.
@@ -261,7 +387,11 @@ fn subblocked_lz4_row() {
 /// — so "one state per subblock" is a separate way to reach the same defect on each, and one
 /// codec's shape does not hold the other's. LZ4 is not here: its buffers are sized from the
 /// subblock already, which is what `subblocked_lz4_row` measures.
-fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(&[u8]) -> Vec<u8>) {
+fn a_subblock_costs_the_subblock_and_not_the_cap(
+    codec: &str,
+    compress: &dyn Fn(&[u8]) -> Vec<u8>,
+    split: Split,
+) {
     // 4096 is the `Subblock count` cap, so the wide point is the worst a file may ask for.
     const SPLITS: [usize; 2] = [8, 4096];
     const PER_SUBBLOCK: usize = 64;
@@ -273,17 +403,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
 
     let mut totals = Vec::new();
     for parts in SPLITS {
-        // Split over the *compression*, per §10.6: each piece is compressed on its own.
-        let part = raw.len() / parts;
-        let mut stored = Vec::new();
-        let mut list = Vec::new();
-        for chunk in raw.chunks(part) {
-            let c = compress(chunk);
-            list.push(format!("{},{}", c.len(), chunk.len()));
-            stored.extend_from_slice(&c);
-        }
-        let list = list.join(":");
-
+        let (stored, list) = split.build(&raw, parts, compress);
         let template = format!(
             r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" compression="{codec}:{}" subblocks="{list}" {{loc}}/>"#,
             raw.len()
@@ -292,13 +412,14 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
         let input_bytes = unit.len();
 
         let mut dst = vec![0.0f32; samples];
-        let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+        let mut reader = split.options().seekable(Cursor::new(&unit)).expect("open");
         assert!(reader.next_image().expect("advance"));
         assert_eq!(
             reader.current_header().expect("a header").granularity(),
-            astroframe::Granularity::Rows,
-            "§ Streaming puts a framed codec plus subblocks at `Rows`; a fixture reporting \
-             anything else is not on the streaming subblock path this measures"
+            split.streaming_floor(parts),
+            "§ Streaming puts a framed codec plus subblocks at `Rows`, or at `Block` where an \
+             attempt holds a subblock; a fixture reporting anything else is not on the \
+             streaming subblock path this measures"
         );
 
         alloc::reset();
@@ -312,7 +433,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
         let allowed = 32 * input_bytes + (8 << 20);
         assert!(
             used <= allowed,
-            "a {codec} block split {parts} ways allocated {used} bytes from a \
+            "a {codec} block split {parts} ways ({split:?}) allocated {used} bytes from a \
              {input_bytes}-byte input, above the fuzz oracle's {allowed}. A per-subblock \
              input window or codec state sized by `Subblock count` rather than by the \
              subblock lands here."
@@ -327,10 +448,10 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
     let allowed = narrow * 2;
     assert!(
         wide <= allowed,
-        "splitting the same {codec} block from {} into {} subblocks took allocation from \
-         {narrow} to {wide} bytes, above the {allowed} a flat per-subblock cost allows. \
-         Allocation that grows with the split is sized by the cap rather than by the \
-         subblock.",
+        "splitting the same {codec} block ({split:?}) from {} into {} subblocks took \
+         allocation from {narrow} to {wide} bytes, above the {allowed} a flat per-subblock \
+         cost allows. Allocation that grows with the split is sized by the cap rather than by \
+         the subblock.",
         SPLITS[0],
         SPLITS[1]
     );
@@ -355,6 +476,7 @@ fn a_subblock_costs_the_subblock_and_not_the_cap(codec: &str, compress: &dyn Fn(
 fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
     codec: &str,
     compress: &dyn Fn(&[u8]) -> Vec<u8>,
+    split: Split,
 ) {
     // 4096 is the `Subblock count` cap, so the wide point is the worst a file may ask for.
     const SPLITS: [usize; 2] = [8, 4096];
@@ -372,17 +494,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
 
     let mut totals = Vec::new();
     for parts in SPLITS {
-        // Split over the *compression*, per §10.6: each piece is compressed on its own.
-        let part = shuffled.len() / parts;
-        let mut stored = Vec::new();
-        let mut list = Vec::new();
-        for chunk in shuffled.chunks(part) {
-            let c = compress(chunk);
-            list.push(format!("{},{}", c.len(), chunk.len()));
-            stored.extend_from_slice(&c);
-        }
-        let list = list.join(":");
-
+        let (stored, list) = split.build(&shuffled, parts, compress);
         let template = format!(
             r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" compression="{codec}+sh:{}:2" subblocks="{list}" {{loc}}/>"#,
             raw.len()
@@ -391,7 +503,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
         let input_bytes = unit.len();
 
         let mut dst = vec![0.0f32; samples];
-        let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+        let mut reader = split.options().seekable(Cursor::new(&unit)).expect("open");
         assert!(reader.next_image().expect("advance"));
         assert_eq!(
             reader.current_header().expect("a header").granularity(),
@@ -413,7 +525,8 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
             dst.iter()
                 .zip(&expect)
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "the {codec} fixture split {parts} ways did not round-trip through the shuffle"
+            "the {codec} fixture split {parts} ways ({split:?}) did not round-trip through the \
+             shuffle"
         );
 
         // The fuzz oracle's own bound, restated so the two cannot drift — `32 × input_length
@@ -421,7 +534,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
         let allowed = 32 * input_bytes + (8 << 20);
         assert!(
             used <= allowed,
-            "a materialized {codec} block split {parts} ways allocated {used} bytes from a \
+            "a materialized {codec} block split {parts} ways ({split:?}) allocated {used} bytes from a \
              {input_bytes}-byte input, above the fuzz oracle's {allowed}. A codec state built \
              per subblock rather than carried across the block lands here."
         );
@@ -435,7 +548,7 @@ fn a_materialized_subblock_costs_the_subblock_and_not_the_cap(
     let allowed = narrow * 2;
     assert!(
         wide <= allowed,
-        "splitting the same materialized {codec} block from {} into {} subblocks took \
+        "splitting the same materialized {codec} block ({split:?}) from {} into {} subblocks took \
          allocation from {narrow} to {wide} bytes, above the {allowed} a flat per-subblock \
          cost allows. Allocation that grows with the split is sized by the cap rather than by \
          the subblock.",

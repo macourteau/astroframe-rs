@@ -12,7 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use astroframe::{DecodeOptions, Limits};
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits};
 
 /// Where the general allocation bound comes from.
 ///
@@ -153,6 +153,23 @@ pub fn limits() -> Limits {
     limits
 }
 
+/// The `DecodeOptions` every target constructs its `Reader` with: [`limits`], and the reading
+/// of an XISF subblock whose two lengths are equal, chosen by the input.
+///
+/// `EqualLengthSubblocks::TryDecompress` is a second path through every subblock walk — the
+/// attempt, the fallback, a framed block held a subblock at a time — so a fuzzer held to the
+/// default never reaches it. The **low bit of the input's last byte** picks it, rather than a
+/// byte taken off the front, so every seed keeps its meaning: the front of an input is the
+/// format signature the corpus was built to start from, and a mutation of the last byte is a
+/// single bit flip away from the other reading.
+pub fn options(input: &[u8]) -> DecodeOptions {
+    let reading = match input.last() {
+        Some(byte) if byte & 1 == 1 => EqualLengthSubblocks::TryDecompress,
+        _ => EqualLengthSubblocks::Uncompressed,
+    };
+    DecodeOptions::from(limits()).with_equal_length_subblocks(reading)
+}
+
 /// The general allocation bound: `ALLOC_MULTIPLE × input_length + header_cap`.
 ///
 /// The header-cap term is there because a twenty-byte input may legitimately declare a header
@@ -215,7 +232,7 @@ pub fn assert_within(run: &AllocationRun, bound: usize, target: &str, input_len:
 /// Errors are outcomes, not failures — the contract being that malformed input produces an
 /// `Err` rather than a panic, a hang, or unbounded allocation.
 pub fn walk_headers(data: &[u8]) {
-    let Ok(mut reader) = DecodeOptions::from(limits()).seekable(std::io::Cursor::new(data)) else {
+    let Ok(mut reader) = options(data).seekable(std::io::Cursor::new(data)) else {
         return;
     };
     let mut advances = 0;

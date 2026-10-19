@@ -32,9 +32,9 @@
 mod alloc;
 mod common;
 
-use astroframe::{DecodeOptions, Limits, Samples};
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits, Samples};
 use common::Hdu;
-use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib};
+use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib, zstd_raw};
 use std::io::Cursor;
 
 #[global_allocator]
@@ -88,6 +88,16 @@ fn limits() -> Limits {
     limits
 }
 
+/// The fuzz crate's `options()`: [`limits`], and the reading of an equal-length XISF subblock
+/// the input's last byte picks.
+fn options(data: &[u8]) -> DecodeOptions {
+    let reading = match data.last() {
+        Some(byte) if byte & 1 == 1 => EqualLengthSubblocks::TryDecompress,
+        _ => EqualLengthSubblocks::Uncompressed,
+    };
+    DecodeOptions::from(limits()).with_equal_length_subblocks(reading)
+}
+
 /// A `Read` with no `Seek`, matching the `decode_sequential` target's source.
 struct Forward<'a> {
     data: &'a [u8],
@@ -113,11 +123,22 @@ impl std::io::Read for Forward<'_> {
 /// bounds — `read_image()` sizes its own destination and is allowed the geometry-implied term
 /// — and summing three lanes' allocation against the loosest of their three bounds is both
 /// weaker than any of them and able to fail on a shape none of them would.
+///
+/// **Under both readings of an equal-length subblock**, not only the one the targets would pick
+/// from the seed's last byte: a seed is a starting point for a mutator that flips that bit, so
+/// both paths through its subblock walk are what it seeds.
 fn replay(data: &[u8]) {
-    header_lane(data);
-    decode_any_lane(data);
-    decode_alloc_lane(data);
-    decode_sequential_lane(data);
+    let picked = options(data);
+    let other = match picked.equal_length_subblocks {
+        EqualLengthSubblocks::Uncompressed => EqualLengthSubblocks::TryDecompress,
+        _ => EqualLengthSubblocks::Uncompressed,
+    };
+    for options in [picked, picked.with_equal_length_subblocks(other)] {
+        header_lane(data, &options);
+        decode_any_lane(data, &options);
+        decode_alloc_lane(data, &options);
+        decode_sequential_lane(data, &options);
+    }
 }
 
 /// The prefix `fits_header` prepends to its input, byte for byte.
@@ -184,9 +205,9 @@ fn strip_xisf_header(bytes: &[u8]) -> &[u8] {
 
 /// `fits_header` / `xisf_header`: the walk with no pixel read at all, which is where every
 /// header-multiplication seed here does its work and the cheapest place to catch one.
-fn header_lane(data: &[u8]) {
+fn header_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
-    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
+    if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
         let mut advances = 0;
         while advances < 1024 {
             match reader.next_image() {
@@ -206,9 +227,9 @@ fn header_lane(data: &[u8]) {
 
 /// `decode_any` and `xisf_block`: a seekable source read into a destination the caller sizes
 /// from the parsed header, as `f32` and as native samples.
-fn decode_any_lane(data: &[u8]) {
+fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
-    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
+    if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -231,10 +252,10 @@ fn decode_any_lane(data: &[u8]) {
 
 /// `decode_alloc`: the allocating `read_image()`, whose bound carries the geometry-implied
 /// size the declared-versus-stored gap can produce.
-fn decode_alloc_lane(data: &[u8]) {
+fn decode_alloc_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     let mut implied = 0usize;
-    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
+    if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -257,9 +278,9 @@ fn decode_alloc_lane(data: &[u8]) {
 
 /// `decode_sequential`: the forward-only source, whose read-and-discard skipping and
 /// no-known-length size checks no other target reaches.
-fn decode_sequential_lane(data: &[u8]) {
+fn decode_sequential_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
-    if let Ok(mut reader) = DecodeOptions::from(limits()).sequential(Forward { data, at: 0 }) {
+    if let Ok(mut reader) = options.sequential(Forward { data, at: 0 }) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -349,6 +370,58 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
                     r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zlib:128" subblocks="{list}" {{loc}}/>"#
                 ),
                 subblocked,
+            )
+            .build(),
+    ));
+    // **Uncompressed subblocks among compressed ones** (§10.6.1), the shape whose two readings
+    // diverge: copied under the default, attempted and fallen back on under `TryDecompress`,
+    // which also holds each one whole. Every other pair is stored at its own length.
+    let (alternating, list) = {
+        let raw = le_u16(&repeating_u16(64));
+        let mut stored = Vec::new();
+        let mut list = Vec::new();
+        for (i, chunk) in raw.chunks(raw.len() / 8).enumerate() {
+            let c = if i % 2 == 0 {
+                chunk.to_vec()
+            } else {
+                zlib(chunk)
+            };
+            list.push(format!("{},{}", c.len(), chunk.len()));
+            stored.extend_from_slice(&c);
+        }
+        (stored, list.join(":"))
+    };
+    seeds.push((
+        "xisf/uncompressed-subblocks".into(),
+        Unit::new()
+            .attached(
+                &format!(
+                    r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zlib:128" subblocks="{list}" {{loc}}/>"#
+                ),
+                alternating,
+            )
+            .build(),
+    ));
+    // **An equal-length pair that is a zstd frame header**, declaring a window above the cap:
+    // sixteen bytes of data under the default and a `LimitExceeded` attempt under
+    // `TryDecompress`, beside a raw-block frame longer than its data.
+    let (window, list) = {
+        let raw = le_u16(&repeating_u16(64));
+        let mut stored = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 20 << 3];
+        stored.resize(16, 0x5a);
+        let tail = zstd_raw(&raw[16..]);
+        let list = format!("16,16:{},{}", tail.len(), raw.len() - 16);
+        stored.extend_from_slice(&tail);
+        (stored, list)
+    };
+    seeds.push((
+        "xisf/equal-length-zstd-window".into(),
+        Unit::new()
+            .attached(
+                &format!(
+                    r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zstd:128" subblocks="{list}" {{loc}}/>"#
+                ),
+                window,
             )
             .build(),
     ));

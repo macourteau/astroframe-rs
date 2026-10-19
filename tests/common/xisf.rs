@@ -301,6 +301,12 @@ pub fn shuffle(input: &[u8], item_size: usize) -> Vec<u8> {
 
 /// zlib-wrapped deflate — **not** raw deflate, which is what an XISF `zlib` block holds.
 pub fn zlib(input: &[u8]) -> Vec<u8> {
+    compressed(input, zlib_unchecked(input))
+}
+
+/// [`zlib`] without its length check, for the fixtures whose subject is a compressed stream
+/// exactly as long as its data.
+pub fn zlib_unchecked(input: &[u8]) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
     use std::io::Write;
@@ -315,6 +321,25 @@ pub fn lz4(input: &[u8]) -> Vec<u8> {
     assert!(
         !out.is_empty(),
         "the LZ4 compressor produced nothing; use repeating_u16 for compressible samples"
+    );
+    compressed(input, out)
+}
+
+/// The check every compressing helper here makes: **a fixture meant to be compressed is not
+/// as long as its data.**
+///
+/// XISF Revision 2's §10.6.1 makes a subblock whose compressed and uncompressed lengths are
+/// equal an *uncompressed* subblock — and a block without `subblocks` is one subblock — so a
+/// compressor output that happens to land on the input's length is read as stored bytes, and
+/// the fixture decodes to its own compressed bytes as pixels. That reads exactly like a decoder
+/// bug, so it is refused here instead, where the fixture is built.
+fn compressed(input: &[u8], out: Vec<u8>) -> Vec<u8> {
+    assert_ne!(
+        out.len(),
+        input.len(),
+        "this compressed fixture is as long as its {}-byte input, which §10.6.1 reads as an \
+         uncompressed subblock; change the data or its length",
+        input.len()
     );
     out
 }
@@ -414,6 +439,9 @@ pub fn decodes_to(bytes: Vec<u8>, levels: &[u16], what: &str) -> astroframe::Hea
 /// The `Frame_Content_Size` field widens with the input rather than being fixed at one byte:
 /// the memory fixtures need blocks far past 255 bytes to say anything about peak usage, and a
 /// one-byte field silently cannot describe them.
+///
+/// The frame is always longer than its data, so a pair built from it is a compressed subblock
+/// longer than its data — the `c > u` case §10.6.1 says is still decompressed.
 pub fn zstd_raw(input: &[u8]) -> Vec<u8> {
     assert!(input.len() < 128 * 1024, "one Raw_Block's maximum size");
     let mut out = vec![0x28, 0xb5, 0x2f, 0xfd];
@@ -428,4 +456,82 @@ pub fn zstd_raw(input: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&block_header.to_le_bytes()[..3]);
     out.extend_from_slice(input);
     out
+}
+
+/// A zstd frame of one `RLE_Block`: `n` copies of `byte`, in ten bytes whatever `n` is.
+///
+/// Written byte by byte for the reason [`zstd_raw`] is: magic, a single-segment frame header
+/// whose one-byte `Frame_Content_Size` is `n`, and one last `RLE_Block` of size `n` whose
+/// content is the one byte. It is what makes a zstd stream *shorter* than its data without an
+/// encoder, and at `n == 10` exactly as long.
+pub fn zstd_rle(byte: u8, n: u8) -> Vec<u8> {
+    let mut out = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, n];
+    let block_header: u32 = (u32::from(n) << 3) | (1 << 1) | 1; // last block, RLE_Block
+    out.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    out.push(byte);
+    out
+}
+
+// ------------------------------------------------------------------ the routes to a block
+
+/// One block on each route to the two subblock walks, with the floor each route must report:
+/// attached, which streams unless `attached` says otherwise, and embedded and checksummed,
+/// which materialize. The route is the subject, so the floor travels with the unit — a fixture
+/// drifting onto the other walk would pass by measuring the decoder it is not for.
+///
+/// `image` is the `<Image>` element's own attributes (geometry and sample format), `block` the
+/// block's (`compression`, `subblocks`), which an embedded block carries on its `<Data>`.
+pub fn block_routes(
+    image: &str,
+    block: &str,
+    stored: &[u8],
+    attached: super::Streams,
+) -> Vec<(&'static str, Vec<u8>, super::Streams)> {
+    let attach = |extra: &str| {
+        Unit::new()
+            .attached(
+                &format!("<Image {image} {block} {extra} {{loc}}/>"),
+                stored.to_vec(),
+            )
+            .build()
+    };
+    #[allow(unused_mut)] // only the checksum route pushes
+    let mut routes = vec![
+        ("attached", attach(""), attached),
+        (
+            "embedded",
+            xml_unit(&format!(
+                r#"<Image {image} location="embedded"><Data encoding="base64" {block}>{}</Data></Image>"#,
+                base64(stored)
+            )),
+            super::Streams::WholeImage,
+        ),
+    ];
+    #[cfg(feature = "checksum")]
+    routes.push((
+        "checksummed",
+        attach(&checksum_attr("sha-1", stored)),
+        super::Streams::WholeImage,
+    ));
+    routes
+}
+
+/// What one fixture decodes to on the reader's whole path under `options`: the samples and the
+/// reported floor, or the class of the first refusal — construction, a declined position and
+/// the pixel call all count, since which of them raises it depends on the route.
+pub fn outcome_under(
+    bytes: Vec<u8>,
+    options: &astroframe::DecodeOptions,
+) -> Result<(astroframe::Granularity, Vec<f32>), &'static str> {
+    use super::kind;
+    let mut reader = options
+        .seekable(std::io::Cursor::new(bytes))
+        .map_err(|e| kind(&e))?;
+    assert!(reader.next_image().map_err(|e| kind(&e))?, "one image");
+    let granularity = reader
+        .current_header()
+        .expect("the advanced position")
+        .granularity();
+    let image = reader.read_image().map_err(|e| kind(&e))?;
+    Ok((granularity, image.into_samples()))
 }

@@ -76,6 +76,7 @@
 //! | XISF, uncompressed, no checksum | `Rows` | one I/O buffer |
 //! | XISF, `zlib` or `zstd`, no shuffling, no checksum | `Rows` | I/O buffer + the codec's window |
 //! | XISF, `lz4`/`lz4hc` **+ `subblocks`**, no shuffling, no checksum | `Block` | one subblock, compressed and decompressed |
+//! | XISF, `zlib`/`zstd` **+ `subblocks`** holding a subblock of equal lengths, read under [`EqualLengthSubblocks::TryDecompress`] | `Block` | one subblock, compressed and decompressed |
 //! | XISF, `zlib` **+ `subblocks`**, no shuffling, no checksum | `Rows` | zlib's floor is already `Rows`; `subblocks` cannot lower it |
 //! | XISF, `subblocks` **+ shuffling** | `WholeImage` | the shuffle spans the whole pre-split block |
 //! | XISF, `subblocks` **+ checksum** | `WholeImage` | the digest covers the whole stored block |
@@ -84,7 +85,9 @@
 //!
 //! Each property of a block imposes a **floor**, and the granularity is the **worst** of
 //! them, not the first one found. A `Block` floor is promoted to `WholeImage` unless the
-//! block is split into subblocks; a `Rows` floor is never promoted.
+//! block is split into subblocks; a `Rows` floor is never promoted. An uncompressed subblock —
+//! XISF Revision 2's name for a pair whose two lengths are equal — is read straight from the
+//! source and imposes no floor of its own.
 //!
 //! What that is worth, honestly: tier 1 is the big win and applies to every format and codec
 //! — a metadata sweep over a night's frames stops being a decode at all. FITS tier 2 is worth
@@ -153,7 +156,7 @@ pub use metadata::{
     ResolutionUnit, ValueKind,
 };
 pub use normalize::{Normalizer, Sample, SampleRange, Scaling};
-pub use options::DecodeOptions;
+pub use options::{DecodeOptions, EqualLengthSubblocks};
 pub use reader::{Chunk, Chunks, Reader};
 pub use samples::{F64Iter, SampleFormat, SampleSlice, Samples};
 pub use source::{Seekable, Sequential, Source};

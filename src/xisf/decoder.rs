@@ -3,12 +3,13 @@
 use crate::error::{Error, Result};
 use crate::header::{DeclineClass, DeclineReason, Granularity, Header, PixelStorage};
 use crate::limits::{Limits, narrow};
+use crate::options::DecodeOptions;
 use crate::reader::{ChunkMeta, PixelPlan};
 use crate::samples::{SampleSlice, Samples, slice_samples};
 use crate::source::Source;
 use crate::xisf::block::{self, Codec, Location, unshuffled_byte};
 use crate::xisf::cache::decline_from;
-use crate::xisf::codec::{self, Stream};
+use crate::xisf::codec::{self, Opening, Stream};
 use crate::xisf::image::{BlockPlan, Occurrence, walk_occurrences};
 use crate::xisf::xml;
 
@@ -37,26 +38,171 @@ struct PixelState {
     raw: Vec<u8>,
     raw_row: Option<u64>,
     scratch: Samples,
-    /// How the streaming path pulls rows.
-    stream: Stream,
+    /// How the streaming path pulls a compressed block's rows. Idle for every other block.
+    walk: SubblockWalk,
     /// The next input row a *compressed* stream will yield. A stream cannot seek, so reaching
     /// a later row means reading and discarding the ones before it.
     stream_row: u64,
-    /// Stored bytes of the **current subblock** not yet handed to the decoder, and where the
-    /// next of them sits in the file.
+}
+
+/// Where a streamed compressed block's decode is inside its subblock list, and the stream
+/// reading it.
+///
+/// §10.6 splits the *compression*, so each subblock is read on its own — an independently
+/// compressed stream, or an uncompressed subblock copied from the source (§10.6.1) — and the
+/// codec restarts at every boundary. A single stream opened over the whole stored range ends
+/// after the first subblock and reports a truncated block. A block with no `subblocks`
+/// attribute is one subblock spanning the whole of it, which [`BlockPlan::pair`] supplies.
+#[derive(Debug, Default)]
+struct SubblockWalk {
+    stream: Stream,
+    /// Which pair is open.
+    index: usize,
+    /// Stored bytes of the open pair not yet handed to the stream, and where the next of them
+    /// sits in the file.
     stored_left: u64,
     stored_at: u64,
-    /// Where the whole stored block begins, so a subblock boundary is computed from the
-    /// declared lengths rather than from how much the codec happened to consume.
-    block_start: u64,
-    /// Which subblock the stream is inside, and how much of its output is still owed.
+    /// Where the open pair's stored bytes end, which is where the next pair's begin. A boundary
+    /// comes from the declared lengths, not from how much the codec consumed: a codec may
+    /// legitimately stop short of the bytes it was given.
+    next_at: u64,
+    /// Output the open pair still owes.
+    owed: u64,
+}
+
+impl SubblockWalk {
+    /// Open the first pair of a block whose stored bytes begin at `position`.
+    fn begin<S: Source>(
+        plan: &BlockPlan,
+        codec: Codec,
+        position: u64,
+        src: &mut S,
+        limits: &Limits,
+    ) -> Result<SubblockWalk> {
+        let mut walk = SubblockWalk {
+            next_at: position,
+            ..SubblockWalk::default()
+        };
+        walk.open(plan, codec, 0, src, limits)?;
+        Ok(walk)
+    }
+
+    /// Open pair `index`, which begins where the pair before it ends.
     ///
-    /// §10.6 splits the *compression*, so each subblock is an independently compressed stream
-    /// and the codec has to be restarted at every boundary. A single stream opened over the
-    /// whole stored range ends after the first subblock and reports a truncated block. A block
-    /// with no `subblocks` attribute is one subblock spanning the whole of it.
-    subblock_index: usize,
-    subblock_uncompressed_left: u64,
+    /// How the pair is read is [`block::classify`]'s answer, the one `codec::decompress` acts
+    /// on for the same pair when the same block is materialized.
+    fn open<S: Source>(
+        &mut self,
+        plan: &BlockPlan,
+        codec: Codec,
+        index: usize,
+        src: &mut S,
+        limits: &Limits,
+    ) -> Result<()> {
+        let Some((compressed, uncompressed)) = plan.pair(index) else {
+            return Err(Error::malformed(
+                "compressed block ended before the geometry-implied size was reached",
+            ));
+        };
+        let start = self.next_at;
+        self.next_at = start
+            .checked_add(compressed)
+            .ok_or_else(|| Error::malformed("subblock offsets overflow the address space"))?;
+        self.index = index;
+        self.stored_at = start;
+        self.stored_left = compressed;
+        self.owed = uncompressed;
+        let opening = Opening {
+            codec,
+            kind: block::classify((compressed, uncompressed), plan.equal_length_subblocks),
+            uncompressed,
+        };
+        // `Stream::open` owns both halves of the boundary. It reuses the codec state a framed
+        // codec carries across the whole block — constructing one per subblock multiplies a
+        // fixed cost by `Subblock count`, which is a cap — and it drops the outgoing subblock's
+        // buffers before sizing the incoming one's, so two held subblocks are never resident
+        // together. § Streaming promises one subblock, compressed and decompressed, not two.
+        self.stream.open(
+            opening,
+            src,
+            &mut self.stored_left,
+            &mut self.stored_at,
+            limits,
+        )
+    }
+
+    /// Finish the open pair and open the next.
+    ///
+    /// The finished pair is required to be at its end **per subblock**, so a bomb hidden in any
+    /// one of them is caught at its own boundary rather than at the end of the block.
+    fn advance<S: Source>(
+        &mut self,
+        plan: &BlockPlan,
+        codec: Codec,
+        src: &mut S,
+        limits: &Limits,
+    ) -> Result<()> {
+        self.require_end(src, limits)?;
+        self.open(plan, codec, self.index + 1, src, limits)
+    }
+
+    fn require_end<S: Source>(&mut self, src: &mut S, limits: &Limits) -> Result<()> {
+        self.stream
+            .require_end(src, &mut self.stored_left, &mut self.stored_at, limits)
+    }
+
+    /// Fill `out`, crossing subblock boundaries as it goes.
+    ///
+    /// A row is not aligned to a subblock, so one read may finish one subblock and continue
+    /// into the next.
+    fn fill<S: Source>(
+        &mut self,
+        plan: &BlockPlan,
+        codec: Codec,
+        src: &mut S,
+        limits: &Limits,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let mut filled = 0usize;
+        while filled < out.len() {
+            if self.owed == 0 {
+                self.advance(plan, codec, src, limits)?;
+            }
+            let want = narrow(self.owed, "subblock output")?;
+            let take = (out.len() - filled).min(want);
+            self.stream.fill(
+                &mut out[filled..filled + take],
+                src,
+                &mut self.stored_left,
+                &mut self.stored_at,
+                limits,
+            )?;
+            self.owed -= take as u64;
+            filled += take;
+        }
+        Ok(())
+    }
+
+    /// Read every pair after the last output byte, and require the last pair's end.
+    ///
+    /// Every pair is read, including those after the last output byte. [`SubblockWalk::fill`]
+    /// opens a subblock only when it needs output, so a trailing pair owed nothing would
+    /// otherwise never be opened — and `codec::decompress`, the walk the same block takes
+    /// embedded or checksummed, refuses one that is not a stream. The sums already match, so
+    /// each pair opened here is owed zero bytes, and `advance` requires the end of the one
+    /// before it.
+    fn finish<S: Source>(
+        &mut self,
+        plan: &BlockPlan,
+        codec: Codec,
+        src: &mut S,
+        limits: &Limits,
+    ) -> Result<()> {
+        while self.index + 1 < plan.pair_count() {
+            self.advance(plan, codec, src, limits)?;
+        }
+        self.require_end(src, limits)
+    }
 }
 
 /// A monolithic XISF unit, walked one image occurrence at a time.
@@ -75,7 +221,8 @@ pub(crate) struct Decoder {
 
 impl Decoder {
     /// Read the preamble and the XML header, and stop. No image is selected.
-    pub(crate) fn new<S: Source>(src: &mut S, limits: &Limits) -> Result<Decoder> {
+    pub(crate) fn new<S: Source>(src: &mut S, options: &DecodeOptions) -> Result<Decoder> {
+        let limits = &options.limits;
         let mut rest = [0u8; 8];
         src.read_exact(&mut rest)?;
         let declared = u64::from(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]));
@@ -117,7 +264,7 @@ impl Decoder {
             }
         }
 
-        let mut occurrences = walk_occurrences(&doc, limits)?;
+        let mut occurrences = walk_occurrences(&doc, limits, options.equal_length_subblocks)?;
         refuse_attachments_inside_the_header(&mut occurrences, PREAMBLE + declared);
         verify_materialized_blocks(&mut occurrences)?;
 
@@ -271,41 +418,21 @@ impl Decoder {
         }
 
         let streaming = is_streamable(&block);
-        let mut stream = Stream::Plain;
-        let mut stored_left = 0u64;
-        let mut stored_at = 0u64;
-        let mut block_start = 0u64;
-        let mut subblock_uncompressed_left = 0u64;
+        let mut walk = SubblockWalk::default();
         let whole = if streaming {
             // `is_streamable` returns false for every location but `Attachment`, so this is
             // a decoder-internal invariant rather than anything a file states — the class the
             // crate panics on rather than misreporting as a bad file (§ Errors).
-            let Location::Attachment { position, size } = block.location else {
+            let Location::Attachment { position, .. } = block.location else {
                 unreachable!(
                     "internal invariant violated: a streaming decode was started on a non-attachment location"
                 );
             };
             src.seek_to(position, limits)?;
-            stored_at = position;
-            block_start = position;
-            // A block with no `subblocks` attribute is one subblock spanning the whole of it.
-            let (first_compressed, first_uncompressed) = match block.subblocks.as_deref() {
-                Some([first, ..]) => *first,
-                _ => (size, block.implied_bytes),
-            };
-            stored_left = first_compressed;
-            subblock_uncompressed_left = first_uncompressed;
             if let Some(c) = &block.compression {
                 // zstd parses its frame header here, which is also where the declared window
                 // is checked -- before the window is allocated.
-                stream.open(
-                    c.codec,
-                    src,
-                    &mut stored_left,
-                    &mut stored_at,
-                    subblock_uncompressed_left,
-                    limits,
-                )?;
+                walk = SubblockWalk::begin(&block, c.codec, position, src, limits)?;
             }
             None
         } else {
@@ -332,13 +459,8 @@ impl Decoder {
             whole,
             raw: vec![0u8; narrow(row_bytes, "row staging buffer")?],
             raw_row: None,
-            stream,
+            walk,
             stream_row: 0,
-            stored_left,
-            stored_at,
-            block_start,
-            subblock_index: 0,
-            subblock_uncompressed_left,
             scratch: Samples::zeroed(block.format, narrow(u64::from(g.width), "chunk")?),
             plan: block,
         });
@@ -386,8 +508,11 @@ impl Decoder {
         let dest_start = dest_row * width;
 
         if p.whole.is_none() && p.raw_row != Some(input_row) {
-            match &p.stream {
-                Stream::Plain => {
+            // Routed on what the plan says the block is, never on the stream's state: a stream
+            // whose open failed delivers nothing, and that must read as the truncation it is
+            // rather than as an uncompressed block at computed offsets.
+            match p.plan.compression {
+                None => {
                     let stride = p.raw.len() as u64;
                     // See `begin_pixels`: reaching a non-attachment location here would be
                     // this decoder contradicting its own `is_streamable`, not a file defect.
@@ -424,15 +549,12 @@ impl Decoder {
                     }
                     src.read_exact(&mut p.raw)?;
                 }
-                _ => {
+                Some(c) => {
                     // A compressed stream cannot seek, so reaching a later input row means
                     // reading and discarding the ones before it. Every cursor this decoder
                     // produces is monotone in the input row, so a row is never wanted twice.
                     while p.stream_row <= input_row {
-                        let mut raw = std::mem::take(&mut p.raw);
-                        let outcome = stream_fill(p, src, limits, &mut raw);
-                        p.raw = raw;
-                        outcome?;
+                        p.walk.fill(&p.plan, c.codec, src, limits, &mut p.raw)?;
                         p.stream_row += 1;
                     }
                 }
@@ -454,30 +576,14 @@ impl Decoder {
         // for are not evidence of anything.
         if p.chunks_done >= p.chunks_total
             && p.whole.is_none()
-            && !matches!(p.stream, Stream::Plain)
+            && let Some(c) = p.plan.compression
         {
             let input_rows = match p.plan.storage {
                 PixelStorage::Planar => height * channels,
                 PixelStorage::Normal => height,
             };
             if p.stream_row >= input_rows {
-                // Every pair is decompressed, including those after the last output byte.
-                // `stream_fill` opens a subblock only when it needs output, so a trailing pair
-                // owed nothing would otherwise never be opened — and `codec::decompress`, the
-                // walk the same block takes embedded or checksummed, refuses one that is not a
-                // stream. The sums already match, so each pair opened here is owed zero bytes,
-                // and `open_next_subblock` requires the end of the one before it.
-                let pairs = p.plan.subblocks.as_deref().map_or(1, <[_]>::len);
-                while p.subblock_index + 1 < pairs {
-                    open_next_subblock(p, src, limits)?;
-                }
-                let PixelState {
-                    stream,
-                    stored_left,
-                    stored_at,
-                    ..
-                } = p;
-                stream.require_end(src, stored_left, stored_at, limits)?;
+                p.walk.finish(&p.plan, c.codec, src, limits)?;
             }
         }
 
@@ -494,106 +600,6 @@ impl Decoder {
             Some(p) => slice_samples(&p.scratch, len),
         }
     }
-}
-
-/// Fill `out` from the compressed stream, crossing subblock boundaries as it goes.
-///
-/// A row is not aligned to a subblock, so one read may finish one subblock and continue into
-/// the next.
-fn stream_fill<S: Source>(
-    p: &mut PixelState,
-    src: &mut S,
-    limits: &Limits,
-    out: &mut [u8],
-) -> Result<()> {
-    let mut filled = 0usize;
-    while filled < out.len() {
-        if p.subblock_uncompressed_left == 0 {
-            open_next_subblock(p, src, limits)?;
-        }
-        let want = narrow(p.subblock_uncompressed_left, "subblock output")?;
-        let take = (out.len() - filled).min(want);
-        {
-            let PixelState {
-                stream,
-                stored_left,
-                stored_at,
-                ..
-            } = p;
-            stream.fill(
-                &mut out[filled..filled + take],
-                src,
-                stored_left,
-                stored_at,
-                limits,
-            )?;
-        }
-        p.subblock_uncompressed_left -= take as u64;
-        filled += take;
-    }
-    Ok(())
-}
-
-/// Finish the current subblock and open the next.
-///
-/// The finished stream is required to be at end of stream **per subblock**, so a bomb hidden
-/// in any one of them is caught at its own boundary rather than at the end of the block.
-fn open_next_subblock<S: Source>(p: &mut PixelState, src: &mut S, limits: &Limits) -> Result<()> {
-    {
-        let PixelState {
-            stream,
-            stored_left,
-            stored_at,
-            ..
-        } = p;
-        stream.require_end(src, stored_left, stored_at, limits)?;
-    }
-
-    // Read the next subblock's declared lengths and its start offset under one shared borrow,
-    // then drop it before mutating. Cloning the list here instead would allocate once per
-    // boundary — with the subblock cap at 4096 that is quadratic, on the one path whose whole
-    // discipline is not allocating from a declared size.
-    let index = p.subblock_index + 1;
-    let (compressed, uncompressed, start) = {
-        let list = p.plan.subblocks.as_deref().unwrap_or(&[]);
-        let Some(&(compressed, uncompressed)) = list.get(index) else {
-            return Err(Error::malformed(
-                "compressed block ended before the geometry-implied size was reached",
-            ));
-        };
-        // The boundary comes from the declared compressed lengths, not from how much the codec
-        // consumed: a codec may legitimately stop short of the bytes it was given.
-        let start = list
-            .iter()
-            .take(index)
-            .try_fold(p.block_start, |at, (c, _)| at.checked_add(*c))
-            .ok_or_else(|| Error::malformed("subblock offsets overflow the address space"))?;
-        (compressed, uncompressed, start)
-    };
-    p.subblock_index = index;
-    p.stored_at = start;
-    p.stored_left = compressed;
-    p.subblock_uncompressed_left = uncompressed;
-
-    let codec = p
-        .plan
-        .compression
-        .ok_or_else(|| Error::malformed("subblocks without a compression codec"))?
-        .codec;
-    let PixelState {
-        stream,
-        stored_left,
-        stored_at,
-        ..
-    } = p;
-    // `Stream::open` owns both halves of the boundary. It reuses the codec state a framed
-    // codec carries across the whole block — constructing one per subblock multiplies a fixed
-    // cost by `Subblock count`, which is a cap — and it drops the outgoing subblock's buffers
-    // before sizing the incoming one's, so the two whole-subblock LZ4 buffers are never
-    // resident together. § Streaming promises one subblock, compressed and decompressed, not
-    // two.
-    stream.open(codec, src, stored_left, stored_at, uncompressed, limits)?;
-    Ok(())
 }
 
 /// Read a declared length in fixed chunks rather than pre-allocating from it.
@@ -690,12 +696,15 @@ fn is_streamable(block: &BlockPlan) -> bool {
         // Byte shuffling cannot stream: §10.6.3 spreads one sample's bytes across the entire
         // block, so no prefix yields any complete sample.
         Some(c) if c.shuffled => false,
-        // A bare LZ4 block has no framing and decompresses only as a whole -- so it streams
-        // only where `subblocks` splits it, one subblock held at a time. That is the `Block`
-        // floor `granularity()` reports for exactly this case, and reporting `Block` while
+        // A codec that holds whole subblocks -- a bare LZ4 block, which has no framing and
+        // decompresses only as a whole, or a subblock of equal lengths read under
+        // `EqualLengthSubblocks::TryDecompress` -- streams only where `subblocks` splits it,
+        // one subblock held at a time. That is the `Block` floor `granularity()` reports for
+        // exactly this case, from the same predicate, and reporting `Block` while
         // materializing the whole image would make the reported floor a fiction.
-        Some(c) if matches!(c.codec, Codec::Lz4 | Codec::Lz4Hc) => block.subblocks.is_some(),
-        Some(c) => matches!(c.codec, Codec::Zlib | Codec::Zstd),
+        Some(_) if block.holds_whole_subblocks() => block.subblocks.is_some(),
+        // zlib and zstd otherwise, which are framed streams.
+        Some(_) => true,
     }
 }
 
@@ -938,6 +947,7 @@ fn materialize<S: Source>(
         &stored,
         compression,
         block.subblocks.as_deref(),
+        block.equal_length_subblocks,
         &mut out,
         limits,
     )?;
@@ -973,6 +983,7 @@ mod tests {
             format,
             implied_bytes,
             materialized: None,
+            equal_length_subblocks: crate::options::EqualLengthSubblocks::default(),
         }
     }
 
@@ -986,13 +997,8 @@ mod tests {
             raw: vec![0u8; raw_len],
             raw_row: None,
             scratch,
-            stream: Stream::Plain,
+            walk: SubblockWalk::default(),
             stream_row: 0,
-            stored_left: 0,
-            stored_at: 0,
-            block_start: 0,
-            subblock_index: 0,
-            subblock_uncompressed_left: 0,
             plan,
         }
     }

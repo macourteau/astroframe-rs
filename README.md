@@ -186,6 +186,8 @@ a floating-point image, so one without it has no normalized output either.
 | `lz4hc`, `lz4hc+sh` | CI + corpus |
 | `zstd`, `zstd+sh` | CI + corpus |
 | `subblocks`, beside any of the above | CI + corpus |
+| uncompressed subblocks (a pair with equal lengths, §10.6.1), beside any of the above | CI |
+| a block stored at exactly its uncompressed size, without `subblocks` | CI |
 | any other codec name | declined, `Unsupported` (CI) |
 
 `zstd` is the codec §10.6 recommends, and §7.2 makes reading it and its shuffled variant an
@@ -195,6 +197,17 @@ computed per byte on the way out rather than by materializing an unshuffled copy
 The corpus half of the `subblocks` row is 79 frames carrying a genuine `subblocks` attribute;
 see § Where the corpus evidence comes from for what they span and where the streams inside them
 were produced.
+
+Subblocks are read as XISF 1.0 Revision 2's §10.6.1 defines them. A pair whose compressed and
+uncompressed lengths are equal is an *uncompressed subblock*, copied as stored; every other pair,
+including one longer than its data, is decompressed to exactly its declared length or the block
+is `Malformed`; and a block without `subblocks` is one such pair. Files written before Revision 2
+by an encoder that compressed every subblock can hold a compressed subblock of equal lengths,
+which the default reads as stored bytes. `EqualLengthSubblocks::TryDecompress`, set through
+`DecodeOptions::with_equal_length_subblocks`, attempts to decompress such a subblock first, as
+§10.6.1 permits. It is off by default because it is a repair: a damaged subblock of that shape decodes
+to its stored bytes without an error unless the block declares a checksum. No corpus frame holds
+an equal-length subblock, so these rows are graded by fixtures alone.
 
 ### XISF block checksums
 

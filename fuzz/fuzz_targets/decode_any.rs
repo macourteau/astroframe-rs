@@ -1,13 +1,12 @@
 //! Format sniffing through to a full decode.
 #![no_main]
 
-use astroframe::DecodeOptions;
-use astroframe_fuzz::{assert_within, bound, limits, start_counting};
+use astroframe_fuzz::{assert_within, bound, options, start_counting};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let run = start_counting();
-    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(std::io::Cursor::new(data)) {
+    if let Ok(mut reader) = options(data).seekable(std::io::Cursor::new(data)) {
         while matches!(reader.next_image(), Ok(true)) {
             let Ok(h) = reader.current_header() else {
                 break;

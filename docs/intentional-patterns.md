@@ -268,6 +268,30 @@ per subblock left 4096 subblocks costing 312 MB from a 140 KB input and 37 MB fr
 A per-occurrence walk is identified by the cap that bounds its length, never by the decoder that
 performs it.
 
+**An uncompressed subblock is an occurrence too, and so is a decompression attempt that fails.**
+Two shapes in `src/xisf/codec.rs` look like more code than they need, and each is this rule.
+
+- **The codec state is a field of `Stream`, not of the variant saying how the current subblock is
+  delivered.** §10.6.1's uncompressed subblocks sit among compressed ones as often as a file
+  likes, and the obvious spelling — a `Raw` variant beside `Zlib` and `Zstd`, holding nothing —
+  drops the decoder every time a raw subblock replaces it, so the next compressed one builds a
+  fresh one. Alternating raw and compressed subblocks at the cap is 2048 constructions: measured,
+  a zlib block split 4096 ways that way allocated 88 670 368 bytes from a 221 428-byte input,
+  against the oracle's 15 474 304. `Codecs` owns the state for the whole block, both walks use
+  it, and `Current` only names delivery, so a raw subblock has nothing it could drop.
+- **A failed attempt is a value, not an `Error`.** Under `EqualLengthSubblocks::TryDecompress`
+  a stored subblock is attempted and refused, which is not an error at all — it falls back to its
+  stored bytes — and up to 4096 of them do it per block. `Error::malformed(format!(..))` on the
+  refusal is an allocation per occurrence for a message nobody reads, and so is driving the codec
+  through a `Read` adapter, which has to box the codec's error into an `io::Error` to say it
+  failed: flate2's `Decompress` is driven directly for the resident case, and ruzstd's
+  `FrameDecoder` likewise rather than through its `StreamingDecoder`. The codec's own error
+  values are kept unformatted in `Fault` and spelled as an `Error` only where one is returned.
+  Measured with the message and the box restored, the alternating zlib shape under the option
+  grew from 306 458 bytes at 8 subblocks to 711 104 at 4096, 2.32×; without them it is flat at
+  1.00×. Reaching for `?` and `map_err` on that path, which is what every other fallible call in
+  the crate does, reintroduces it.
+
 ### How it is enforced
 
 `tests/header_alloc.rs` is where the rule is enforced. Its shapes assert the fuzz oracle's
@@ -289,6 +313,11 @@ the other decoder, its fixture shuffled so that the granularity floor is `WholeI
 asserts that floor so the fixture cannot drift back onto the streaming path and pass by
 measuring a decoder the shape is not for. Two shapes for one rule, because the paragraph above
 about a walk existing twice was learnt from the streaming shape passing alone.
+
+Both run three ways over the same block: every subblock compressed, and every other subblock
+uncompressed under each reading of an equal-length subblock. The second is what fails when a raw
+subblock drops the codec state, which trips the oracle's bound, and the third when a failed
+attempt allocates, which trips the 2× one — each checked by putting the defect back.
 
 **A fixture that exercises the code's memo-hit shape measures the memo, not the code.** Every
 reader here memoizes, and byte-identical inputs are the one shape every key hits however wrongly

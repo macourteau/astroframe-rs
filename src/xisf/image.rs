@@ -11,14 +11,15 @@ use crate::metadata::{
     Cfa, DisplayChannels, DisplayFunction, KeywordOrigin, KeywordSet, Property, PropertyScope,
     PropertySet, PropertyType, PropertyValue, Resolution, ResolutionUnit,
 };
+use crate::options::EqualLengthSubblocks;
 use crate::samples::SampleFormat;
 use crate::xisf::attributes::{
     read_bounds, read_byte_order, read_checksum, read_color_space, read_geometry, read_offset,
     read_pixel_storage, read_sample_format,
 };
 use crate::xisf::block::{
-    Checksum, Codec, Compression, Location, Subblock, check_subblock_sums, parse_compression,
-    parse_encoding, parse_location, parse_subblocks,
+    Checksum, Compression, Location, Subblock, check_subblock_sums, holds_whole_subblocks,
+    parse_compression, parse_encoding, parse_location, parse_subblocks,
 };
 use crate::xisf::cache::{Cache, decline_from, malformed, memoized};
 use crate::xisf::codec;
@@ -54,6 +55,51 @@ pub(crate) struct BlockPlan {
     pub(crate) implied_bytes: u64,
     /// For an `embedded` or `inline` block, the bytes decoded during the header parse.
     pub(crate) materialized: Option<Arc<Vec<u8>>>,
+    /// How a subblock of equal lengths is read, which the reader was told at construction.
+    pub(crate) equal_length_subblocks: EqualLengthSubblocks,
+}
+
+impl BlockPlan {
+    /// The stored length of the block, where the header phase knows it.
+    pub(crate) fn stored_size(&self) -> Option<u64> {
+        stored_size(
+            Some(&self.location),
+            self.materialized.as_deref().map(Vec::as_slice),
+        )
+    }
+
+    /// The `index`-th `(compressed, uncompressed)` pair of the block's subblock list as
+    /// §10.6.1 reads it: a block with no `subblocks` attribute is the one pair of its stored
+    /// length and its uncompressed size, which the pixel phase has already checked equals
+    /// [`BlockPlan::implied_bytes`].
+    pub(crate) fn pair(&self, index: usize) -> Option<Subblock> {
+        match self.subblocks.as_deref() {
+            Some(list) => list.get(index).copied(),
+            None if index == 0 => self
+                .stored_size()
+                .map(|stored| (stored, self.implied_bytes)),
+            None => None,
+        }
+    }
+
+    /// How many pairs [`BlockPlan::pair`] yields.
+    pub(crate) fn pair_count(&self) -> usize {
+        self.subblocks.as_deref().map_or(1, <[_]>::len)
+    }
+
+    /// Whether this block's codec holds a whole subblock resident — the predicate the reported
+    /// granularity was computed from, asked again of the plan.
+    pub(crate) fn holds_whole_subblocks(&self) -> bool {
+        self.compression.is_some_and(|c| {
+            holds_whole_subblocks(
+                c.codec,
+                self.subblocks.as_deref(),
+                self.stored_size(),
+                self.implied_bytes,
+                self.equal_length_subblocks,
+            )
+        })
+    }
 }
 
 /// One image occurrence: an `<Image>` element, or a root-level `<Reference>` resolving to one.
@@ -80,7 +126,14 @@ pub(crate) struct Occurrence {
 }
 
 /// Walk the header's image occurrences in document order.
-pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurrence>> {
+///
+/// `equal_length_subblocks` is the reader's, and the memo below stays sound with it: it is one
+/// value for the whole walk, so no two occurrences can differ by it.
+pub(crate) fn walk_occurrences(
+    doc: &Doc,
+    limits: &Limits,
+    equal_length_subblocks: EqualLengthSubblocks,
+) -> Result<Vec<Occurrence>> {
     let mut cache = Cache::default();
     // Positions and properties come back as two lists rather than as pairs, because the two
     // halves have different lifetimes below: the properties are consumed into the shared list
@@ -139,6 +192,7 @@ pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurre
                 let fresh = build_occurrence(
                     doc,
                     limits,
+                    equal_length_subblocks,
                     image,
                     &metadata_positions,
                     &shared_metadata,
@@ -175,6 +229,7 @@ pub(crate) fn walk_occurrences(doc: &Doc, limits: &Limits) -> Result<Vec<Occurre
 fn build_occurrence(
     doc: &Doc,
     limits: &Limits,
+    equal_length_subblocks: EqualLengthSubblocks,
     image: usize,
     // Where each shared root `<Metadata>` property was found, in ascending order. The values
     // themselves are in `shared_metadata`; all this needs of them is the position the split
@@ -257,15 +312,29 @@ fn build_occurrence(
             format,
             implied_bytes,
             materialized: site.materialized.clone(),
+            equal_length_subblocks,
         }),
         _ => None,
     };
 
+    // The same predicate, over the same inputs, that `BlockPlan::holds_whole_subblocks` asks
+    // when the decoder picks a path — computed here rather than from the plan because a
+    // declined position has no plan and still reports a granularity.
+    let held_whole = compression.is_some_and(|c| {
+        holds_whole_subblocks(
+            c.codec,
+            subblocks.as_deref(),
+            stored,
+            implied_bytes,
+            equal_length_subblocks,
+        )
+    });
     let granularity = granularity(
         site.location.as_ref(),
         compression.as_ref(),
         subblocks.as_deref(),
         checksum.as_ref(),
+        held_whole,
         decline_reason.is_some(),
     );
 
@@ -536,6 +605,7 @@ fn granularity(
     compression: Option<&Compression>,
     subblocks: Option<&[Subblock]>,
     checksum: Option<&Checksum>,
+    held_whole: bool,
     declined: bool,
 ) -> Granularity {
     if declined {
@@ -551,12 +621,12 @@ fn granularity(
     // The two floors that ignore `subblocks`: the shuffle spans the whole pre-split block, and
     // a digest covers the whole *stored* block (§10.5), which `subblocks` does not split.
     let split_immune = checksum.is_some() || compression.is_some_and(|c| c.shuffled);
-    // A bare LZ4 block decompresses only as a whole; zlib and zstd are framed streams that
-    // decompress incrementally, so their floor — and an uncompressed block's — is `Rows`.
-    let codec_floor_is_block =
-        compression.is_some_and(|c| matches!(c.codec, Codec::Lz4 | Codec::Lz4Hc));
-
-    if !split_immune && !codec_floor_is_block {
+    // `held_whole` is the codec's floor: a bare LZ4 block decompresses only as a whole, and so
+    // does any subblock read under `EqualLengthSubblocks::TryDecompress` whose lengths are
+    // equal, the attempt needing it resident. zlib and zstd are otherwise framed streams that
+    // decompress incrementally, so their floor — and an uncompressed block's — is `Rows`. An
+    // uncompressed subblock is read straight from the source on any codec and sets no floor.
+    if !split_immune && !held_whole {
         return Granularity::Rows;
     }
     // One promotion, applying only to a `Block` floor: it becomes `WholeImage` unless the block
@@ -947,11 +1017,12 @@ fn metadata_properties(doc: &Doc, cache: &mut Cache) -> (Vec<usize>, Vec<Propert
 pub(super) mod tests {
     use super::*;
     use crate::header::{Bounds, DeclineClass};
+    use crate::xisf::block::Codec;
 
     fn walk(header: &str) -> Vec<Occurrence> {
         let limits = Limits::default();
         let doc = crate::xisf::xml::parse(header.as_bytes(), &limits).expect("header parses");
-        walk_occurrences(&doc, &limits).expect("the walk succeeds")
+        walk_occurrences(&doc, &limits, EqualLengthSubblocks::default()).expect("the walk succeeds")
     }
 
     pub(crate) fn one(header: &str) -> Occurrence {
@@ -1064,6 +1135,9 @@ pub(super) mod tests {
         assert_eq!(declined.header.granularity(), Granularity::WholeImage);
     }
 
+    /// The pairs here have equal lengths, which §10.6.1 makes uncompressed subblocks — of a
+    /// compressed block. Without a `compression` attribute there is no block for them to be
+    /// subblocks of, so Revision 2 leaves the crate's reading where it was.
     #[test]
     fn subblocks_without_compression_is_malformed() {
         let o = one(&tiny(
@@ -1089,7 +1163,8 @@ pub(super) mod tests {
         let header =
             tiny(r#"location="attachment:1024:10" compression="lz4:16" subblocks="5,8:5,8""#);
         let doc = crate::xisf::xml::parse(header.as_bytes(), &limits).expect("header parses");
-        let occurrences = walk_occurrences(&doc, &limits).expect("the walk succeeds");
+        let occurrences = walk_occurrences(&doc, &limits, EqualLengthSubblocks::default())
+            .expect("the walk succeeds");
         assert_eq!(
             occurrences[0].header.decline_reason().map(|d| d.class()),
             Some(DeclineClass::LimitExceeded)

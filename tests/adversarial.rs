@@ -513,9 +513,9 @@ fn a_geometry_whose_byte_extent_exceeds_u64_under_a_raised_cap() {
 /// pixels, and it did.
 ///
 /// A subblocked LZ4 block whose second subblock is corrupt fails when that boundary is
-/// crossed. The failure left `Stream::Plain` in the decoder — the outgoing stream is dropped
-/// before the replacement is built, and the replacement's `?` returns with `Plain` in its
-/// place — and `Plain` is the *uncompressed* reader, which seeks into the file and hands back
+/// crossed. The failure once left the decoder's *uncompressed* reader in place — the outgoing
+/// stream was dropped before the replacement was built, and the replacement's `?` returned with
+/// the uncompressed state in its place — and that reader seeks into the file and hands back
 /// whatever is there. A caller that logged the error and kept pulling received the block's own
 /// compressed bytes as pixels and then a clean end of image, which is § The organizing
 /// principle's "never a best guess" exactly inverted.
@@ -530,6 +530,10 @@ fn a_failed_chunk_poisons_the_rest_of_the_image() {
     let plain = le_u16(&levels);
     let (first, second) = plain.split_at(plain.len() / 2);
     let (ca, cb) = (lz4(first), lz4(second));
+    // Both halves must be *compressed* subblocks for the corruption to be the codec's to find:
+    // a pair whose lengths are equal is an uncompressed subblock (§10.6.1), and overwriting one
+    // of those is just different pixels.
+    assert!(ca.len() != first.len() && cb.len() != second.len());
     let list = format!("{},{}:{},{}", ca.len(), first.len(), cb.len(), second.len());
     let mut stored = ca;
     stored.extend(std::iter::repeat_n(0xFFu8, cb.len()));

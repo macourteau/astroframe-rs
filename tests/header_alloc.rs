@@ -316,6 +316,10 @@ fn root_metadata_property_count_across_many_images() {
 /// This one stayed inside `oracle_bound` throughout, the fixed 8 MiB term absorbing it, which is
 /// exactly why the ratio is asserted: by the bound alone nothing here ever looked wrong.
 ///
+/// Every pair is `1,1`, which §10.6.1 makes an uncompressed subblock, so the list is valid as
+/// well as full: nothing about it declines before the walk builds the occurrence, and the
+/// per-pair classification the granularity is computed from runs over all 4096 pairs.
+///
 /// Its ceiling is the loosest of the family and above `ALLOC_MULTIPLE`, because the input is
 /// 26 KB and the fixed cost of parsing 4096 subblock pairs is charged against it: the same
 /// fixture at **one** occurrence measures 20.4×, before any multiplication at all. What the

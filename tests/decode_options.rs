@@ -10,7 +10,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{DecodeOptions, Limits, Reader};
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits, Reader};
 
 use common::{file, kind, unsigned_2x2};
 
@@ -51,6 +51,32 @@ fn assert_header_cards_tripped<T>(result: astroframe::Result<T>, what: &str) {
 fn the_defaults_are_the_default_limits() {
     assert_eq!(DecodeOptions::default().limits, Limits::default());
     assert_eq!(DecodeOptions::new(), DecodeOptions::default());
+}
+
+/// The default reading is Revision 2's own rule, and the setter changes that field alone; the
+/// reader reports the reading it was built with. What each reading decodes is graded in
+/// `tests/uncompressed_subblocks.rs`.
+#[test]
+fn the_default_reading_copies_an_equal_length_subblock() {
+    assert_eq!(
+        DecodeOptions::default().equal_length_subblocks,
+        EqualLengthSubblocks::Uncompressed
+    );
+    assert_eq!(
+        EqualLengthSubblocks::default(),
+        EqualLengthSubblocks::Uncompressed
+    );
+
+    let legacy = loose().with_equal_length_subblocks(EqualLengthSubblocks::TryDecompress);
+    assert_eq!(
+        legacy.equal_length_subblocks,
+        EqualLengthSubblocks::TryDecompress
+    );
+    assert_eq!(legacy.limits, loose().limits);
+    let reader = legacy
+        .seekable(Cursor::new(file(&[unsigned_2x2()])))
+        .expect("constructs");
+    assert_eq!(*reader.options(), legacy);
 }
 
 #[test]

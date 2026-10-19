@@ -368,7 +368,7 @@ impl<S: Source> Reader<S> {
             other => other,
         })?;
 
-        let inner = Self::sniff(&signature, &mut source, &options.limits)?;
+        let inner = Self::sniff(&signature, &mut source, &options)?;
 
         Ok(Reader {
             source,
@@ -383,12 +383,14 @@ impl<S: Source> Reader<S> {
         })
     }
 
-    fn sniff(signature: &[u8; 8], source: &mut S, limits: &Limits) -> Result<Inner> {
+    fn sniff(signature: &[u8; 8], source: &mut S, options: &DecodeOptions) -> Result<Inner> {
         if signature.starts_with(b"SIMPLE") {
             #[cfg(feature = "fits")]
             {
                 return Ok(Inner::Fits(Box::new(crate::fits::Decoder::new(
-                    signature, source, limits,
+                    signature,
+                    source,
+                    &options.limits,
                 )?)));
             }
             #[cfg(not(feature = "fits"))]
@@ -406,7 +408,7 @@ impl<S: Source> Reader<S> {
             #[cfg(feature = "xisf")]
             {
                 return Ok(Inner::Xisf(Box::new(crate::xisf::Decoder::new(
-                    source, limits,
+                    source, options,
                 )?)));
             }
             #[cfg(not(feature = "xisf"))]

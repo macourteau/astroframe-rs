@@ -172,6 +172,19 @@ worded to include it.
 The rule cuts the other way too: `astroframe` **never silently repairs** a file. A
 frame it cannot decode under its documented rules is an error, never a best guess.
 
+**One repair is reachable, and only by asking for it.** XISF Revision 2 (§10.6.1) makes a
+subblock whose compressed and uncompressed lengths are equal an *uncompressed* subblock, and
+permits a decoder to first try decompressing one, for files an earlier encoder wrote by
+compressing every subblock. That attempt is
+`DecodeOptions::with_equal_length_subblocks(EqualLengthSubblocks::TryDecompress)`, and it is
+a repair in exactly the sense this rule forbids: a *damaged* compressed subblock of equal
+lengths fails the attempt and is read as its stored bytes, which decodes to wrong pixels
+without an error unless the block declares a checksum. The default is the specification's
+rule, which copies such a subblock and is no guess at all; the option is the specification's
+own *may*, documented on the type as the repair it is, and never on unless a caller writes it
+at a call site. § XISF decisions carries the full rule set, and § Alternatives why it is not
+the default.
+
 ### Normalization
 
 **This section is the single normative home of the normalization form. Nothing else in
@@ -484,7 +497,10 @@ options are built first and the source they read finishes them. `DecodeOptions` 
 a reader is told at construction, its `Limits` among it — a `Copy`, `#[non_exhaustive]` struct
 with public fields and by-value `with_*` setters, the same shape as `Limits` itself, plus
 `From<Limits>` for the caller who only moves caps. Its finishers take `&self`, so one value
-serves a batch.
+serves a batch. Its other field, `equal_length_subblocks`, is an interpretation rather than a
+cap, and the line between the two is why they are separate fields rather than one struct: a
+cap decides only *whether* a file is refused, and raising one never changes a decoded sample,
+while this decides which bytes an XISF block decodes to (§ XISF decisions).
 
 One options value rather than one constructor per knob is the point of the type. A pair per
 knob multiplies with every knob — three sources times each combination of settings — while a
@@ -863,6 +879,7 @@ Each property of a data block imposes a granularity floor, and the granularity i
 | --- | --- | --- |
 | Codec is `lz4` / `lz4hc` | `Block` | A bare LZ4 block decompresses only as a whole |
 | Codec is `zlib`, `zstd`, or none | `Rows` | Both codecs are framed streams and decompress incrementally |
+| A non-empty subblock of equal lengths, read under `EqualLengthSubblocks::TryDecompress` | `Block` | The attempt needs the whole subblock resident, whatever the codec (§ XISF decisions). Under the default the same subblock is an uncompressed one, read straight from the source, and lowers no floor |
 | Byte shuffling (`+sh`) | `Block`, **ignoring `subblocks`** | The shuffle spans the whole pre-split block, so subblock boundaries buy nothing |
 | A `checksum` is declared | `Block`, **ignoring `subblocks`** | The digest covers the whole **stored** block (§10.5); `subblocks` splits the compression, not the stored block, so nothing may be delivered until all of it is read and hashed |
 | Location is `embedded` | `WholeImage` | The pixels were fully materialized during header parse, so no part of the input remains to stream |
@@ -887,6 +904,8 @@ information those rules do not.
 | XISF, `zlib`, no shuffling, no checksum | `Rows` | I/O buffer + inflate window (~32 KiB) |
 | XISF, `lz4`/`lz4hc` **+ `subblocks`**, no shuffling, no checksum | `Block` | one subblock, compressed and decompressed |
 | XISF, `zlib` **+ `subblocks`**, no shuffling, no checksum | `Rows` | zlib's floor is already `Rows`; subblocks cannot lower it |
+| XISF, `zlib`/`zstd` **+ `subblocks`** holding a subblock of equal lengths, read under `TryDecompress`, no shuffling, no checksum | `Block` | one subblock, compressed and decompressed, as for LZ4 |
+| XISF, one `zlib`/`zstd` block stored at its uncompressed size, read under `TryDecompress` | `WholeImage` | the stored block plus its decompressed form, the attempt having no split to hold a piece of |
 | XISF, `subblocks` **+ shuffling** | `WholeImage` | the shuffle floor ignores the subblock split |
 | XISF, `subblocks` **+ checksum**, no shuffling | `WholeImage` | the checksum floor ignores the subblock split |
 | XISF, checksummed **+ shuffled** **+ subblocked** | `WholeImage` | worst of the floors, not the first |
@@ -927,6 +946,18 @@ per-row fact is not merely a branch, it is a constraint on how everything around
 samples for all channels, so the decoder never has to hold more of the *input*. The cost
 is one row-sized staging buffer, not an image-sized one: a chunk is a contiguous run of a
 single channel, so interleaved input is transposed a row at a time to produce one.
+
+**An uncompressed subblock streams on every codec, and holds nothing.** §10.6.1's
+uncompressed subblock is read straight from the source into the row being assembled, through
+the same cursor a compressed subblock's codec reads through, so on `zlib` and `zstd` it keeps
+the `Rows` floor and on LZ4 it is cheaper than its compressed neighbours, needing neither of
+the two whole-subblock buffers they cost. The codec state a framed block carries across its
+split is kept apart from how the current subblock is delivered, so a raw subblock between two
+compressed ones changes the second and leaves the first alone — rebuilding the decoder around
+one would cost a construction per alternation, which `Subblock count` lets a file repeat 2048
+times (`docs/intentional-patterns.md`). Whether a pair is raw, compressed or an attempt is one
+decision made for both subblock walks, the streaming one and the one that materializes a
+shuffled, checksummed or embedded block, so the two cannot read the same block differently.
 
 **`WholeImage` does not mean a second copy of the output.** Tier 2 drives tier 3, and at
 `WholeImage` granularity the reader still normalizes *into the caller's destination* —
@@ -970,7 +1001,7 @@ alongside the ported zlib and LZ4 bombs — the ported cases include none, that 
 having never supported the codec.
 
 Two mitigations are real and are taken. XISF's `subblocks` attribute (§10.6) splits a
-block into independently-decompressed pieces, which restores block-granularity streaming
+block into independently-read pieces, which restores block-granularity streaming
 to LZ4 files that use it — `Block` granularity is reachable *only* that way, since `zlib`
 and `zstd` already stream by rows and shuffling or a checksum forces `WholeImage`. No
 frame a production writer emits at ordinary sizes uses `subblocks` — the writer splits
@@ -1054,7 +1085,7 @@ on; it is never a silent fallback.
 | | Supported | Declined (`Unsupported`) |
 | --- | --- | --- |
 | **FITS** | All image HDUs, walked forward: the primary when it holds an image, then each `XTENSION = 'IMAGE'` extension that holds one. An extension declaring `NAXIS = 0` holds no image and is skipped rather than declined, exactly as a `NAXIS = 0` primary is (§ Errors → Where a decline surfaces). `BITPIX` 8/16/32/64 integer. Any `BSCALE`/`BZERO` for native samples. `NAXIS` 2, or 3 read as channels | *For normalized output only*, native samples still decoding: `BITPIX` −32/−64, and any `BSCALE`/`BZERO` outside the FITS unsigned convention. *Outright*, with no pixel output of either kind: `NAXIS = 1`, `NAXIS > 3`, and tile-compressed images — recognized by `ZIMAGE = T` on a `BINTABLE` extension and never by filename, the corpus's tile-compressed files being named `.fits` |
-| **XISF** | Monolithic. `UInt8/16/32/64`, `Float32/64`. `Gray` and `RGB`. `Planar` and `Normal` storage. Both byte orders. `attachment` and `embedded` pixel locations. `zlib`, `lz4`, `lz4hc`, `zstd`, all `+sh` variants, `subblocks` — every standard codec, which §7.2 makes a baseline decoder ability. All five checksum algorithms | `Complex32/64`. `CIELab`. Geometry other than `width:height:channels`. Distributed XISF. Signature verification. (`url(...)` and `path(...)` in a monolithic file are `Malformed`, not `Unsupported` — §10.2 forbids external blocks there outright) |
+| **XISF** | Monolithic. `UInt8/16/32/64`, `Float32/64`. `Gray` and `RGB`. `Planar` and `Normal` storage. Both byte orders. `attachment` and `embedded` pixel locations. `zlib`, `lz4`, `lz4hc`, `zstd`, all `+sh` variants, `subblocks` including uncompressed subblocks (§10.6.1) — every standard codec, which §7.2 makes a baseline decoder ability, and Revision 2's §7.2 names blocks with uncompressed subblocks among them. All five checksum algorithms | `Complex32/64`. `CIELab`. Geometry other than `width:height:channels`. Distributed XISF. Signature verification. (`url(...)` and `path(...)` in a monolithic file are `Malformed`, not `Unsupported` — §10.2 forbids external blocks there outright) |
 | **Both** | Multi-image sources, advanced forward-only. FITS keywords. XISF `Property` elements whose values are attribute-borne **or character-data** | Writing. CFA/Bayer demosaicing. Colour-space conversion. WCS interpretation. XISF `Property` values stored in **data blocks**; `Table`-typed properties, which §11.1 excludes from `Property` |
 
 **A CFA/OSC frame decodes normally, as a single channel.** Only *demosaicing* is out of
@@ -1327,6 +1358,13 @@ an impossible sample count `LimitExceeded` rather than `Malformed` on the size c
 and it is what leaves the rebuilt `geometry overflow` fixture's assertion determinate rather
 than arguable either way (*Adversarial suite*).
 
+§10.6.1's reading of each subblock adds no step to that order and no class to § Errors. Each
+pair is classified as it is reached, after the stored-block cap, the uncompressed-size
+cross-check and the header phase's subblock sums have all run; a compressed pair of the wrong
+length is `Malformed` at the pixel call, as any block that does not decompress is. Under
+`EqualLengthSubblocks::TryDecompress` a refused attempt is not an error at all, and a cap the
+attempt trips is `LimitExceeded` at the pixel call like any other cap.
+
 Both header-phase placements are the same rule § Hardening applies to the
 geometry-versus-file-length check: a frame that cannot be *normalized* is not thereby a
 frame that cannot be *read*. This order deliberately does **not** match the prior art's,
@@ -1496,7 +1534,12 @@ A declared uncompressed size that disagrees with the geometry-implied size is a
 `Malformed` error raised *before* any buffer is allocated, which makes decompression bombs
 structurally impossible rather than merely caught. Decompression additionally inflates to
 exactly the expected length and then requires end-of-stream, so a bomb is refused after a
-few dozen bytes rather than after materializing.
+few dozen bytes rather than after materializing. The check is made **per subblock**, which is
+XISF Revision 2's own *shall* (§10.6.1): every compressed subblock — every pair whose two
+lengths differ, `c > u` included — decompresses to exactly its declared `u` bytes and the
+codec must end there, or the block is `Malformed`, on whichever walk reads it and including
+pairs owed no bytes after the last row. An uncompressed subblock is copied, and is exactly as
+long as it says by construction.
 
 The one deliberate exception to the rule is the XML header itself, which has no geometry
 to be checked against. It is read **incrementally up to its cap** rather than pre-allocated
@@ -1565,7 +1608,7 @@ source, which is the difference between this and the two rejected mechanisms.
 | HDUs traversed per advance | FITS | 4096 | Every extension skipped inside one `next_image()` — non-image extensions and `IMAGE` extensions declaring `NAXIS = 0` alike, both being positions the walk steps over rather than sits on |
 | Total samples | both | 2³⁰ | The **file's** `width × height × channels`, counted whether or not `select_channel` narrowed the reader, and checked before any buffer is sized and before any sample width is known |
 | Decoded output bytes | both | 2³⁰ | The destination buffer, measured in the bytes actually written to it — so `select_channel` narrows it |
-| Materialized bytes | both | 2³⁰ | Any whole-image or row-shaped buffer this crate allocates for itself, measured at that buffer's own size. This is what bounds tier 3, which has no destination |
+| Materialized bytes | both | 2³⁰ | Any whole-image or row-shaped buffer this crate allocates for itself, and each subblock held whole — an LZ4 subblock, or one attempted under `EqualLengthSubblocks::TryDecompress` — measured at that buffer's own size. This is what bounds tier 3, which has no destination |
 | Skipped block bytes | both | 2³⁰ | A block or data unit read-and-discarded to step over it — a thumbnail, the remainder of an abandoned image, or a non-image extension's data unit walked past inside `next_image()`, whose `PCOUNT` heap can be enormous and which a length-unknown source gives nothing else to bound. Bounds a *read*, not an allocation — so it does not apply where skipping is a seek. On a seekable source the cursor moves without transferring bytes and the cap is not consulted; an ordinary MEF whose `BINTABLE` heap exceeds it is walked past, not declined |
 | Images per source | both | 256 | `next_image()` advances. Inherited from an XISF decoder, where multi-image is rare; FITS MEF is where it binds, and a mosaic instrument writing more than 256 image extensions is `LimitExceeded` on a valid file — the FITS-side shape most likely to move this number |
 
@@ -1715,6 +1758,12 @@ arithmetic untested:
 | `decode_any` | arbitrary bytes | format sniffing through to a full decode. The destination is sized **from the parsed header**, bounded by the caps — not a fixed capacity, which would make almost every fuzzer-generated geometry an `InvalidRequest` before a pixel byte was touched and reduce the target to a header parser |
 | `decode_sequential` | arbitrary bytes, wrapped `Read`-only | The forward-only source: read-and-discard skipping, the backwards-block `Unsupported` rule, thumbnail skipping, and the no-known-length branch of every size check. All the other targets hand the reader a `Cursor`, which is seekable, so this path — a pipe-fed consumer's shape, and the one the FITS and stored-block caps exist for — is otherwise entirely unfuzzed |
 | `decode_alloc` | arbitrary bytes | the allocating `read_image()` path, which `decode_any` cannot reach — this is the target that exercises geometry-driven allocation, and its oracle bounds allocation against the geometry-implied size |
+
+Every target reading an XISF block also takes the reading of an equal-length subblock from the
+input — the low bit of its last byte picks `EqualLengthSubblocks::TryDecompress` — so the
+attempt, its fallback and the held-subblock path are explored as well as the default, without a
+byte taken off the front of an input whose front is the format signature the seeds start from.
+The stable replay lane runs every seed under both readings.
 
 **The oracle is not merely "it didn't crash".** Each target asserts that the call returns
 rather than panicking or aborting, that it terminates, and that **total allocation stays
@@ -2122,6 +2171,8 @@ reader who does not find the argument here will reach for them again.
 | **License under MIT alone** | MIT alone is permissive enough and would satisfy every constraint this crate is under. It buys nothing the dual licence does not, and gives up Apache-2.0's explicit patent grant for consumers that want it, against an ecosystem that expects the pair. § Licensing boundary. |
 | **Verify block checksums only on request** | XISF §10.5 makes verification mandatory when the attribute is present, so skipping it silently is a conformance gap. The `checksum` cargo feature governs only whether the verification code and its three hash dependencies are *compiled in*. Building without it does not weaken the safety guarantee — a block that declares a checksum is declined as `Unsupported` rather than trusted, and §7 requires that decline to leave the rest of the unit accessible — but it does give up conformance: §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder, so such a build is not a baseline XISF decoder. One consequence is worth stating because it is not obvious: §9.5 and §10.5 require every block of a **digitally signed** unit that is not serialized directly in the header to carry a checksum, so an `xisf`-without-`checksum` build cannot decode a signed unit whose pixels are attached — and with the feature on, every signed unit is forced to `WholeImage` granularity by the checksum floor. |
 | **Decline `zstd`-compressed blocks** | §10.6.10/§10.6.11 specify the codec and its attribute syntax, §10.6 recommends it over the others, and §7.2 lists reading it among the abilities a baseline decoder has — so declining it would be a conformance gap, not a conservative reading. The cost is concrete besides: PixInsight writes `zstd` blocks, and the local corpus contains 240 such files. |
+| **Try to decompress an equal-length subblock by default** | Revision 2 (§10.6.1) makes the copy the rule and the attempt a *may*, and the attempt is a repair: a damaged compressed subblock of equal lengths falls back to its stored bytes and decodes to wrong pixels without an error unless a checksum is declared, which § The organizing principle refuses to do unasked. It is also the reading that makes a valid Revision 2 file's uncompressed subblock decode differently whenever its bytes happen to be a stream of the codec. The files it serves were written before the revision by encoders that compressed every subblock, and a caller who has them opts in at a call site — `EqualLengthSubblocks::TryDecompress` — where the choice is visible. The corpus holds no equal-length subblock either way |
+| **Under `TryDecompress`, materialize any `zlib`/`zstd` block holding an equal-length subblock** | The obvious shape for an attempt that needs its subblock resident, and the wrong one: it turns a split frame above `Materialized bytes` that the default streams by rows into `LimitExceeded`, the opposite of what a caller asking for compatibility wants. Held one subblock at a time instead — the shape a bare LZ4 subblock already has, reported as `Block` — the attempt costs one subblock, compressed and decompressed, and the walk shares the codec state it reads every other subblock with. An unsplit block has no smaller piece to hold and is `WholeImage` under the option, as any block that cannot stream is |
 | **Eagerly enumerate all images/HDUs at header time** | Free for XISF (they are all in the XML header) but for FITS it means reading past every data unit, which would make tier-1 header decode cost a full pass over the file. Forward-only `next_image()` keeps tier 1 cheap for both. |
 | **Select the first image at construction** | Every multi-extension FITS file and every tile-compressed file has a primary with `NAXIS = 0`, so on those files there is no first image to select and the constructor has nothing to sit on. Selecting nothing at construction and advancing with `next_image()` holds for every file layout instead (§ The API). |
 | **Have construction sit on the declined image** | The other way to give the constructor something to select: on a file whose primary is `NAXIS = 0`, advance to the first position even when it is one this version declines. Reaching a `BINTABLE` past that primary means skipping a data unit, which contradicts the criterion that construction touches only a header region. |
@@ -2309,13 +2360,18 @@ report, a pasted header.
     report `WholeImage`; `subblocks` **+** checksum must report `WholeImage` too; `lz4` **+**
     `subblocks` with neither must report `Block`; `zlib` **+** `subblocks` must report `Rows`,
     since `subblocks` only blocks a promotion and never lowers a `Rows` floor. An `embedded`
-    source reports `WholeImage`.
+    source reports `WholeImage`. An uncompressed subblock moves no floor; under
+    `EqualLengthSubblocks::TryDecompress` a `zlib` or `zstd` block holding a non-empty
+    equal-length subblock reports `Block` when split and `WholeImage` when not, an empty one
+    moves nothing, and every one of these is the same over a seekable and a forward-only
+    source.
 27. **Baseline XISF decoder conformance.** Each of the ten abilities XISF §7.2 requires of a
     baseline decoder has a test demonstrating it, and they live together in
     `tests/conformance.rs` rather than scattered through the suite: monolithic files; 8-, 16-,
     32- and 64-bit scalar properties; multiple `Image` elements from one file; `embedded` and
     `attachment` pixel locations (the partial one — no inline pixel data, per § Format support
-    matrix); both byte orders; every standard compression codec; verification of the SHA-1,
+    matrix); both byte orders; every standard compression codec, including blocks with
+    uncompressed subblocks, which Revision 2 adds to the bullet; verification of the SHA-1,
     SHA-256 and SHA-512 checksums §10.5 requires of every decoder; `Planar` and `Normal`
     storage; `UInt8`, `UInt16` and `Float32` sample formats; `Gray` and `RGB` colour spaces.
     §7's three general obligations are graded there too — an unsupported feature leaves the
@@ -2432,7 +2488,8 @@ report, a pasted header.
     unit length, non-ASCII in a value field); tile-compressed FITS declined; the XML-guard
     cases; an `<Image>` with **no `location` at all** — net-new, since every ported fixture
     that reaches that check supplies one; a `Reference` pointing at a nonexistent `uid`; a
-    subblock list whose lengths do not sum to the block size; a checksummed block whose
+    subblock list whose lengths do not sum to the block size; a compressed subblock that
+    decompresses short of, or past, its declared length; a checksummed block whose
     digest does not match; a **zstd window bomb**; and a block behind the cursor on a
     sequential source. Cases beyond these are welcome; dropping one the ported suite covers
     is a regression.
@@ -2714,7 +2771,8 @@ criterion.
 | **Header encoding is UTF-8 (§9.5); invalid UTF-8 is `Malformed` and a declared non-UTF-8 encoding is `Unsupported`. A missing XML declaration is tolerated** | `quick-xml` is built without its transcoding feature and guessing would be worse than refusing. The missing declaration makes the header invalid by §9.5 and is tolerated anyway, as deliberate leniency toward real writers rather than as a conformance claim; nothing in decoding depends on it |
 | **The XML header may not be a well-formed standalone document, and that is fine** | A signed unit places its `<Signature>` element *after* `</xisf>` (§9.5), so the header buffer has two roots. Pull-parsing naturally stops caring once the `xisf` element closes, which is what makes a signed unit decode normally even though signature verification is out of scope |
 | **`Metadata`'s absence is tolerated** | The specification requires it but defines no failure mode, and a decode-only library gains nothing by refusing |
-| **`subblocks` without `compression` is `Malformed` — this crate's decision, not a spec rule** | §10.6's "*must* appear along with the compression attribute" is conditional: it governs the case where a block exceeds a codec's input limit, and the following paragraph makes the attribute optional otherwise. The specification never contemplates `subblocks` on an uncompressed block, so it neither permits nor forbids it; refusing is the same call made everywhere else here, since the attribute describes how compressed data was split and on an uncompressed block it describes nothing. The granularity floors accordingly never pair `subblocks` with an uncompressed codec |
+| **`subblocks` without `compression` is `Malformed` — this crate's decision, not a spec rule** | §10.6's "*must* appear along with the compression attribute" is conditional: it governs the case where a block exceeds a codec's input limit, and the following paragraph makes the attribute optional otherwise. The specification never contemplates `subblocks` on an uncompressed block, so it neither permits nor forbids it; refusing is the same call made everywhere else here, since the attribute describes how compressed data was split and on an uncompressed block it describes nothing. Revision 2's uncompressed subblocks do not change that: §10.6.1 defines them as subblocks *of a compressed block*, and a list of equal pairs with no `compression` is still a split of nothing. The granularity floors accordingly never pair `subblocks` with an uncompressed codec |
+| **Subblocks are read under Revision 2's §10.6.1.** A pair with `c == u` is an **uncompressed subblock**: its stored bytes are copied unmodified, on every route. Every other pair — `c < u`, and `c > u` too — is decompressed, to exactly `u` bytes, and the codec must end there, or the block is `Malformed`. A block with no `subblocks` attribute is one pair, its stored length and its declared uncompressed size, under the same rules, so a block stored at exactly its uncompressed size is copied. `(0, 0)` is an empty uncompressed subblock. Under byte shuffling an uncompressed subblock holds bytes of the *shuffled* block and the unshuffle runs over the concatenation as before; a checksum covers the subblocks as stored, uncompressed ones included, and is verified before any of them is read. **`EqualLengthSubblocks::TryDecompress`**, off by default, reads a non-empty `c == u` pair by attempting the codec first and using the result only if it ends after exactly `u` bytes; a codec that refuses the bytes leaves them read as stored, while a cap the attempt trips — a zstd window above `zstd_window_bytes` — is reported as `LimitExceeded`. Such a pair is held whole, so the option moves a framed block's granularity to `Block`, or `WholeImage` unsplit | §10.6.1 is the rule set, and the corpus carries no equal-length pair, no `c > u` pair and no unsplit block stored at its size, so the decision is graded by fixtures on every codec, `+sh` variant and route. The option is §10.6.1's and §2.1's *may*, and it is a **deliberate, opt-in carve-out from § The organizing principle**: a damaged compressed subblock of equal lengths falls back to its stored bytes silently, decoding to wrong pixels without an error, which is why it is never the default and why a declared checksum — verified before the attempt — is what closes it. Only the codec's own refusal falls back, because only that says the bytes are not a stream; a cap refusing what may be a valid stream would otherwise become fabricated pixels. The option is fixed for the reader's life, so granularity is computed from the header and the option together and never from the source. Why the attempt is not the default, and why it holds one subblock rather than materializing the block, is in § Alternatives |
 | **Three checks are added to the subblock list**: the count is capped, the declared compressed lengths must sum to the stored block size, and the declared uncompressed lengths must sum to the geometry-implied size. All three run before any allocation | §10.6 requires no validation of the list and explicitly sets no upper limit on the number of subblocks. Without these the attribute is a cheap amplification vector the element-count cap does not cover, because the whole list is one attribute string rather than elements |
 | **Checksums are verified for every block whose contents are actually read** — which makes tier 1 free for `attachment` blocks and **not** free for `embedded` ones, whose contents are read during header parse and whose digest is therefore verified at construction | §10.5 permits on-demand verification. A mismatch returns `ChecksumMismatch`: §10.5 tells a decoder to warn and let *the user* choose whether to continue, and for a library the caller is that user; the same section adds that an unattended batch decoder should not load a failing unit, which is this crate's primary setting |
 | **All five algorithms are supported, not the mandatory three alone**: `sha-1` (also `sha1`), `sha-256` (`sha256`), `sha-512` (`sha512`), `sha3-256`, `sha3-512`, digests lowercase Base16 | §10.5 requires SHA-1, SHA-256 and SHA-512 of every decoder — the "claiming support" qualifier applies to encoders — and leaves the two SHA-3 algorithms optional. One more hash crate is a small price beside a feature matrix where a file's decodability depends on which digest its writer chose |

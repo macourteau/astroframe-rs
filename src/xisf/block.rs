@@ -8,6 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::limits::Limits;
+use crate::options::EqualLengthSubblocks;
 use crate::xisf::scalars::{parse_u64, split_fields, trim};
 
 /// How an embedded or inline block's bytes are spelled as text (§10.3).
@@ -198,6 +199,72 @@ pub(crate) fn parse_compression(text: &str) -> Result<Compression> {
 
 /// One entry of a `subblocks` list: `(compressed, uncompressed)` lengths in bytes.
 pub(crate) type Subblock = (u64, u64);
+
+/// How one subblock is read — the per-pair decision of §10.6.1, made here and only here.
+///
+/// Both subblock walks act on it: `codec::decompress`, which materializes a block, and
+/// `Stream::open`, which streams one. A block's route is the header's choice for reasons of
+/// its own — a checksum, a shuffle, an embedded location — so a rule each walk restated could
+/// make the same block decode differently by route, which is the drift this keeps out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairKind {
+    /// An uncompressed subblock (`c == u`): its stored bytes are its data, copied unmodified.
+    Raw,
+    /// Every other subblock, `c > u` included: decompressed to exactly `u` bytes, and the
+    /// codec must end there.
+    Compressed,
+    /// `c == u` under [`EqualLengthSubblocks::TryDecompress`]: decompressed if the codec takes
+    /// it and ends at exactly `u` bytes, copied otherwise. The attempt needs the subblock
+    /// resident.
+    Probe,
+}
+
+/// Classify one `(compressed, uncompressed)` pair.
+///
+/// An empty pair is raw under either reading: there is nothing to attempt, and building a
+/// codec state to learn that zero bytes are zero bytes is work a subblock list of 4096 empty
+/// pairs would multiply.
+pub(crate) fn classify(
+    (compressed, uncompressed): Subblock,
+    reading: EqualLengthSubblocks,
+) -> PairKind {
+    if compressed != uncompressed {
+        return PairKind::Compressed;
+    }
+    match reading {
+        _ if compressed == 0 => PairKind::Raw,
+        EqualLengthSubblocks::Uncompressed => PairKind::Raw,
+        EqualLengthSubblocks::TryDecompress => PairKind::Probe,
+    }
+}
+
+/// Whether a block's codec has to hold a whole subblock resident to produce any of it.
+///
+/// This is the one predicate both `granularity()` and the decoder's `is_streamable` read, so
+/// the floor a header reports and the path its pixels take cannot disagree. A bare LZ4 block
+/// has no framing and decompresses only as a whole; zlib and zstd are framed streams that
+/// decompress incrementally, unless a pair is a [`PairKind::Probe`], whose attempt needs it
+/// resident.
+///
+/// `stored` is the block's stored length, which an unsplit block's one pair is made of
+/// (§10.6.1); it is `None` only where the header phase does not know it, and such a block is
+/// never streamed.
+pub(crate) fn holds_whole_subblocks(
+    codec: Codec,
+    subblocks: Option<&[Subblock]>,
+    stored: Option<u64>,
+    implied: u64,
+    reading: EqualLengthSubblocks,
+) -> bool {
+    if matches!(codec, Codec::Lz4 | Codec::Lz4Hc) {
+        return true;
+    }
+    let probe = |pair: Subblock| classify(pair, reading) == PairKind::Probe;
+    match subblocks {
+        Some(list) => list.iter().copied().any(probe),
+        None => stored.is_some_and(|stored| probe((stored, implied))),
+    }
+}
 
 /// Parse a `subblocks` attribute — `c_1,u_1:c_2,u_2:…:c_N,u_N`.
 ///
