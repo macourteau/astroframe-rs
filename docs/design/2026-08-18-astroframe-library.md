@@ -442,9 +442,9 @@ a caller asks for; it is unrelated to the two *layers* above, which are about wh
 bytes have been turned into.
 
 ```
-  constructors:  Reader::open(path)        ·  Reader::open_with_limits(path, lim)
-                 Reader::sequential(r)     ·  Reader::sequential_with_limits(r, lim)
-                 Reader::seekable(r)       ·  Reader::seekable_with_limits(r, lim)
+  constructors:  Reader::open(path)        ·  options.open(path)
+                 Reader::sequential(r)     ·  options.sequential(r)
+                 Reader::seekable(r)       ·  options.seekable(r)
                                  │
                                  ▼
         ┌──────────────────────────────────────────────────┐
@@ -453,6 +453,7 @@ bytes have been turned into.
         │  known from construction                         │
         │    · format() -> Format                          │
         │    · is_seekable() -> bool                       │
+        │    · options() -> &DecodeOptions                 │
         │    · limits() -> &Limits                         │
         │                                                  │
         │  header phase — parsed at construction           │
@@ -477,12 +478,24 @@ bytes have been turned into.
         └──────────────────────────────────────────────────┘
 ```
 
-**Every constructor comes in a pair.** The short spelling uses `Limits::default()`; the
-`_with_limits` spelling takes the caller's. Limits are fixed for the reader's life, with no
-setter, because the header parse the constructor performs is already subject to them — a cap
-that could change afterwards would have to describe which of the two settings had governed
-the bytes already read. § The caps is their single normative home: the values, both
-directions a caller moves them, and the two mechanisms rejected in favour of a parameter.
+**Every constructor comes in a pair.** The `Reader` spelling uses the defaults; the
+`DecodeOptions` spelling takes the caller's, in the manner of `std::fs::OpenOptions`: the
+options are built first and the source they read finishes them. `DecodeOptions` is everything
+a reader is told at construction, its `Limits` among it — a `Copy`, `#[non_exhaustive]` struct
+with public fields and by-value `with_*` setters, the same shape as `Limits` itself, plus
+`From<Limits>` for the caller who only moves caps. Its finishers take `&self`, so one value
+serves a batch.
+
+One options value rather than one constructor per knob is the point of the type. A pair per
+knob multiplies with every knob — three sources times each combination of settings — while a
+field added to a `#[non_exhaustive]` struct is an addition that no existing call site sees.
+
+The options are fixed for the reader's life, with no setter, because the header parse the
+constructor performs is already subject to them — a cap that could change afterwards would
+have to describe which of the two settings had governed the bytes already read.
+`Reader::options` and `Reader::limits` report what is in force. § The caps is the single
+normative home of the caps: the values, both directions a caller moves them, and the two
+mechanisms rejected in favour of a parameter.
 
 **Tier 1 — header only.** Constructing a `Reader` parses the first header unit and
 stops; no pixel byte is read. For FITS that is the 2880-byte blocks up to `END`; for
@@ -1507,7 +1520,8 @@ of them are explicit:
 parameter**, defaulted to the values in the table below, and tripping one is
 `LimitExceeded`. Each caller supplies its own at construction and nobody's choice leaks
 into anybody else's: `Limits` is an argument, so it does not unify across a dependency
-graph and there is no global for a second consumer to overwrite.
+graph and there is no global for a second consumer to overwrite. It reaches the reader inside
+the `DecodeOptions` a constructor takes (§ The API).
 
 **Both directions are real, which is why the knob exists at all.** A service accepting
 uploads wants the caps *tighter* than the defaults — refusing far below 2³⁰ over untrusted
@@ -1531,7 +1545,7 @@ reach another's:
 `Limits` is a plain `Copy` struct with one public field per row below — two for the
 stored-block row, whose value is a multiple of the geometry-implied size *and* a floor —
 `#[non_exhaustive]` so a later cap is an addition rather than a break, built from
-`Limits::default()` and mutated. Its one real cost is accepted rather than argued away: a
+`Limits::default()` and mutated or chained through its `with_*` setters. Its one real cost is accepted rather than argued away: a
 caller can set a cap high enough to offer no protection. That appears in the caller's own
 source, which is the difference between this and the two rejected mechanisms.
 

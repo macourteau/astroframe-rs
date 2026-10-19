@@ -2,7 +2,7 @@
 //! arithmetic and the allocation guards live.
 #![no_main]
 
-use astroframe::{Reader, Samples};
+use astroframe::{DecodeOptions, Samples};
 use astroframe_fuzz::{assert_within, bound, limits, start_counting};
 use libfuzzer_sys::fuzz_target;
 
@@ -16,7 +16,7 @@ fuzz_target!(|input: (&[u8], &[u8])| {
     unit.extend_from_slice(body);
 
     let run = start_counting();
-    if let Ok(mut reader) = Reader::seekable_with_limits(std::io::Cursor::new(&unit), limits()) {
+    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(std::io::Cursor::new(&unit)) {
         while matches!(reader.next_image(), Ok(true)) {
             let Ok(h) = reader.current_header() else {
                 break;

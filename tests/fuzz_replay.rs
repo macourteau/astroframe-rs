@@ -32,7 +32,7 @@
 mod alloc;
 mod common;
 
-use astroframe::{Limits, Reader, Samples};
+use astroframe::{DecodeOptions, Limits, Samples};
 use common::Hdu;
 use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib};
 use std::io::Cursor;
@@ -186,7 +186,7 @@ fn strip_xisf_header(bytes: &[u8]) -> &[u8] {
 /// header-multiplication seed here does its work and the cheapest place to catch one.
 fn header_lane(data: &[u8]) {
     alloc::reset();
-    if let Ok(mut reader) = Reader::seekable_with_limits(Cursor::new(data), limits()) {
+    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
         let mut advances = 0;
         while advances < 1024 {
             match reader.next_image() {
@@ -208,7 +208,7 @@ fn header_lane(data: &[u8]) {
 /// from the parsed header, as `f32` and as native samples.
 fn decode_any_lane(data: &[u8]) {
     alloc::reset();
-    if let Ok(mut reader) = Reader::seekable_with_limits(Cursor::new(data), limits()) {
+    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -234,7 +234,7 @@ fn decode_any_lane(data: &[u8]) {
 fn decode_alloc_lane(data: &[u8]) {
     alloc::reset();
     let mut implied = 0usize;
-    if let Ok(mut reader) = Reader::seekable_with_limits(Cursor::new(data), limits()) {
+    if let Ok(mut reader) = DecodeOptions::from(limits()).seekable(Cursor::new(data)) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -259,7 +259,7 @@ fn decode_alloc_lane(data: &[u8]) {
 /// no-known-length size checks no other target reaches.
 fn decode_sequential_lane(data: &[u8]) {
     alloc::reset();
-    if let Ok(mut reader) = Reader::sequential_with_limits(Forward { data, at: 0 }, limits()) {
+    if let Ok(mut reader) = DecodeOptions::from(limits()).sequential(Forward { data, at: 0 }) {
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;

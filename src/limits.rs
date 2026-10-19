@@ -3,7 +3,8 @@
 
 use crate::error::{Error, Result};
 
-/// Per-`Reader` caps. Tripping one is [`Error::LimitExceeded`].
+/// Per-`Reader` caps, handed to a reader inside [`DecodeOptions`](crate::DecodeOptions). Tripping
+/// one is [`Error::LimitExceeded`].
 ///
 /// A per-[`Reader`](crate::Reader) parameter rather than a compile-time constant or a global,
 /// because **both directions are real**. A service accepting uploads wants them tighter than
@@ -43,7 +44,7 @@ use crate::error::{Error, Result};
 /// limits.xml_depth = 16;
 /// assert_eq!(generous.decoded_output_bytes, limits.decoded_output_bytes);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Limits {
     // ---- XISF ----

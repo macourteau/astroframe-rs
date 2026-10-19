@@ -35,7 +35,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{Error, Limits, Reader};
+use astroframe::{Error, Reader};
 
 use common::kind;
 use common::xisf::{Unit, le_u16, lz4, repeating_u16, zlib};
@@ -166,7 +166,7 @@ fn measure(case: &str, bytes: &[u8], want_kind: &'static str, fragment: &str) {
 /// — is dropped before the counter is read, and so a successful decode reports its sample
 /// count rather than being silently discarded.
 fn decode(bytes: &[u8]) -> Result<usize, Error> {
-    let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), Limits::default())?;
+    let mut reader = Reader::seekable(Cursor::new(bytes))?;
     if !reader.next_image()? {
         panic!("a bomb fixture must reach an image position");
     }

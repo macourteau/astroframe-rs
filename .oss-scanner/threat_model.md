@@ -11,14 +11,16 @@ sets `#![forbid(unsafe_code)]` (`src/lib.rs`), has no C dependency and no build 
 nothing.
 
 **Every byte of the source is untrusted.** The calling program is trusted: the path it passes to
-`Reader::open`, its `Limits`, its destination slices, and its `set_bounds` / `select_channel`
-arguments. Untrusted bytes enter only through a `Reader` (`src/reader.rs`):
+`Reader::open`, its `DecodeOptions` and the `Limits` in them, its destination slices, and its
+`set_bounds` / `select_channel` arguments. Untrusted bytes enter only through a `Reader`
+(`src/reader.rs`):
 
 - **Construction**: `Reader::open(path)`, `Reader::seekable(R: Read + Seek)` (in-memory input is
-  `Reader::seekable(Cursor::new(bytes))`), `Reader::sequential(R: Read)`, and the `*_with_limits`
-  form of each. Construction sniffs `SIMPLE` / `XISF0100` and parses the first header unit: the FITS
-  primary header, or the XISF preamble and the whole XML header, which includes decoding every
-  `embedded` block's Base64/Base16 text and verifying its checksum. No attached pixel byte is read.
+  `Reader::seekable(Cursor::new(bytes))`), `Reader::sequential(R: Read)`, and the `DecodeOptions`
+  finisher of each (`open` / `seekable` / `sequential`), which applies the caller's `Limits`.
+  Construction sniffs `SIMPLE` / `XISF0100` and parses the first header unit: the FITS primary
+  header, or the XISF preamble and the whole XML header, which includes decoding every `embedded`
+  block's Base64/Base16 text and verifying its checksum. No attached pixel byte is read.
 - **Walking**: `next_image()`. For FITS it parses extension headers and skips data units; non-image
   extensions and `IMAGE` extensions with `NAXIS = 0` are stepped over inside one call, and a
   tile-compressed `BINTABLE` is a declined position. For XISF it walks `<Image>` elements and the

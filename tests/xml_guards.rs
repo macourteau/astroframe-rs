@@ -27,7 +27,7 @@ mod common;
 
 use std::io::Cursor;
 
-use astroframe::{Error, Limits, Reader};
+use astroframe::{DecodeOptions, Error, Limits, Reader};
 
 use common::xisf::{PREAMBLE, Unit, le_u16, lz4, raw_unit, repeating_u16};
 use common::{CountingRead, kind};
@@ -46,7 +46,7 @@ fn assert_names(case: &str, e: &Error, fragment: &str) {
 /// unparseable or over-guarded header is a **unit-level** fault, so no `Reader` exists at all
 /// and the caller has nothing to walk.
 fn construct(bytes: &[u8], limits: Limits) -> astroframe::Result<Reader<impl astroframe::Source>> {
-    Reader::seekable_with_limits(Cursor::new(bytes), limits)
+    DecodeOptions::from(limits).seekable(Cursor::new(bytes))
 }
 
 /// A guard that fires during the header parse: `LimitExceeded` (or `Malformed`), and **no
@@ -502,8 +502,9 @@ fn the_stored_block_cap_trips_on_a_sequential_source() {
     // Under the defaults the cap is `max(implied x 2, 1 MiB)` and the block is nowhere near it,
     // so the file decodes — over a forward-only source, with no length to fall back on.
     let limits = Limits::default();
-    let mut reader =
-        Reader::sequential_with_limits(Cursor::new(&bytes[..]), limits).expect("construct");
+    let mut reader = DecodeOptions::from(limits)
+        .sequential(Cursor::new(&bytes[..]))
+        .expect("construct");
     assert!(reader.next_image().expect("advance"));
     let image = reader
         .read_image()
@@ -522,8 +523,9 @@ fn the_stored_block_cap_trips_on_a_sequential_source() {
     let mut tight = Limits::default();
     tight.stored_block_multiple = 1;
     tight.stored_block_floor_bytes = raw.len() as u64;
-    let mut reader =
-        Reader::sequential_with_limits(Cursor::new(&bytes[..]), tight).expect("construct");
+    let mut reader = DecodeOptions::from(tight)
+        .sequential(Cursor::new(&bytes[..]))
+        .expect("construct");
     assert!(reader.next_image().expect("advance"));
     let e = match reader.read_image() {
         Ok(image) => panic!(

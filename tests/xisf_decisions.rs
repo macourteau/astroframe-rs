@@ -26,9 +26,9 @@ mod common;
 use std::io::Cursor;
 
 use astroframe::{
-    ColorSpace, DeclineClass, Granularity, Header, ImageType, KeywordOrigin, Orientation,
-    PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader, ResolutionUnit,
-    SampleFormat, Sequential,
+    ColorSpace, DeclineClass, DecodeOptions, Granularity, Header, ImageType, KeywordOrigin,
+    Orientation, PixelStorage, Property, PropertyScope, PropertyType, PropertyValue, Reader,
+    ResolutionUnit, SampleFormat, Sequential,
 };
 #[cfg(feature = "checksum")]
 use common::xisf::checksum_attr;
@@ -1147,7 +1147,8 @@ fn the_three_subblock_checks_hold_and_subblocks_without_compression_is_malformed
         ),
         stored,
     );
-    let mut reader = Reader::seekable_with_limits(Cursor::new(bytes), limits)
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(bytes))
         .expect("the unit itself constructs");
     assert!(reader.next_image().expect("the walk advances"));
     let header = reader
@@ -1317,8 +1318,9 @@ fn a_compressed_stored_block_is_measured_against_the_materialization_cap() {
 
     let mut tight = astroframe::Limits::default();
     tight.materialized_bytes = 20_000;
-    let mut reader =
-        Reader::seekable_with_limits(Cursor::new(unit), tight).expect("the unit constructs");
+    let mut reader = DecodeOptions::from(tight)
+        .seekable(Cursor::new(unit))
+        .expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
     let err = reader
         .read_image()
@@ -1339,8 +1341,9 @@ fn a_compressed_stored_block_is_measured_against_the_materialization_cap() {
             lz4(&plain),
         )
         .build();
-    let mut reader =
-        Reader::seekable_with_limits(Cursor::new(honest), tight).expect("the unit constructs");
+    let mut reader = DecodeOptions::from(tight)
+        .seekable(Cursor::new(honest))
+        .expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
     let image = reader.read_image().expect("a stored block under the cap");
     assert_same_bits(
@@ -1432,7 +1435,8 @@ fn a_thumbnails_attached_block_is_stepped_over_and_the_right_cap_bounds_the_step
     // valid and self-consistent and having tripped a configured cap.
     let mut limits = astroframe::Limits::default();
     limits.skipped_block_bytes = 1024;
-    let mut reader = Reader::sequential_with_limits(Cursor::new(unit.build()), limits)
+    let mut reader = DecodeOptions::from(limits)
+        .sequential(Cursor::new(unit.build()))
         .expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
     let err = reader
@@ -1443,7 +1447,8 @@ fn a_thumbnails_attached_block_is_stepped_over_and_the_right_cap_bounds_the_step
 
     // The same tight cap on a **seekable** source decodes: skipping is a seek there, the
     // cursor moves without transferring bytes, and the cap is not consulted.
-    let mut reader = Reader::seekable_with_limits(Cursor::new(unit.build()), limits)
+    let mut reader = DecodeOptions::from(limits)
+        .seekable(Cursor::new(unit.build()))
         .expect("the unit constructs");
     assert!(reader.next_image().expect("the walk advances"));
     let image = reader.read_image().expect("a seek costs no skipped bytes");

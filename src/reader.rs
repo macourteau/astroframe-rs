@@ -9,6 +9,7 @@ use crate::header::{Bounds, BoundsUnavailable, Format, Header};
 use crate::image::Image;
 use crate::limits::{Limits, narrow};
 use crate::normalize::{Normalizer, SampleRange};
+use crate::options::DecodeOptions;
 use crate::samples::{SampleSlice, Samples};
 use crate::source::{Seekable, Sequential, Source};
 
@@ -233,7 +234,7 @@ macro_rules! dispatch {
 /// `&Reader` is sound but buys nothing; that is a statement about the API, not about `Sync`.
 pub struct Reader<S: Source> {
     source: S,
-    limits: Limits,
+    options: DecodeOptions,
     inner: Inner,
     phase: Phase,
     /// Set by `set_bounds`; per-image, cleared by `next_image`.
@@ -291,8 +292,10 @@ impl Reader<Seekable<std::io::BufReader<std::fs::File>>> {
     /// raises: [`Error::Malformed`] for bytes matching neither format's signature,
     /// [`Error::Unsupported`] for a format this build has disabled, [`Error::LimitExceeded`]
     /// for a header past one of [`Limits`]' caps.
+    ///
+    /// Under the default [`DecodeOptions`]; [`DecodeOptions::open`] takes the caller's.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_limits(path, Limits::default())
+        DecodeOptions::default().open(path)
     }
 
     /// [`Reader::open`] with the caller's caps.
@@ -300,9 +303,9 @@ impl Reader<Seekable<std::io::BufReader<std::fs::File>>> {
     /// # Errors
     ///
     /// As [`Reader::open`], against `limits` rather than the defaults.
+    #[deprecated(since = "0.3.1", note = "use `DecodeOptions::from(limits).open(path)`")]
     pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        Reader::seekable_with_limits(std::io::BufReader::new(file), limits)
+        DecodeOptions::from(limits).open(path)
     }
 }
 
@@ -324,8 +327,10 @@ impl<R: std::io::Read> Reader<Sequential<R>> {
     /// [`Error::Malformed`] for bytes matching neither format's signature,
     /// [`Error::Unsupported`] for a format this build has disabled, [`Error::LimitExceeded`]
     /// for a header past one of [`Limits`]' caps.
+    ///
+    /// Under the default [`DecodeOptions`]; [`DecodeOptions::sequential`] takes the caller's.
     pub fn sequential(source: R) -> Result<Self> {
-        Self::sequential_with_limits(source, Limits::default())
+        DecodeOptions::default().sequential(source)
     }
 
     /// [`Reader::sequential`] with the caller's caps.
@@ -333,8 +338,12 @@ impl<R: std::io::Read> Reader<Sequential<R>> {
     /// # Errors
     ///
     /// As [`Reader::sequential`], against `limits` rather than the defaults.
+    #[deprecated(
+        since = "0.3.1",
+        note = "use `DecodeOptions::from(limits).sequential(source)`"
+    )]
     pub fn sequential_with_limits(source: R, limits: Limits) -> Result<Self> {
-        Reader::build(Sequential::new(source), limits)
+        DecodeOptions::from(limits).sequential(source)
     }
 }
 
@@ -358,8 +367,10 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
     /// As [`Reader::sequential`], plus the [`Error::Io`] a source that cannot report its own
     /// length raises — the constructor measures it, which is what the geometry cross-check
     /// uses.
+    ///
+    /// Under the default [`DecodeOptions`]; [`DecodeOptions::seekable`] takes the caller's.
     pub fn seekable(source: R) -> Result<Self> {
-        Self::seekable_with_limits(source, Limits::default())
+        DecodeOptions::default().seekable(source)
     }
 
     /// [`Reader::seekable`] with the caller's caps.
@@ -367,8 +378,12 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
     /// # Errors
     ///
     /// As [`Reader::seekable`], against `limits` rather than the defaults.
+    #[deprecated(
+        since = "0.3.1",
+        note = "use `DecodeOptions::from(limits).seekable(source)`"
+    )]
     pub fn seekable_with_limits(source: R, limits: Limits) -> Result<Self> {
-        Reader::build(Seekable::new(source)?, limits)
+        DecodeOptions::from(limits).seekable(source)
     }
 }
 
@@ -379,7 +394,8 @@ impl<R: std::io::Read + std::io::Seek> Reader<Seekable<R>> {
 // is silenced for it specifically rather than papering over a real unused binding elsewhere.
 #[cfg_attr(not(any(feature = "fits", feature = "xisf")), allow(unused_variables))]
 impl<S: Source> Reader<S> {
-    fn build(mut source: S, limits: Limits) -> Result<Self> {
+    /// Every constructor ends here, through [`DecodeOptions`]' finishers.
+    pub(crate) fn build(mut source: S, options: DecodeOptions) -> Result<Self> {
         let mut signature = [0u8; 8];
         source.read_exact(&mut signature).map_err(|e| match e {
             Error::Malformed(_) => {
@@ -388,11 +404,11 @@ impl<S: Source> Reader<S> {
             other => other,
         })?;
 
-        let inner = Self::sniff(&signature, &mut source, &limits)?;
+        let inner = Self::sniff(&signature, &mut source, &options.limits)?;
 
         Ok(Reader {
             source,
-            limits,
+            options,
             inner,
             phase: Phase::Header,
             bounds_override: None,
@@ -448,16 +464,33 @@ impl<S: Source> Reader<S> {
     /// caller reporting a [`Error::LimitExceeded`] needs in order to name the cap it tripped.
     ///
     /// ```no_run
-    /// use astroframe::{Limits, Reader};
+    /// use astroframe::{DecodeOptions, Limits};
     ///
     /// # fn main() -> astroframe::Result<()> {
     /// let limits = Limits::default().with_total_samples(64 << 20);
-    /// let reader = Reader::open_with_limits("frame.fits", limits)?;
+    /// let reader = DecodeOptions::from(limits).open("frame.fits")?;
     /// assert_eq!(reader.limits().total_samples, 64 << 20);
     /// # Ok(()) }
     /// ```
     pub fn limits(&self) -> &Limits {
-        &self.limits
+        &self.options.limits
+    }
+
+    /// The options this reader was built with; [`Reader::limits`] is their
+    /// [`limits`](DecodeOptions::limits).
+    ///
+    /// Fixed for the reader's life, as the caps are.
+    ///
+    /// ```no_run
+    /// use astroframe::{DecodeOptions, Reader};
+    ///
+    /// # fn main() -> astroframe::Result<()> {
+    /// let reader = Reader::open("frame.fits")?;
+    /// assert_eq!(*reader.options(), DecodeOptions::default());
+    /// # Ok(()) }
+    /// ```
+    pub fn options(&self) -> &DecodeOptions {
+        &self.options
     }
 
     /// Which container this reader is decoding.
@@ -631,7 +664,7 @@ impl<S: Source> Reader<S> {
     pub fn next_image(&mut self) -> Result<bool> {
         if self.pixels_started {
             let src = &mut self.source;
-            let limits = &self.limits;
+            let limits = &self.options.limits;
             dispatch!(&mut self.inner, d => d.abandon(src, limits), Result<()>)?;
         }
 
@@ -642,7 +675,7 @@ impl<S: Source> Reader<S> {
         self.pixels_failed = false;
 
         let src = &mut self.source;
-        let limits = &self.limits;
+        let limits = &self.options.limits;
         let advanced = dispatch!(&mut self.inner, d => d.next_image(src, limits), Result<bool>)?;
 
         // The cap counts **occurrences**, so it is checked only once the decoder confirms
@@ -652,11 +685,11 @@ impl<S: Source> Reader<S> {
         // `LimitExceeded`, and a 256-image mosaic is not more than 256.
         if advanced {
             self.advances = self.advances.saturating_add(1);
-            if self.advances > u64::from(self.limits.images_per_source) {
+            if self.advances > u64::from(self.options.limits.images_per_source) {
                 return Err(Error::limit(format!(
                     "images per source: this source holds more than the {} image occurrences \
                      the cap allows",
-                    self.limits.images_per_source
+                    self.options.limits.images_per_source
                 )));
             }
         }
@@ -1043,10 +1076,10 @@ impl<S: Source> Reader<S> {
     }
 
     fn check_output_bytes(&self, bytes: u64) -> Result<()> {
-        if bytes > self.limits.decoded_output_bytes {
+        if bytes > self.options.limits.decoded_output_bytes {
             return Err(Error::limit(format!(
                 "decoded output bytes: this decode writes {bytes} bytes, above the {} byte cap",
-                self.limits.decoded_output_bytes
+                self.options.limits.decoded_output_bytes
             )));
         }
         Ok(())
@@ -1117,12 +1150,12 @@ impl<S: Source> Reader<S> {
                 selected_channel: self.selected_channel,
             };
             let src = &mut self.source;
-            let limits = &self.limits;
+            let limits = &self.options.limits;
             dispatch!(&mut self.inner, d => d.begin_pixels(src, limits, &plan), Result<()>)?;
             self.pixels_started = true;
         }
         let src = &mut self.source;
-        let limits = &self.limits;
+        let limits = &self.options.limits;
         dispatch!(&mut self.inner, d => d.next_chunk(src, limits), Result<Option<ChunkMeta>>)
     }
 
@@ -1142,10 +1175,10 @@ impl<S: Source> Reader<S> {
             return Ok(());
         };
         let total = g.total_samples();
-        if total > self.limits.total_samples {
+        if total > self.options.limits.total_samples {
             return Err(Error::limit(format!(
                 "total samples: the file declares {}x{}x{} = {total} samples, above the {} cap",
-                g.width, g.height, g.channels, self.limits.total_samples
+                g.width, g.height, g.channels, self.options.limits.total_samples
             )));
         }
 
@@ -1318,8 +1351,9 @@ mod tests {
             images_per_source: u32::MAX,
             ..Limits::default()
         };
-        let mut reader =
-            Reader::sequential_with_limits(std::io::Cursor::new(bytes), limits).unwrap();
+        let mut reader = crate::DecodeOptions::from(limits)
+            .sequential(std::io::Cursor::new(bytes))
+            .unwrap();
         assert!(reader.next_image().unwrap(), "the fixture's first image");
 
         reader.advances = u64::from(u32::MAX);
