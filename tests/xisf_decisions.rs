@@ -35,7 +35,7 @@ use common::xisf::checksum_attr;
 use common::xisf::{
     PREAMBLE, Unit, attached_image, attached_u16, base64, be_u16, decodes_to, embedded_u16,
     expected_u16, hex, image_element, le_u16, lz4, read_one, repeating_u16, samples, seekable,
-    shuffle, with_header, xml_unit, zlib,
+    shuffle, with_header, xml_unit, zlib, zstd_raw,
 };
 use common::{Streams, assert_granularity, assert_same_bits, kind};
 
@@ -2040,6 +2040,152 @@ fn a_subblocked_zlib_block_streams_by_rows() {
         stored,
     );
     decodes_to(unit, &levels, "zlib + subblocks");
+}
+
+/// One subblocked block on each route to the two subblock walks, with the floor each route
+/// must report: attached, which streams, and embedded and checksummed, which materialize. The
+/// route is the subject, so the floor is asserted beside the outcome — a fixture drifting onto
+/// the other walk would pass by measuring the decoder it is not for.
+fn subblock_routes(
+    attrs: &str,
+    stored: &[u8],
+    streams: Streams,
+) -> Vec<(&'static str, Vec<u8>, Streams)> {
+    #[allow(unused_mut)] // only the checksum route pushes
+    let mut routes = vec![
+        ("attached", attached_u16(attrs, stored.to_vec()), streams),
+        (
+            "embedded",
+            embedded_u16(
+                "",
+                &format!(r#"encoding="base64" {attrs}"#),
+                &base64(stored),
+            ),
+            Streams::WholeImage,
+        ),
+    ];
+    #[cfg(feature = "checksum")]
+    routes.push((
+        "checksummed",
+        attached_u16(
+            &format!("{attrs} {}", checksum_attr("sha-1", stored)),
+            stored.to_vec(),
+        ),
+        Streams::WholeImage,
+    ));
+    routes
+}
+
+/// What one fixture decodes to on the reader's whole path: the samples and the reported
+/// floor, or the class of the first refusal — construction, a declined position and the pixel
+/// call all count, since which of them raises it depends on the route.
+fn outcome(bytes: Vec<u8>) -> Result<(Granularity, Vec<f32>), &'static str> {
+    let mut reader = seekable(bytes).map_err(|e| kind(&e))?;
+    assert!(reader.next_image().map_err(|e| kind(&e))?, "one image");
+    let granularity = reader
+        .current_header()
+        .expect("the advanced position")
+        .granularity();
+    let image = reader.read_image().map_err(|e| kind(&e))?;
+    Ok((granularity, image.into_samples()))
+}
+
+/// A test-side encoder for one codec's stored form.
+type Compress = fn(&[u8]) -> Vec<u8>;
+
+/// The three subblocked codecs, with the floor the attached route reports for each.
+fn subblock_codecs() -> [(&'static str, Compress, Streams); 3] {
+    [
+        ("zlib", zlib, Streams::Rows),
+        ("zstd", zstd_raw, Streams::Rows),
+        ("lz4", lz4, Streams::Block(2)),
+    ]
+}
+
+/// §10.6.1: *a decoder shall verify that each compressed subblock decompresses to exactly
+/// u_i bytes, and shall treat the data block as invalid otherwise* — every pair of the list,
+/// including the pairs after the last output byte.
+///
+/// A trailing `(c, 0)` pair with `c > 0` is a compressed subblock owed no bytes. It is valid
+/// only where its `c` bytes really are a stream of that codec ending at zero bytes, and the
+/// sums cannot tell: they match either way. The streaming walk opens a subblock only when it
+/// needs output, so it once finished the last row and returned `Ok` without opening the
+/// trailing pair at all, while the materializing walk — reached by the same block embedded,
+/// or checksummed — decompressed every pair and refused it. Which walk runs is the header's
+/// choice for reasons of its own, so the outcome has to be the block's.
+#[test]
+fn a_trailing_subblock_owed_no_bytes_is_decompressed_on_every_route() {
+    let levels = samples();
+    let plain = le_u16(&levels);
+    let garbage = vec![0xde, 0xad, 0xbe, 0xef, 0x00];
+    for (codec, compress, streams) in subblock_codecs() {
+        let compressed = compress(&plain);
+        // `lz4` refuses to build an empty block, which is the one this case needs.
+        let empty = match codec {
+            "lz4" => lz4_flex::block::compress(&[]),
+            _ => compress(&[]),
+        };
+        for (trailing, want_ok) in [(&garbage, false), (&empty, true)] {
+            let mut stored = compressed.clone();
+            stored.extend_from_slice(trailing);
+            let attrs = format!(
+                r#"compression="{codec}:{}" subblocks="{},{}:{},0""#,
+                plain.len(),
+                compressed.len(),
+                plain.len(),
+                trailing.len()
+            );
+            for (route, unit, floor) in subblock_routes(&attrs, &stored, streams) {
+                let what = format!("{codec}, {route}, trailing {trailing:02x?}");
+                match outcome(unit) {
+                    Ok((granularity, got)) => {
+                        assert!(want_ok, "{what}: decoded where it must be refused");
+                        assert_same_bits(&got, &expected_u16(&levels), &what);
+                        assert_granularity(granularity, floor, &what);
+                    }
+                    Err(class) => {
+                        assert!(!want_ok, "{what}: refused as {class} where it must decode");
+                        assert_eq!(class, "Malformed", "{what}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A `(0, 0)` pair gets one answer per codec, wherever it sits in the list and whichever walk
+/// reads it.
+///
+/// What that answer is, is each codec's answer for an empty stream: this version decompresses
+/// every pair, and zero stored bytes are an empty zlib stream to the inflater and are not a
+/// zstd frame or an LZ4 block. Revision 2's §10.6.1 makes `c_i = u_i` an *uncompressed*
+/// subblock, under which the pair is a valid empty one on every codec; this test pins the
+/// agreement rather than that answer. A trailing pair is the case that once disagreed — the
+/// streaming walk never opened it, and decoded zstd and LZ4 blocks the materializing walk and
+/// the same pair at the front both refused.
+#[test]
+fn an_empty_subblock_pair_gets_one_answer_wherever_it_sits() {
+    let levels = samples();
+    let plain = le_u16(&levels);
+    for (codec, compress, streams) in subblock_codecs() {
+        let compressed = compress(&plain);
+        let pair = format!("{},{}", compressed.len(), plain.len());
+        let mut seen: Vec<(String, Result<Vec<u32>, &'static str>)> = Vec::new();
+        for list in [format!("0,0:{pair}"), format!("{pair}:0,0")] {
+            let attrs = format!(
+                r#"compression="{codec}:{}" subblocks="{list}""#,
+                plain.len()
+            );
+            for (route, unit, _) in subblock_routes(&attrs, &compressed, streams) {
+                let bits = outcome(unit).map(|(_, got)| got.iter().map(|s| s.to_bits()).collect());
+                seen.push((format!("{codec}, {route}, {list:?}"), bits));
+            }
+        }
+        let (first, want) = &seen[0];
+        for (what, got) in &seen[1..] {
+            assert_eq!(got, want, "{what} disagrees with {first}");
+        }
+    }
 }
 
 // ------------------------ *Header-only decode works on a truncated prefix* (XISF half)
