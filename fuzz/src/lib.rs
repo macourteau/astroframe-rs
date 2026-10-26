@@ -140,16 +140,24 @@ impl AllocationRun {
 /// This is § The caps being tightened by its first caller rather than a fuzz-only constant:
 /// the fuzz crate passes a `Limits` like anyone else and the shipped defaults are unchanged.
 ///
-/// **Only these two move.** The pair is one number in two units — 2¹⁸ samples at `f32` is
+/// **Of the geometry caps, only these two move.** The pair is one number in two units — 2¹⁸ samples at `f32` is
 /// exactly 2²⁰ bytes — so neither trips before the other on normalized output. The other
 /// fuzz-reachable buffers follow the same geometry rather than needing their own tightening:
 /// at 2¹⁸ samples the whole-image scratch is at most 2 MiB for the widest sample type and the
 /// stored block at most 4 MiB, that cap being the geometry-implied size × 2. Both sit under
 /// the header-cap term on their own.
+///
+/// **The zstd window is the one buffer that does not follow the geometry**, so it moves too.
+/// Its size is declared by the frame header, and at the shipped 8 MiB it equals the bound's
+/// whole header-cap term: a 798-byte input whose second subblock's frame declared exactly that
+/// window had it reserved outright when the reused decoder was reset, and everything else on
+/// top pushed the run over the bound. 2²⁰ is the decoded-output cap again —
+/// no window the fuzz reader could legitimately need is larger than the output it may produce.
 pub fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.total_samples = 1 << 18;
     limits.decoded_output_bytes = 1 << 20;
+    limits.zstd_window_bytes = 1 << 20;
     limits
 }
 
