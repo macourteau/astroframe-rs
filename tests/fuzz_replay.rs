@@ -85,6 +85,7 @@ fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.total_samples = 1 << 18;
     limits.decoded_output_bytes = 1 << 20;
+    limits.zstd_window_bytes = 1 << 20;
     limits
 }
 
@@ -422,6 +423,36 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
                     r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zstd:128" subblocks="{list}" {{loc}}/>"#
                 ),
                 window,
+            )
+            .build(),
+    ));
+    // **A second subblock's zstd frame declaring a window exactly at the shipped 8 MiB cap**,
+    // which the fuzzer found. Inside the cap, so it is honoured, and on its own it fills the
+    // bound's whole header-cap term. It takes two frames: `ruzstd` grows a fresh decoder's
+    // window as output arrives, but resetting the decoder for a later frame — which the
+    // subblock walk does, reusing one decoder — reserves the declared window outright. Not
+    // single-segment, so the window is the declared one rather than the content size; `0x68`
+    // is exponent 13, mantissa 0 — 2^(10+13) bytes.
+    let (at_cap, list) = {
+        let raw = le_u16(&repeating_u16(64));
+        let head = zstd_raw(&raw[..64]);
+        let mut tail = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x68];
+        let block_header: u32 = (64 << 3) | 1; // last block, Raw_Block
+        tail.extend_from_slice(&block_header.to_le_bytes()[..3]);
+        tail.extend_from_slice(&raw[64..]);
+        let list = format!("{},64:{},64", head.len(), tail.len());
+        let mut stored = head;
+        stored.extend_from_slice(&tail);
+        (stored, list)
+    };
+    seeds.push((
+        "xisf/zstd-window-at-default-cap".into(),
+        Unit::new()
+            .attached(
+                &format!(
+                    r#"<Image geometry="8:8:1" sampleFormat="UInt16" compression="zstd:128" subblocks="{list}" {{loc}}/>"#
+                ),
+                at_cap,
             )
             .build(),
     ));

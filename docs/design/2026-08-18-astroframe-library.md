@@ -1876,7 +1876,7 @@ Writing that down is what makes the tenth one visible as the tenth.
 
 **Every target constructs its `Reader` with a `Limits` far tighter than the defaults** —
 **2¹⁸ total samples (about a quarter of a megapixel), 2²⁰ decoded output bytes (1 MiB)**
-rather than 2³⁰ of each. Small limits are what a fuzz target should use whatever the oracle
+rather than 2³⁰ of each, **and a 2²⁰-byte zstd window** rather than 8 MiB. Small limits are what a fuzz target should use whatever the oracle
 asserts: many fast iterations exploring parser state space find more than a few large ones
 exercising allocation volume, and large-geometry behaviour belongs to the caps tests and the
 local corpus rather than to the fuzzer. Without them a twenty-byte input declaring 2²⁸
@@ -1890,13 +1890,32 @@ They are also what keeps the oracle's bound honest. At 2¹⁸ samples the `f32` 
 1 MiB, so the 8 MiB header-cap term dominates the bound and it holds with room even on the
 compressed path, where the decompressed size is bounded by the caps rather than by the input
 length. The pair is one number in two units — 2¹⁸ samples at `f32` is exactly 2²⁰ bytes — so
-neither of the two trips before the other on normalized output. Only these two caps move,
-because the other fuzz-reachable buffers follow the same geometry rather than needing their
-own tightening: at 2¹⁸ samples the whole-image scratch is at most 2 MiB for the widest sample
-type and the stored block at most 4 MiB, that cap being the geometry-implied size × 2. Both
-sit under the header-cap term on their own, and a seed reaching both at once has to carry
-the stored block in its own bytes, which raises the `ALLOC_MULTIPLE × input_length` term
-along with it. So the remaining caps stay at their defaults.
+neither of the two trips before the other on normalized output. Of the geometry caps, only
+these two move, because the other fuzz-reachable buffers follow the same geometry rather than
+needing their own tightening: at 2¹⁸ samples the whole-image scratch is at most 2 MiB for the
+widest sample type and the stored block at most 4 MiB, that cap being the geometry-implied
+size × 2. Both sit under the header-cap term on their own, and a seed reaching both at once
+has to carry the stored block in its own bytes, which raises the `ALLOC_MULTIPLE ×
+input_length` term along with it.
+
+**The zstd window is the exception, because it does not follow the geometry, and this is the
+record of why it moves.** Its size is the one the frame header declares, capped only by
+`zstd_window_bytes`, and at the shipped 8 MiB that cap *equals* the bound's whole fixed term —
+so a frame declaring a window at the cap leaves nothing for the rest of the run. The fuzzer
+found exactly that: a 798-byte `decode_sequential` input whose second zstd frame declared an
+8 MiB window allocated 8 797 654 bytes against an 8 414 144-byte bound, and the seekable path,
+reading the image twice, 17.4 MB. The buffer is `ruzstd`'s decode window, the largest single
+allocation of the run — 8 388 609 bytes under `ruzstd` 0.9.0 and 8 650 753 under 0.9.1, which
+reserves 256 KiB beyond the window. A fresh decoder grows that window as output arrives, but
+resetting one for a later frame reserves the declared window outright, and the subblock walk
+reuses one decoder across its frames — so the shape needs a second frame, and the seed
+`xisf/zstd-window-at-default-cap` carries one. The allocation is legitimate: the declared window
+was inside its cap, which is what the cap admits. The fix is
+the knob the derivation above names, not `ALLOC_MULTIPLE`, which scales with input length and
+cannot absorb a fixed 8 MiB. The fuzz window is 2²⁰, the decoded-output cap again: no window the
+fuzz reader could legitimately need exceeds the output it may produce. No seed loses coverage —
+the seeds' frames are single-segment, whose window is their content size, or the 1 GiB window
+bomb, which is refused under either cap. So the remaining caps stay at their defaults.
 
 **One shape exceeds the bound and is accepted rather than fixed, and this is the record of
 why.** A `CONTINUE` chain is assembled from records, so its value is a concatenation that
@@ -1930,8 +1949,8 @@ shape's 485.4×, a ratio of 2.02. A bound placed above 485 admits repeated assem
 970×. Raising `ALLOC_MULTIPLE` here would not be a raise; it would be switching the oracle off
 for this class.
 
-**Tightening the fuzz `Limits` does not help either, and the paragraph above is right that only
-two caps move.** Lowering `Images per source` and `Assembled keyword value` shrinks the
+**Tightening the fuzz `Limits` does not help either, and the paragraphs above are right that
+these caps stay at their defaults.** Lowering `Images per source` and `Assembled keyword value` shrinks the
 legitimate shape and the defect together, and both fall under the bound's fixed 8 MiB term
 before the legitimate one fits: at 32 images and a 32 KiB assembled value, a repeated-assembly
 defect allocates 4 MB against a 9.65 MB bound and passes. The tightening that makes the oracle
