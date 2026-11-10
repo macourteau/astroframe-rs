@@ -1934,12 +1934,15 @@ charged a fresh one per change: eight *distinct* images alternating `Float64` an
 each declaring more samples than the cap, allocated 16.9 MB from 1068 bytes, and 256 of them
 537 MB from 30 kB, almost all of it the harness's own 2 MiB buffers. A buffer per format would
 bound it, at 6.75 MiB across XISF's six formats — four-fifths of the bound's fixed term, spent
-before the library allocates a byte. So `xisf_block` reads native samples through the chunk
-cursor, which every native read is built on, and holds no destination at all: the same eight
-images cost 84 kB. What that gives up is `read_samples_into`'s checks of the buffer it is
-handed and its decoded-output cap at the native width; none of them decodes anything, and
-`decode_any` reaches the same cap at `f32`'s width. The seed is
-`xisf/distinct-images-alternating-sample-format`.
+before the library allocates a byte. Reading every image through the chunk cursor, which every
+native read is built on, would need no destination at all, and would take
+`read_samples_into`'s checks of the buffer it is handed and its decoded-output cap at the
+native width out of the fuzzer's reach. So `xisf_block` does both: it builds one `Samples` for
+the first image that declares a geometry and holds it for the run, reads every image matching
+it in format and length through `read_samples_into` — the common case, one image repeated by
+`<Reference>` — and reads any other through the chunk cursor rather than building a second
+buffer. The same eight images cost 2.18 MB and 256 of them 2.69 MB, one 2 MiB buffer and the
+decode. The seed is `xisf/distinct-images-alternating-sample-format`.
 
 **`decode_alloc`'s geometry-implied term is charged per occurrence, each capped by the
 decoded-output cap, and this is the record of why it is not one ceiling.** `read_image()`

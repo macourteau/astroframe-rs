@@ -32,7 +32,7 @@
 mod alloc;
 mod common;
 
-use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits};
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits, Samples};
 use common::Hdu;
 use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib, zstd_raw};
 use std::io::Cursor;
@@ -226,12 +226,14 @@ fn header_lane(data: &[u8], options: &DecodeOptions) {
 }
 
 /// `decode_any` and `xisf_block`: a seekable source read into an `f32` destination the caller
-/// sizes from the parsed header and holds across images, and as native samples through the
-/// chunk cursor, as the targets read them.
+/// sizes from the parsed header and holds across images, and as native samples the way
+/// `xisf_block` reads them — into one held `Samples` where the image matches it, and through
+/// the chunk cursor where it does not.
 fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
         let mut dst: Vec<f32> = Vec::new();
+        let mut samples: Option<Samples> = None;
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -243,8 +245,15 @@ fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
                 dst.clear();
                 dst.resize(len, 0.0);
                 let _ = reader.read_image_into(&mut dst);
+                if let Some(f) = h.sample_format() {
+                    let held = samples.get_or_insert_with(|| Samples::zeroed(f, len));
+                    if held.format() == f && held.len() == len {
+                        let _ = reader.read_samples_into(held);
+                    } else {
+                        let _ = reader.for_each_chunk(|_| ControlFlow::Continue(()));
+                    }
+                }
             }
-            let _ = reader.for_each_chunk(|_| ControlFlow::Continue(()));
         }
     }
     assert_within(alloc::total(), bound(data.len()), "decode_any", data.len());
