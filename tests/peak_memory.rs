@@ -102,6 +102,112 @@ fn peak_decode_memory_meets_the_stated_target() {
         }
     }
     a_read_costs_one_read_and_not_the_occurrence_count();
+    a_held_subblock_is_released_before_a_larger_one_is_sized();
+    a_kept_working_set_is_released_before_a_larger_one_is_sized();
+}
+
+/// Incompressible bytes, so a compressed block is about as long as its data.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// Within one read, a held subblock's buffers are released before the next subblock's are
+/// sized whenever either has to grow.
+///
+/// The shape is the one that inverts the two halves: a first subblock of 8 MiB of zeros, whose
+/// stored bytes are tiny, then 4 MiB of noise stored at about its own length. Holding the first
+/// subblock's 8 MiB output while the second's 4 MiB of stored bytes is sized puts both on top
+/// of each other — 12.6 MB, against the 8.4 MB of decoding each subblock from nothing. The
+/// bound is the larger subblock's stored and decompressed bytes together, plus the two row
+/// buffers and a little for the codec.
+fn a_held_subblock_is_released_before_a_larger_one_is_sized() {
+    let (width, height) = (1024u32, 12_288u32);
+    let first = vec![0u8; 8 << 20];
+    let second = noise(4 << 20);
+    let (c1, c2) = (lz4(&first), lz4(&second));
+    let list = format!("{},{}:{},{}", c1.len(), first.len(), c2.len(), second.len());
+    let template = format!(
+        r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt8" compression="lz4:{}" subblocks="{list}" {{loc}}/>"#,
+        first.len() + second.len()
+    );
+    let largest_pair = (c1.len() + first.len()).max(c2.len() + second.len());
+    let unit = Unit::new().attached(&template, [c1, c2].concat()).build();
+
+    let mut dst = astroframe::Samples::zeroed(astroframe::SampleFormat::U8, first.len() * 3 / 2);
+    let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+    assert!(reader.next_image().expect("advance"));
+    alloc::reset();
+    reader.read_samples_into(&mut dst).expect("decode");
+    let used = alloc::peak();
+    let allowed = largest_pair + 2 * width as usize + (64 << 10);
+    assert!(
+        used <= allowed,
+        "a two-subblock LZ4 read peaked at {used} bytes above its destination, over the \
+         {allowed} its larger subblock's stored and decompressed bytes allow. A held \
+         subblock kept while the next one's buffers are sized lands here."
+    );
+}
+
+/// Across reads, nothing an earlier read left is still held while a later read sizes a buffer
+/// larger than the kept one.
+///
+/// Two shuffled zlib blocks, so both are materialized whole: A is 8 MiB of zeros, stored tiny,
+/// and B 4 MiB of noise, stored at about 4 MiB. Keeping A's 8 MiB block while B's stored bytes
+/// are sized puts both on top of each other. The bound is the larger of the two reads' peaks,
+/// each measured on a reader that has read nothing before it.
+fn a_kept_working_set_is_released_before_a_larger_one_is_sized() {
+    let width = 1024u32;
+    let image = |uid: &str, height: u32, data: &[u8]| {
+        (
+            format!(
+                r#"<Image uid="{uid}" geometry="{width}:{height}:1" sampleFormat="UInt8" compression="zlib+sh:{}:1" {{loc}}/>"#,
+                data.len()
+            ),
+            zlib(data),
+        )
+    };
+    let (a, a_stored) = image("a", 8192, &vec![0u8; 8 << 20]);
+    let (b, b_stored) = image("b", 4096, &noise(4 << 20));
+    let unit = Unit::new()
+        .attached(&a, a_stored)
+        .attached(&b, b_stored)
+        .build();
+
+    let mut dst = vec![0.0f32; 8 << 20];
+    let mut alone = Vec::new();
+    for position in 0..2 {
+        let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+        for _ in 0..=position {
+            assert!(reader.next_image().expect("advance"));
+        }
+        let len = reader.destination_len().expect("a length");
+        alloc::reset();
+        reader.read_image_into(&mut dst[..len]).expect("decode");
+        alone.push(alloc::peak());
+    }
+
+    let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+    alloc::reset();
+    while reader.next_image().expect("advance") {
+        let len = reader.destination_len().expect("a length");
+        reader.read_image_into(&mut dst[..len]).expect("decode");
+    }
+    let used = alloc::peak();
+    let allowed = alone[0].max(alone[1]);
+    assert!(
+        used <= allowed,
+        "reading A then B on one reader peaked at {used} bytes above the destination, over \
+         the {allowed} the larger of the two peaks on a reader that read nothing before. A \
+         working set kept while a later read sizes a larger buffer lands here."
+    );
 }
 
 /// Reading one block again costs nothing it did not cost the first time, on every path a read

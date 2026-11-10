@@ -591,7 +591,7 @@ const INPUT_CHUNK: usize = 256 * 1024;
 /// a gigabyte of zeroed buffer, which § Fuzzing's oracle sees in full because it counts every
 /// allocation rather than the peak. Sized from the subblock, the window is bounded by that
 /// subblock's own stored bytes, and the sum over a block is bounded by the block.
-fn input_window(stored_left: u64) -> usize {
+pub(crate) fn input_window(stored_left: u64) -> usize {
     usize::try_from(stored_left)
         .unwrap_or(INPUT_CHUNK)
         .min(INPUT_CHUNK)
@@ -623,9 +623,11 @@ pub(crate) struct Stream {
     zlib: ZlibInput,
     zstd: ZstdOutput,
     current: Current,
-    /// A held subblock's stored bytes, kept for the next one to [`refit`]. Its decompressed
-    /// half is the `buf` of [`Current::Held`], taken back at each [`Stream::open`].
+    /// A held subblock's stored bytes and its decompressed output, which [`Current::Held`]
+    /// delivers from. Kept for the next held subblock, and released together before either
+    /// is sized larger — see [`Stream::open`].
     held_stored: Vec<u8>,
+    held_buf: Vec<u8>,
 }
 
 /// How the current subblock's bytes are delivered.
@@ -649,8 +651,9 @@ enum Current {
     /// produced; a [`PairKind::Probe`] of any codec has to be resident for its attempt. Both
     /// are exactly the `Block` floor `granularity()` reports, and exactly the peak memory
     /// § Streaming promises for it: one subblock, compressed and decompressed, rather than the
-    /// whole image.
-    Held { buf: Vec<u8>, at: usize },
+    /// whole image. The bytes are [`Stream`]'s `held_buf`; this is how much of them has been
+    /// handed over.
+    Held { at: usize },
 }
 
 impl std::fmt::Debug for Stream {
@@ -667,23 +670,48 @@ impl std::fmt::Debug for Stream {
 
 impl Stream {
     /// Ready a stream kept from an earlier read for one of a block declaring `codec`, keeping
-    /// only what that read can use: the codec's own state and input or output buffer, and the
-    /// held-subblock buffers only where `holds` says the block holds subblocks whole.
+    /// only what that read can use: the codec's own state, its input or output buffer where
+    /// `streams` says the block is streamed through it, and the held-subblock buffers only
+    /// where `holds` says the block holds subblocks whole.
     ///
     /// Run before the read sizes anything, so a buffer an earlier read needed and this one does
     /// not is released rather than held beside the ones this read builds.
-    pub(crate) fn keep_only(&mut self, codec: Option<Codec>, holds: bool) {
+    pub(crate) fn keep_only(&mut self, codec: Option<Codec>, streams: bool, holds: bool) {
         self.codecs.keep_only(codec);
-        if codec != Some(Codec::Zlib) {
+        if !(streams && codec == Some(Codec::Zlib)) {
             self.zlib = ZlibInput::default();
         }
-        if codec != Some(Codec::Zstd) {
+        if !(streams && codec == Some(Codec::Zstd)) {
             self.zstd = ZstdOutput::default();
         }
         if !holds {
             self.current = Current::Ended;
             self.held_stored = Vec::new();
+            self.held_buf = Vec::new();
         }
+    }
+
+    /// Whether a read of a block declaring `codec` can run on what this stream already holds
+    /// without growing any of it: the codec's state already built, a zlib input window of at
+    /// least `zlib_window` bytes, and held-subblock buffers of at least `held`'s stored and
+    /// decompressed lengths where the block holds subblocks. A zstd window is not knowable
+    /// before its frame header is read, so whether a zstd state fits is the caller's question.
+    pub(crate) fn fits(
+        &self,
+        codec: Option<Codec>,
+        zlib_window: usize,
+        held: Option<(usize, usize)>,
+    ) -> bool {
+        let state = match codec {
+            Some(Codec::Zlib) => self.codecs.zlib.is_some(),
+            Some(Codec::Zstd) => self.codecs.zstd.is_some(),
+            _ => true,
+        };
+        state
+            && self.zlib.buf.len() >= zlib_window
+            && held.is_none_or(|(stored, out)| {
+                self.held_stored.capacity() >= stored && self.held_buf.capacity() >= out
+            })
     }
 
     /// The codec state, for the materializing walk to decode a whole block with.
@@ -714,14 +742,9 @@ impl Stream {
         at: &mut u64,
         limits: &Limits,
     ) -> Result<()> {
-        // Take the outgoing subblock's buffer back *before* sizing the incoming one's, and
-        // [`refit`] it in place: holding two held subblocks at once is twice what § Streaming's
-        // peak-memory row promises, and building a fresh pair per subblock is a construction
-        // per occurrence. It also leaves the stream delivering nothing if this open fails.
-        let mut held = match std::mem::take(&mut self.current) {
-            Current::Held { buf, .. } => buf,
-            _ => Vec::new(),
-        };
+        // Delivering nothing until the open succeeds, so a read through a failed one is a
+        // truncation rather than a fabricated row.
+        self.current = Current::Ended;
         let Opening {
             codec,
             kind,
@@ -754,18 +777,28 @@ impl Stream {
                 // a `Block`-granularity decode materializes.
                 let compressed_len = check_materialized(*left, limits, "a held subblock's stored")?;
                 let out_len = check_materialized(uncompressed, limits, "a held subblock's")?;
+                // Reused in place when both already fit. When either must grow, both are
+                // released before either is sized: the outgoing subblock's output kept while the
+                // incoming one's stored bytes are allocated is two held subblocks at once, which
+                // is twice what § Streaming's peak-memory row promises.
+                if self.held_stored.capacity() < compressed_len
+                    || self.held_buf.capacity() < out_len
+                {
+                    self.held_stored = Vec::new();
+                    self.held_buf = Vec::new();
+                }
                 refit(&mut self.held_stored, compressed_len);
                 BlockReader::new(src, limits, left, at).copy(&mut self.held_stored)?;
-                refit(&mut held, out_len);
+                refit(&mut self.held_buf, out_len);
                 decode_pair(
                     &mut self.codecs,
                     kind,
                     &self.held_stored,
                     codec,
-                    &mut held,
+                    &mut self.held_buf,
                     limits,
                 )?;
-                Current::Held { buf: held, at: 0 }
+                Current::Held { at: 0 }
             }
         };
         Ok(())
@@ -835,7 +868,8 @@ impl Stream {
             Current::Zstd => self
                 .zstd
                 .fill_upto(self.codecs.zstd(), out, src, left, at, limits),
-            Current::Held { buf, at: held_at } => {
+            Current::Held { at: held_at } => {
+                let buf = &self.held_buf;
                 let take = (buf.len() - *held_at).min(out.len());
                 out[..take].copy_from_slice(&buf[*held_at..*held_at + take]);
                 *held_at += take;

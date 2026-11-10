@@ -16,7 +16,8 @@ use std::io::Cursor;
 use std::ops::ControlFlow;
 
 use astroframe::{
-    Bounds, F64Iter, Format, Header, Orientation, PixelStorage, Reader, RowOrder, Samples, Source,
+    Bounds, F64Iter, Format, Header, Orientation, PixelStorage, Reader, RowOrder, SampleSlice,
+    Samples, Source,
 };
 
 use common::xisf::{self, Unit};
@@ -1352,10 +1353,16 @@ fn a_narrowed_chunk_reports_the_file_index_and_narrowed_destination_coordinates(
 /// The XISF decoder keeps a read's working set — codec state, input window, row buffers, a
 /// materialized block — for the next read, and hands each buffer over zeroed at the length the
 /// read asks for. This is what that has to mean: no state from one read reaches another. So the
-/// run alternates every way the working set can change — zlib, zstd, LZ4 held whole and a
-/// subblock at a time, a shuffled block, a narrower sample format, a smaller image after a
-/// larger one, a read that fails part-way — and returns to earlier images through
-/// `<Reference>`, each compared by `to_bits()` against a reader that read nothing before it.
+/// run alternates every way the working set can change — zlib, zstd streamed whole and split
+/// into subblocks, LZ4 held whole and a subblock at a time, a shuffled block, a checksummed
+/// compressed block that holds its stored bytes and its decompressed form together, a narrower
+/// sample format, a smaller image after a larger one, a read that fails part-way, and reads
+/// abandoned after their first chunk — and returns to earlier images through `<Reference>`.
+/// Every position read through is compared by `to_bits()`, normalized and native alike, against
+/// a reader that read nothing before it.
+///
+/// Without the `checksum` feature the checksummed block declines on both readers, which is
+/// compared as an error like the truncated one.
 #[test]
 fn a_reused_working_set_changes_no_bits() {
     let big = levels(16 * 12);
@@ -1371,11 +1378,40 @@ fn a_reused_working_set_changes_no_bits() {
         xisf::lz4(back).len(),
         back.len()
     );
+    let (zstd_split, zstd_list) = {
+        let mut stored = Vec::new();
+        let mut list = Vec::new();
+        for part in raw_big.chunks(raw_big.len() / 4) {
+            let frame = xisf::zstd_raw(part);
+            list.push(format!("{},{}", frame.len(), part.len()));
+            stored.extend_from_slice(&frame);
+        }
+        (stored, list.join(":"))
+    };
     let mut truncated = xisf::zlib(&raw_big);
     truncated.truncate(truncated.len() / 2);
+    let checksummed = xisf::zlib(&raw_big);
+    let checksum = xisf::checksum_attr("sha1", &checksummed);
     let n_big = raw_big.len();
     let n_small = raw_small.len();
 
+    // Each reference, and whether the reused reader abandons it after its first chunk.
+    let references = [
+        ("zs", false),
+        ("zl", true),
+        ("bad", false),
+        ("lw", true),
+        ("sh", false),
+        ("u8", false),
+        ("lh", true),
+        ("zl", false),
+        ("zm", true),
+        ("ck", false),
+        ("zm", false),
+        ("lh", false),
+        ("ck", true),
+        ("lw", false),
+    ];
     let unit = Unit::new()
         .attached(
             &format!(r#"<Image uid="zl" geometry="16:12:1" sampleFormat="UInt16" compression="zlib:{n_big}" {{loc}}/>"#),
@@ -1405,15 +1441,25 @@ fn a_reused_working_set_changes_no_bits() {
             &format!(r#"<Image uid="sh" geometry="4:3:1" sampleFormat="UInt16" compression="zlib+sh:{n_small}:2" {{loc}}/>"#),
             xisf::zlib(&xisf::shuffle(&raw_small, 2)),
         )
+        .attached(
+            &format!(r#"<Image uid="zm" geometry="16:12:1" sampleFormat="UInt16" compression="zstd:{n_big}" subblocks="{zstd_list}" {{loc}}/>"#),
+            zstd_split,
+        )
+        .attached(
+            &format!(r#"<Image uid="ck" geometry="16:12:1" sampleFormat="UInt16" compression="zlib:{n_big}" {checksum} {{loc}}/>"#),
+            checksummed,
+        )
         .xml(
-            &["zs", "zl", "bad", "lw", "sh", "u8", "lh", "zl"]
-                .map(|r| format!(r#"<Reference ref="{r}"/>"#))
+            &references
+                .map(|(r, _)| format!(r#"<Reference ref="{r}"/>"#))
                 .concat(),
         )
         .build();
+    const IMAGES: usize = 9;
 
-    /// The position's normalized decode and its native samples, or the class of its error.
-    type Decoded = Result<(Vec<f32>, Samples), &'static str>;
+    /// The position's normalized decode and its native samples, both as bits, or the class of
+    /// its error.
+    type Decoded = Result<(Vec<f32>, Vec<u64>), &'static str>;
     fn decode<S: Source>(reader: &mut Reader<S>) -> Decoded {
         let header = reader.current_header().expect("a header");
         let len = expected_len(&header);
@@ -1424,13 +1470,36 @@ fn a_reused_working_set_changes_no_bits() {
         reader
             .read_samples_into(&mut samples)
             .map_err(|e| kind(&e))?;
-        Ok((dst, samples))
+        Ok((dst, native_bits(&samples)))
+    }
+    /// Every native sample as the bits that hold it: `to_bits()` for a float, the value for
+    /// an integer, which no two distinct samples share.
+    fn native_bits(samples: &Samples) -> Vec<u64> {
+        match samples.as_slice() {
+            SampleSlice::U8(v) => v.iter().map(|&x| u64::from(x)).collect(),
+            SampleSlice::U16(v) => v.iter().map(|&x| u64::from(x)).collect(),
+            SampleSlice::U32(v) => v.iter().map(|&x| u64::from(x)).collect(),
+            SampleSlice::U64(v) => v.to_vec(),
+            SampleSlice::I16(v) => v.iter().map(|&x| x as u64).collect(),
+            SampleSlice::I32(v) => v.iter().map(|&x| x as u64).collect(),
+            SampleSlice::I64(v) => v.iter().map(|&x| x as u64).collect(),
+            SampleSlice::F32(v) => v.iter().map(|x| u64::from(x.to_bits())).collect(),
+            SampleSlice::F64(v) => v.iter().map(|x| x.to_bits()).collect(),
+        }
     }
 
     let mut reused = Reader::seekable(Cursor::new(unit.clone())).expect("construct");
     let mut position = 0;
-    let mut failed = 0;
+    let (mut compared, mut failed) = (0, 0);
     while reused.next_image().expect("advance") {
+        let abandoned = position >= IMAGES && references[position - IMAGES].1;
+        if abandoned {
+            // One chunk and no more: the next advance abandons the decode part-way.
+            let mut chunks = reused.chunks();
+            let _ = chunks.next_chunk();
+            position += 1;
+            continue;
+        }
         let got = decode(&mut reused);
         let mut fresh = Reader::seekable(Cursor::new(unit.clone())).expect("construct");
         for _ in 0..=position {
@@ -1441,7 +1510,7 @@ fn a_reused_working_set_changes_no_bits() {
         match (got, want) {
             (Ok((got, got_native)), Ok((want, want_native))) => {
                 assert_same_bits(&got, &want, &what);
-                assert_eq!(got_native, want_native, "{what}: native samples");
+                assert_eq!(got_native, want_native, "{what}: native samples, as bits");
             }
             (got, want) => {
                 assert_eq!(
@@ -1452,8 +1521,17 @@ fn a_reused_working_set_changes_no_bits() {
                 failed += 1;
             }
         }
+        compared += 1;
         position += 1;
     }
-    assert_eq!(position, 15, "seven images and eight references");
-    assert_eq!(failed, 2, "the truncated block, directly and by reference");
+    assert_eq!(
+        position,
+        IMAGES + references.len(),
+        "every image and reference"
+    );
+    assert_eq!(compared, 18, "every position but the five abandoned ones");
+    // The truncated block, directly and by reference; and the checksummed one likewise where
+    // the checksum cannot be verified.
+    let declined = if cfg!(feature = "checksum") { 0 } else { 2 };
+    assert_eq!(failed, 2 + declined);
 }

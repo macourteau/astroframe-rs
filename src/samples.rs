@@ -115,22 +115,33 @@ impl Samples {
         }
     }
 
-    /// [`Samples::zeroed`], reusing `spare`'s allocation where it is the same format.
+    /// [`Samples::zeroed`], reusing `spare`'s allocation where it is the same format and
+    /// already large enough.
     ///
     /// The buffer handed back is the one `zeroed` would have built, sample for sample; only
-    /// the allocation holding it differs.
+    /// the allocation holding it differs. Anything else — another format, or too small — is
+    /// dropped *before* the replacement is allocated, so the two are never live together.
     #[cfg(feature = "xisf")]
     pub(crate) fn refit(spare: Option<Samples>, format: SampleFormat, len: usize) -> Samples {
         match spare {
-            Some(mut s) if s.format() == format => {
+            Some(mut s) if s.format() == format && s.capacity() >= len => {
                 samples_dispatch!(Samples, &mut s, v => {
                     v.clear();
                     v.resize(len, Default::default());
                 });
                 s
             }
-            _ => Samples::zeroed(format, len),
+            other => {
+                drop(other);
+                Samples::zeroed(format, len)
+            }
         }
+    }
+
+    /// How many samples the buffer can hold without allocating.
+    #[cfg(feature = "xisf")]
+    pub(crate) fn capacity(&self) -> usize {
+        samples_dispatch!(Samples, self, v => v.capacity())
     }
 
     /// Which variant this is.

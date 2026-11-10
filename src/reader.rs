@@ -231,18 +231,22 @@ macro_rules! dispatch {
 ///
 /// **An XISF reader holds the last read's working set until the next read begins.** Its codec
 /// state, input and output buffers and row buffers outlive the read that built them, through
-/// [`Reader::next_image`], until the next read of pixels starts — which reuses what it needs and
-/// releases the rest before allocating anything — or until the reader is dropped. One image
-/// reached through many `<Reference>` elements is then decoded with one working set rather
-/// than one per occurrence. For a block decoded whole, at
+/// [`Reader::next_image`], until the next read of pixels starts or the reader is dropped. One
+/// image reached through many `<Reference>` elements is then decoded with one working set
+/// rather than one per occurrence. For a block decoded whole, at
 /// [`Granularity::WholeImage`](crate::Granularity::WholeImage) — LZ4 without `subblocks`, a
-/// byte-shuffled or a checksummed block — that held set includes the whole decompressed block,
-/// and for a block held a subblock at a time, at
-/// [`Granularity::Block`](crate::Granularity::Block), one subblock's stored and decompressed
-/// bytes. Peak memory does not rise above the largest single read's: a buffer is reused only by
-/// a read that uses one of its kind, grows by being dropped before its replacement is sized,
-/// and is never shrunk, so a small read after a large one of the same shape keeps the large
-/// one's allocation. A caller that wants the memory back between reads drops the reader.
+/// byte-shuffled or a checksummed block — that held set includes the whole decompressed block
+/// and its stored bytes, and for a block held a subblock at a time, at
+/// [`Granularity::Block`](crate::Granularity::Block), the largest subblock's stored and
+/// decompressed bytes.
+///
+/// The next read reuses that set only if it fits in it whole — every buffer it will size is
+/// already at least that large — and otherwise releases all of it before sizing anything, so
+/// nothing kept is ever live beside a buffer being allocated. Peak memory is therefore that of
+/// a reader keeping nothing for the same reads, plus at most one row staging buffer and one
+/// chunk of scratch: a stored-bytes buffer that a reader keeping nothing releases as soon as it
+/// has decoded the block or subblock stays allocated here while those two row buffers are in
+/// use. A caller that wants the memory back between reads drops the reader.
 ///
 /// `Send` when its source is, and `Sync` when its source is — the auto traits apply, since
 /// nothing here has interior mutability. Every useful method takes `&mut self`, so a shared

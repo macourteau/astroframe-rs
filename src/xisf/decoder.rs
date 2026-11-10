@@ -7,7 +7,7 @@ use crate::options::DecodeOptions;
 use crate::reader::{ChunkMeta, PixelPlan};
 use crate::samples::{SampleSlice, Samples, slice_samples};
 use crate::source::Source;
-use crate::xisf::block::{self, Codec, Location, unshuffled_byte};
+use crate::xisf::block::{self, Codec, Location, PairKind, unshuffled_byte};
 use crate::xisf::cache::decline_from;
 use crate::xisf::codec::{self, Opening, Stream, refit};
 use crate::xisf::image::{BlockPlan, Occurrence, walk_occurrences};
@@ -242,11 +242,15 @@ pub(crate) struct Decoder {
 /// and decompressed block, each once per occurrence. Kept here, each is built once, at the size
 /// of the largest read that needed it.
 ///
-/// **Only what the next read uses survives into it.** [`Decoder::begin_pixels`] releases the
-/// rest before it sizes anything, so a decode never holds a buffer § Streaming's row for its
-/// shape does not name. What stays alive is the working set the last read ran with, until
-/// the next read begins or the reader is dropped; a buffer is never shrunk, so it is the size
-/// of the largest read of its kind so far.
+/// **A read reuses the spare only if it fits in it whole.** [`Decoder::begin_pixels`] asks
+/// [`Spare::fits`] — every buffer the read will size already at least that large, its codec
+/// state already built, and a zstd state only for a read of the same block — and otherwise
+/// releases all of it before anything is sized, so nothing kept is ever live beside a buffer
+/// being allocated. A fitting read releases the kinds it does not use, so a decode never holds
+/// a buffer § Streaming's row for its shape does not name. Peak memory is that of a reader
+/// keeping nothing, plus at most one row staging buffer and one chunk of scratch: the stored
+/// bytes of a materialized block or a held subblock stay here beside those two, where a reader
+/// keeping nothing has released them before sizing the rows.
 ///
 /// Every buffer is handed to its read exactly as a fresh one would be — zeroed, at the length
 /// the read asks for — so reuse changes which allocation holds the bytes and nothing else.
@@ -255,10 +259,71 @@ struct Spare {
     stream: Stream,
     raw: Vec<u8>,
     scratch: Option<Samples>,
-    /// A materialized block's stored bytes, when it is compressed and they are not the block.
+    /// A materialized compressed attachment's stored bytes.
     stored: Vec<u8>,
-    /// A materialized block: decompressed, or the stored bytes of an uncompressed one.
+    /// A materialized block: decompressed, or the stored bytes of an uncompressed attachment.
     whole: Vec<u8>,
+    /// The block the working set was last used for, which is how a zstd state is known to fit:
+    /// its window is declared by a frame header no earlier step reads.
+    plan: Option<BlockPlan>,
+}
+
+/// What a read of one block sizes, from its plan alone — the question [`Spare::fits`] asks of
+/// the working set an earlier read left.
+struct Needs {
+    raw: u64,
+    chunk: u64,
+    stored: u64,
+    whole: u64,
+    /// Whether the block is streamed through a codec, which is what the stream's input and
+    /// output buffers serve.
+    streams: bool,
+    zlib_window: usize,
+    /// The largest held subblock's stored and decompressed lengths, where the block holds any.
+    held: Option<(usize, usize)>,
+}
+
+impl Needs {
+    fn of(block: &BlockPlan, streaming: bool, row_bytes: u64) -> Needs {
+        let compressed = block.compression.is_some();
+        let (stored, whole) = match (&block.location, streaming, compressed) {
+            (_, true, _) => (0, 0),
+            (Location::Attachment { size, .. }, false, true) => (*size, block.implied_bytes),
+            (Location::Attachment { size, .. }, false, false) => (0, *size),
+            (_, false, true) => (0, block.implied_bytes),
+            (_, false, false) => (0, 0),
+        };
+        let mut needs = Needs {
+            raw: row_bytes,
+            chunk: u64::from(block.geometry.width),
+            stored,
+            whole,
+            streams: streaming && compressed,
+            zlib_window: 0,
+            held: None,
+        };
+        let Some(codec) = block.compression.map(|c| c.codec).filter(|_| streaming) else {
+            return needs;
+        };
+        let size = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        for index in 0..block.pair_count() {
+            let Some(pair) = block.pair(index) else {
+                break;
+            };
+            match (block::classify(pair, block.equal_length_subblocks), codec) {
+                (PairKind::Raw, _) => {}
+                (PairKind::Compressed, Codec::Zlib) => {
+                    needs.zlib_window = needs.zlib_window.max(codec::input_window(pair.0));
+                }
+                (PairKind::Compressed, Codec::Zstd) => {}
+                (PairKind::Compressed, Codec::Lz4 | Codec::Lz4Hc) | (PairKind::Probe, _) => {
+                    let (stored, out) = needs.held.unwrap_or((0, 0));
+                    needs.held = Some((stored.max(size(pair.0)), out.max(size(pair.1))));
+                }
+            }
+        }
+        needs
+    }
 }
 
 impl Spare {
@@ -275,6 +340,26 @@ impl Spare {
         {
             self.whole = whole;
         }
+        self.plan = Some(p.plan);
+    }
+
+    /// Whether a read of `block` can run on this working set without growing any of it.
+    ///
+    /// A zstd state fits only a read of the same block, since its window comes from a frame
+    /// header no earlier step reads; every other buffer is sized from the plan, and fits where
+    /// its capacity is at least what the read will ask of it.
+    fn fits(&self, block: &BlockPlan, needs: &Needs) -> bool {
+        let codec = block.compression.map(|c| c.codec);
+        let wide_enough = |buf: &Vec<u8>, need: u64| buf.capacity() as u64 >= need;
+        (codec != Some(Codec::Zstd) || self.plan.as_ref() == Some(block))
+            && wide_enough(&self.raw, needs.raw)
+            && wide_enough(&self.stored, needs.stored)
+            && wide_enough(&self.whole, needs.whole)
+            && self
+                .scratch
+                .as_ref()
+                .is_some_and(|s| s.format() == block.format && s.capacity() as u64 >= needs.chunk)
+            && self.stream.fits(codec, needs.zlib_window, needs.held)
     }
 }
 
@@ -486,36 +571,30 @@ impl Decoder {
 
         let streaming = is_streamable(&block);
 
-        // Release what this read will not use before sizing what it will — see [`Spare`]. The
-        // rest stays in `self.spare` until every step that can fail has passed, so a read that
-        // fails part-way leaves it for the next instead of dropping it: a failed read is an
-        // occurrence too.
+        // Reuse the working set an earlier read left only when this read fits in it whole;
+        // otherwise release all of it before anything is sized, so nothing kept is ever live
+        // beside a buffer this read allocates — see [`Spare`]. What fits stays in `self.spare`
+        // until every step that can fail has passed, so a read that fails part-way leaves it
+        // for the next instead of dropping it: a failed read is an occurrence too.
         self.recycle();
-        let spare = &mut self.spare;
-        spare.stream.keep_only(
-            block.compression.map(|c| c.codec),
-            streaming && block.holds_whole_subblocks(),
-        );
-        // `materialize` reads an attachment into `stored` and decompresses into `whole`.
-        let attached = matches!(block.location, Location::Attachment { .. });
-        let compressed = block.compression.is_some();
-        match (streaming, attached, compressed) {
-            (false, true, true) => {}
-            // The stored bytes are the block, so one buffer serves: the larger of the two,
-            // since the last such block came back in `whole`.
-            (false, true, false) => {
-                if spare.whole.capacity() > spare.stored.capacity() {
-                    std::mem::swap(&mut spare.stored, &mut spare.whole);
-                }
-                spare.whole = Vec::new();
-            }
-            // An embedded block's stored bytes are the plan's.
-            (false, false, true) => spare.stored = Vec::new(),
-            _ => {
+        let needs = Needs::of(&block, streaming, row_bytes);
+        if self.spare.fits(&block, &needs) {
+            let spare = &mut self.spare;
+            spare.stream.keep_only(
+                block.compression.map(|c| c.codec),
+                needs.streams,
+                needs.held.is_some(),
+            );
+            if needs.stored == 0 {
                 spare.stored = Vec::new();
+            }
+            if needs.whole == 0 {
                 spare.whole = Vec::new();
             }
+        } else {
+            self.spare = Spare::default();
         }
+        let spare = &mut self.spare;
 
         let mut walk = SubblockWalk::default();
         let whole = if streaming {
@@ -1013,6 +1092,13 @@ fn materialize<S: Source>(
             // buffer.
             let size = crate::xisf::codec::check_materialized(*size, limits, "a stored block's")?;
             src.seek_to(*position, limits)?;
+            if block.compression.is_none() {
+                // The stored bytes are the block, so they are read where the block is kept.
+                refit(&mut spare.whole, size);
+                src.read_exact(&mut spare.whole)?;
+                return finish_uncompressed(block, &spare.whole)
+                    .map(|()| std::sync::Arc::new(std::mem::take(&mut spare.whole)));
+            }
             refit(&mut spare.stored, size);
             src.read_exact(&mut spare.stored)?;
             &spare.stored
@@ -1034,6 +1120,19 @@ fn materialize<S: Source>(
         }
     };
 
+    let Some(compression) = &block.compression else {
+        // Uncompressed and resident: the stored bytes *are* the block, so the plan's own buffer
+        // is handed on rather than copied.
+        finish_uncompressed(block, stored)?;
+        return match &block.materialized {
+            Some(bytes) => Ok(bytes.clone()),
+            // Step 1 returned for a resident block with no bytes.
+            None => unreachable!(
+                "internal invariant violated: a resident block reached decompression with no bytes"
+            ),
+        };
+    };
+
     // 2. Verify, before anything touches the bytes. §10.6.2 is explicit that decompressing a
     //    block that failed verification is exploitable, so nothing may be reordered here to
     //    save a pass. The digest covers the entire *stored* block (§10.5).
@@ -1042,27 +1141,6 @@ fn materialize<S: Source>(
     }
 
     // 3. Decompress into a destination sized from the geometry, never from a declared length.
-    let Some(compression) = &block.compression else {
-        if stored.len() as u64 != block.implied_bytes {
-            return Err(Error::malformed(format!(
-                "uncompressed block holds {} bytes where the geometry implies {}",
-                stored.len(),
-                block.implied_bytes
-            )));
-        }
-        // Uncompressed: the stored bytes *are* the block, so the buffer is handed on rather
-        // than copied — the plan's own for an embedded block, `spare.stored` for an attachment.
-        return Ok(match (&block.location, &block.materialized) {
-            (Location::Attachment { .. }, _) => {
-                std::sync::Arc::new(std::mem::take(&mut spare.stored))
-            }
-            (_, Some(bytes)) => bytes.clone(),
-            // Step 1 returned for a resident block with no bytes.
-            (_, None) => unreachable!(
-                "internal invariant violated: a resident block reached decompression with no bytes"
-            ),
-        });
-    };
 
     if let Some(list) = &block.subblocks {
         block::check_subblock_sums(list, stored.len() as u64, block.implied_bytes)?;
@@ -1082,6 +1160,22 @@ fn materialize<S: Source>(
         limits,
     )?;
     Ok(std::sync::Arc::new(std::mem::take(&mut spare.whole)))
+}
+
+/// Steps 2 and 3 for an uncompressed block, whose stored bytes are the block: verify them, then
+/// require the geometry-implied length.
+fn finish_uncompressed(block: &BlockPlan, stored: &[u8]) -> Result<()> {
+    if let Some(checksum) = &block.checksum {
+        codec::verify(checksum, stored)?;
+    }
+    if stored.len() as u64 != block.implied_bytes {
+        return Err(Error::malformed(format!(
+            "uncompressed block holds {} bytes where the geometry implies {}",
+            stored.len(),
+            block.implied_bytes
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
