@@ -1777,10 +1777,10 @@ The stable replay lane runs every seed under both readings.
 **The oracle is not merely "it didn't crash".** Each target asserts that the call returns
 rather than panicking or aborting, that it terminates, and that **total allocation stays
 under `ALLOC_MULTIPLE × input_length + header_cap`, where `ALLOC_MULTIPLE = 32`** — and for
-`decode_alloc` the geometry-implied size on top of that, it being the target whose whole
-purpose is geometry-driven allocation. The caps are deliberately *not* the bound, since
-summing them would admit a gigabyte of allocation from a twenty-byte input and assert almost
-nothing. Two notes on that oracle: measuring total allocation needs a counting global
+`decode_alloc` the geometry-implied size of every occurrence on top of that, it being the
+target whose whole purpose is geometry-driven allocation. The caps are deliberately *not* the
+bound, since summing them would admit a gigabyte of allocation from a twenty-byte input and
+assert almost nothing. Two notes on that oracle: measuring total allocation needs a counting global
 allocator, which needs `unsafe impl` — that lives in the fuzz crate, not the library, so
 `#![forbid(unsafe_code)]` is unaffected; and the bound is expressed against input length
 *plus* the caps because a twenty-byte input may legitimately declare a header the reader
@@ -1940,6 +1940,25 @@ images cost 84 kB. What that gives up is `read_samples_into`'s checks of the buf
 handed and its decoded-output cap at the native width; none of them decodes anything, and
 `decode_any` reaches the same cap at `f32`'s width. The seed is
 `xisf/distinct-images-alternating-sample-format`.
+
+**`decode_alloc`'s geometry-implied term is charged per occurrence, each capped by the
+decoded-output cap, and this is the record of why it is not one ceiling.** `read_image()`
+allocates its own destination on every call, sized from the validated geometry before the
+decode can find anything wrong with the block, so each occurrence it is called on is one
+destination the caller asked for. The term was once a single 16 MiB ceiling over the whole run,
+on the reasoning that more images cost more input bytes to declare and the input-length term
+already scales with them. `<Reference>` makes that false — an occurrence costs twenty bytes —
+and two shapes measured it. 255 references to one compressed 512 × 512 `UInt16` image returned
+255 legitimate 1 MiB images, 268 823 416 bytes against a 25 361 760-byte bound; and the fuzzer
+mutated `xisf/over-cap-image-by-many-references` into an image inside the caps whose embedded
+block is two bytes long, so each of its 24 occurrences allocated a destination and was refused,
+25 271 586 bytes from 747 against 25 189 728. In both the library's own share was a few hundred
+kilobytes. The decoded-output cap is the per-occurrence figure because it is what refuses a
+larger destination before the allocation, so the sum ends at `Images per source` such
+destinations — what that many occurrences may legitimately ask `read_image()` for — and the
+oracle on this target asserts that the library allocates nothing per occurrence beyond them.
+The seeds are `xisf/compressed-image-by-many-references` and
+`xisf/refused-image-by-many-references`.
 
 **The zstd window is the exception, because it does not follow the geometry, and this is the
 record of why it moves.** Its size is the one the frame header declares, capped only by

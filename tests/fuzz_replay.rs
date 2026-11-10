@@ -54,19 +54,17 @@ fn bound(input_len: usize) -> usize {
         .saturating_add(limits().xml_header_bytes as usize)
 }
 
-/// `fuzz/src/lib.rs`'s `IMPLIED_CEILING`, and the one lane that is allowed it: `read_image()`
-/// allocates the destination itself, so its bound carries the geometry-implied size on top of
-/// the general one, clamped overall rather than per occurrence.
-const IMPLIED_CEILING: usize = 1 << 24;
-
+/// `fuzz/src/lib.rs`'s `accumulate_implied`, for the one lane that is allowed it:
+/// `read_image()` allocates its destination on every call, so its bound carries the
+/// geometry-implied size of every occurrence on top of the general one, each capped by the
+/// decoded-output cap that refuses a larger destination before allocating it.
 fn accumulate_implied(total: usize, width: u32, height: u32, channels: u32, bytes: u32) -> usize {
     let samples = u64::from(width)
         .saturating_mul(u64::from(height))
         .saturating_mul(u64::from(channels));
     let geometry_bytes = samples.saturating_mul(u64::from(bytes.max(4)));
-    total
-        .saturating_add(geometry_bytes.min(IMPLIED_CEILING as u64) as usize)
-        .min(IMPLIED_CEILING)
+    let occurrence = geometry_bytes.min(limits().decoded_output_bytes);
+    total.saturating_add(usize::try_from(occurrence).unwrap_or(usize::MAX))
 }
 
 /// `fuzz/src/lib.rs`'s `assert_within`, with its message: a failure is a bug in the
@@ -518,6 +516,37 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
         Unit::new()
             .xml(&format!(
                 r#"<Image uid="im" geometry="512:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
+                r#"<Reference ref="im"/>"#.repeat(24)
+            ))
+            .build(),
+    ));
+    // **A compressed image inside the caps, read once per occurrence.** Every read decodes
+    // legitimately, so whatever a read builds for itself — the codec state and the buffers
+    // around it — is built once per occurrence, a count `Images per source` bounds rather than
+    // the input. The subject is the repetition, so the occurrences are one image repeated. On
+    // `decode_alloc` each occurrence also returns its own 1 MiB `Image`, which is what that
+    // target's per-occurrence term exists for.
+    seeds.push((
+        "xisf/compressed-image-by-many-references".into(),
+        Unit::new()
+            .attached(
+                r#"<Image uid="im" geometry="512:512:1" sampleFormat="UInt16" compression="zlib:524288" {loc}/>"#,
+                zlib(&vec![0u8; 1 << 19]),
+            )
+            .xml(&r#"<Reference ref="im"/>"#.repeat(255))
+            .build(),
+    ));
+    // **An image inside the caps whose read is refused, repeated.** `read_image()` sizes its
+    // destination from the validated geometry — 2¹⁸ samples, 1 MiB of `f32` — before the
+    // decode finds that the embedded block holds two bytes where the geometry implies 524 288,
+    // so every occurrence allocates its destination and returns none. The fuzzer reached it from
+    // `xisf/over-cap-image-by-many-references` in under a minute: 25 271 586 bytes from 747,
+    // against a bound that summed the occurrences under one 16 MiB ceiling.
+    seeds.push((
+        "xisf/refused-image-by-many-references".into(),
+        Unit::new()
+            .xml(&format!(
+                r#"<Image uid="im" geometry="256:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
                 r#"<Reference ref="im"/>"#.repeat(24)
             ))
             .build(),
