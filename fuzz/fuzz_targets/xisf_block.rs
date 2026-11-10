@@ -17,6 +17,10 @@ fuzz_target!(|input: (&[u8], &[u8])| {
 
     let run = start_counting();
     if let Ok(mut reader) = options(&unit).seekable(std::io::Cursor::new(&unit)) {
+        // Held across images, for the reason `decode_any` gives, and replaced only when an
+        // image needs a different format or length: `<Reference>` repeats one image, which is
+        // the shape reuse has to cover.
+        let mut samples: Option<Samples> = None;
         while matches!(reader.next_image(), Ok(true)) {
             let Ok(h) = reader.current_header() else {
                 break;
@@ -30,8 +34,15 @@ fuzz_target!(|input: (&[u8], &[u8])| {
             // capacity: a fixed one would make almost every fuzzer-generated geometry an
             // InvalidRequest before a pixel byte was touched.
             let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
-            let mut samples = Samples::zeroed(f, len);
-            let _ = reader.read_samples_into(&mut samples);
+            if !samples
+                .as_ref()
+                .is_some_and(|s| s.format() == f && s.len() == len)
+            {
+                samples = Some(Samples::zeroed(f, len));
+            }
+            if let Some(samples) = samples.as_mut() {
+                let _ = reader.read_samples_into(samples);
+            }
         }
     }
     assert_within(&run, bound(unit.len()), "xisf_block", unit.len());

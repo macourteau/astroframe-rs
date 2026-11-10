@@ -1898,6 +1898,22 @@ size × 2. Both sit under the header-cap term on their own, and a seed reaching 
 has to carry the stored block in its own bytes, which raises the `ALLOC_MULTIPLE ×
 input_length` term along with it.
 
+**The targets' destination is one buffer held across images, and this is the record of why.**
+The 1 MiB above is the destination for *one* image, and the bound has room for one. A target
+allocating a fresh destination per image charges that 1 MiB once per occurrence, and
+`<Reference>` makes an occurrence cost twenty bytes of input. The fuzzer found exactly that: a
+1274-byte `decode_any` input repeating one image whose geometry declares 5 × 1 999 999 999
+samples allocated 9 527 774 bytes against an 8 429 376-byte bound. The library's share was
+about 90 kB — every read is refused at the total-samples cap before a pixel buffer exists — and
+the rest was nine 1 MiB destinations, each sized from the header and clamped to the cap as the
+table above requires. The oracle is a claim about the library, so the targets hold their
+destination across images, as a caller decoding a sequence holds one: the `f32` destination is
+resized in place and is charged at most 1 MiB whatever the sequence, and `xisf_block`'s native
+`Samples` is replaced only when an image needs a different format or length. That second rule
+covers repetition of one image, which is the shape `<Reference>` makes cheap; a run of
+*distinct* images alternating sample format still charges a buffer per change, each of those
+images paying for an element of its own. The seed is `xisf/over-cap-image-by-many-references`.
+
 **The zstd window is the exception, because it does not follow the geometry, and this is the
 record of why it moves.** Its size is the one the frame header declares, capped only by
 `zstd_window_bytes`, and at the shipped 8 MiB that cap *equals* the bound's whole fixed term —
