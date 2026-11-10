@@ -2,7 +2,8 @@
 //! arithmetic and the allocation guards live.
 #![no_main]
 
-use astroframe::Samples;
+use std::ops::ControlFlow;
+
 use astroframe_fuzz::{assert_within, bound, options, start_counting};
 use libfuzzer_sys::fuzz_target;
 
@@ -17,32 +18,19 @@ fuzz_target!(|input: (&[u8], &[u8])| {
 
     let run = start_counting();
     if let Ok(mut reader) = options(&unit).seekable(std::io::Cursor::new(&unit)) {
-        // Held across images, for the reason `decode_any` gives, and replaced only when an
-        // image needs a different format or length: `<Reference>` repeats one image, which is
-        // the shape reuse has to cover.
-        let mut samples: Option<Samples> = None;
         while matches!(reader.next_image(), Ok(true)) {
-            let Ok(h) = reader.current_header() else {
+            if reader.current_header().is_err() {
                 break;
-            };
-            let (Some(w), Some(ht), Some(c), Some(f)) =
-                (h.width(), h.height(), h.channels(), h.sample_format())
-            else {
-                continue;
-            };
-            // Sized from the parsed header and bounded by the caps, never from a fixed
-            // capacity: a fixed one would make almost every fuzzer-generated geometry an
-            // InvalidRequest before a pixel byte was touched.
-            let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
-            if !samples
-                .as_ref()
-                .is_some_and(|s| s.format() == f && s.len() == len)
-            {
-                samples = Some(Samples::zeroed(f, len));
             }
-            if let Some(samples) = samples.as_mut() {
-                let _ = reader.read_samples_into(samples);
-            }
+            // Native samples through the chunk cursor, which every native read is built on, so
+            // the target holds no destination of its own. A `Samples` destination is typed by
+            // sample format, so no one buffer can serve every image: a run of distinct images
+            // alternating `Float64` and `UInt64` charged a fresh 2 MiB per image — 16.9 MB
+            // from 1068 bytes at eight images — which is the harness's allocation, not the
+            // library's. What is given up is `read_samples_into`'s checks of the buffer it is
+            // handed, and its decoded-output cap at the native width, which `decode_any` reaches
+            // at `f32`'s; none of them decodes anything.
+            let _ = reader.for_each_chunk(|_| ControlFlow::Continue(()));
         }
     }
     assert_within(&run, bound(unit.len()), "xisf_block", unit.len());

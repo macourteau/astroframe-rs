@@ -1925,11 +1925,21 @@ about 90 kB — every read is refused at the total-samples cap before a pixel bu
 the rest was nine 1 MiB destinations, each sized from the header and clamped to the cap as the
 table above requires. The oracle is a claim about the library, so the targets hold their
 destination across images, as a caller decoding a sequence holds one: the `f32` destination is
-resized in place and is charged at most 1 MiB whatever the sequence, and `xisf_block`'s native
-`Samples` is replaced only when an image needs a different format or length. That second rule
-covers repetition of one image, which is the shape `<Reference>` makes cheap; a run of
-*distinct* images alternating sample format still charges a buffer per change, each of those
-images paying for an element of its own. The seed is `xisf/over-cap-image-by-many-references`.
+resized in place and is charged at most 1 MiB whatever the sequence. The seed is
+`xisf/over-cap-image-by-many-references`.
+
+A native destination cannot be held that way, because `Samples` is typed by sample format and
+no one buffer serves two formats. Holding one and replacing it on a change of format still
+charged a fresh one per change: eight *distinct* images alternating `Float64` and `UInt64`,
+each declaring more samples than the cap, allocated 16.9 MB from 1068 bytes, and 256 of them
+537 MB from 30 kB, almost all of it the harness's own 2 MiB buffers. A buffer per format would
+bound it, at 6.75 MiB across XISF's six formats — four-fifths of the bound's fixed term, spent
+before the library allocates a byte. So `xisf_block` reads native samples through the chunk
+cursor, which every native read is built on, and holds no destination at all: the same eight
+images cost 84 kB. What that gives up is `read_samples_into`'s checks of the buffer it is
+handed and its decoded-output cap at the native width; none of them decodes anything, and
+`decode_any` reaches the same cap at `f32`'s width. The seed is
+`xisf/distinct-images-alternating-sample-format`.
 
 **The zstd window is the exception, because it does not follow the geometry, and this is the
 record of why it moves.** Its size is the one the frame header declares, capped only by

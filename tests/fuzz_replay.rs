@@ -32,10 +32,11 @@
 mod alloc;
 mod common;
 
-use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits, Samples};
+use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits};
 use common::Hdu;
 use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib, zstd_raw};
 use std::io::Cursor;
+use std::ops::ControlFlow;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -226,14 +227,13 @@ fn header_lane(data: &[u8], options: &DecodeOptions) {
     );
 }
 
-/// `decode_any` and `xisf_block`: a seekable source read into a destination the caller sizes
-/// from the parsed header, as `f32` and as native samples — each held across images, as the
-/// targets hold theirs.
+/// `decode_any` and `xisf_block`: a seekable source read into an `f32` destination the caller
+/// sizes from the parsed header and holds across images, and as native samples through the
+/// chunk cursor, as the targets read them.
 fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
         let mut dst: Vec<f32> = Vec::new();
-        let mut samples: Option<Samples> = None;
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -245,18 +245,8 @@ fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
                 dst.clear();
                 dst.resize(len, 0.0);
                 let _ = reader.read_image_into(&mut dst);
-                if let Some(f) = h.sample_format() {
-                    if !samples
-                        .as_ref()
-                        .is_some_and(|s| s.format() == f && s.len() == len)
-                    {
-                        samples = Some(Samples::zeroed(f, len));
-                    }
-                    if let Some(samples) = samples.as_mut() {
-                        let _ = reader.read_samples_into(samples);
-                    }
-                }
             }
+            let _ = reader.for_each_chunk(|_| ControlFlow::Continue(()));
         }
     }
     assert_within(alloc::total(), bound(data.len()), "decode_any", data.len());
@@ -530,6 +520,26 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
                 r#"<Image uid="im" geometry="512:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
                 r#"<Reference ref="im"/>"#.repeat(24)
             ))
+            .build(),
+    ));
+    // **Distinct images alternating between two eight-byte sample formats**, each declaring
+    // more samples than the cap admits. A native destination is typed by format, so a harness
+    // holding one across images still built a fresh 2 MiB one per image here: 16.9 MB from
+    // 1068 bytes. The images are distinct because the subject is the change of format, which
+    // repeating one image never makes.
+    seeds.push((
+        "xisf/distinct-images-alternating-sample-format".into(),
+        Unit::new()
+            .xml(
+                &(0..8)
+                    .map(|i| {
+                        let format = if i % 2 == 0 { "Float64" } else { "UInt64" };
+                        format!(
+                            r#"<Image geometry="5:1999999999:1" sampleFormat="{format}" location="embedded"><Data encoding="base64">AAA=</Data></Image>"#
+                        )
+                    })
+                    .collect::<String>(),
+            )
             .build(),
     ));
     seeds.push((
