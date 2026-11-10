@@ -16,6 +16,48 @@ A *decline* is not a decode: a position the crate refuses with a stated reason h
 output to move. Entries that change what is declined say so, because that is visible to a
 caller even though no sample changes.
 
+## [0.4.1] — 2026-11-10
+
+**Decoded output does not move.** The one library change reuses buffers across reads. Every
+reused buffer is handed over zeroed at exactly the length a fresh one had, and codec states are
+reset as before, so no arithmetic, cap, error class or validation order changed. Compared: the
+full suite under `--all-features` and under `fits,xisf`, including the exhaustive
+`tests/normalization.rs`. `a_reused_working_set_changes_no_bits` reads 23 positions (checksummed,
+multi-subblock zstd and abandoned reads among them) on a reused reader and on a fresh one, and
+compares them bit for bit. A cross-revision digest comparison decoded every XISF position in the
+corpus with 0.4.0 and with this release, under each `EqualLengthSubblocks` reading: 1391 files and
+2788 positions across the two readings, 2766 of them decoded, 0 digests and 0 error classes
+changed. The corpus tier passes, and every example ran clean over 32 corpus frames. Peak resident
+memory, measured on Linux: 40 KiB above baseline for a 25 MP FITS against the 25 MiB allowed, and
+8.4 MiB for a compressed XISF against 26.8 MiB, the maximum over three runs — both as in 0.4.0.
+Each fuzz target ran one minute without a finding.
+
+### Fixed
+
+- **An XISF image reached through many `<Reference>` elements is no longer decoded with one
+  working set per occurrence.** Each read built its codec state, row buffer, scratch and, for a
+  block decoded whole, its stored and decompressed bytes afresh: about 46 kB for zlib, 530 kB for
+  LZ4 and 930 kB for zstd, from twenty bytes of input per reference. A reader keeps the last
+  read's working set and reuses it when the next read fits it whole. A read that does not fit
+  releases all of it before sizing anything, and builds its own as a reader keeping nothing
+  would. A repeat read of the same block costs nothing further on a zlib, zstd or uncompressed
+  stream, and 40 bytes on a block decoded whole.
+
+### Changed
+
+- **An XISF reader holds its last read's working set until the next pixel read begins, or until
+  it is dropped,** rather than releasing it at `next_image`. For a block decoded whole, that
+  includes the decompressed block. Peak memory is that of a reader keeping nothing for the same
+  reads, plus at most one row staging buffer and one chunk of scratch on blocks decoded whole or
+  held a subblock at a time. Dropping the reader returns the memory.
+
+### Documentation
+
+- `Reader` states how long it holds a read's working set and the peak bound above. The design
+  document's § Fuzzing records why the fuzz targets hold their destination across images, why the
+  `decode_alloc` oracle charges each occurrence rather than one ceiling, and what a read costs
+  once reused.
+
 ## [0.4.0] — 2026-10-18
 
 Revision 2 of the XISF 1.0 specification document (version 1.02, October 2026) defines how a
@@ -405,6 +447,9 @@ documented cap, a frame the crate cannot decode under its stated rules is an err
 best guess, and a position this version does not handle is *declined* with a class and a reason
 while the walk continues.
 
+[0.4.1]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.4.1
+[0.4.0]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.4.0
+[0.3.1]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.3.0
 [0.2.3]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.3
 [0.2.2]: https://github.com/macourteau/astroframe-rs/releases/tag/v0.2.2
