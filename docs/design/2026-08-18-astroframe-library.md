@@ -1965,7 +1965,9 @@ larger destination before the allocation, so the sum ends at `Images per source`
 destinations — what that many occurrences may legitimately ask `read_image()` for — and the
 oracle on this target asserts that the library allocates nothing per occurrence beyond them.
 The seeds are `xisf/compressed-image-by-many-references` and
-`xisf/refused-image-by-many-references`.
+`xisf/refused-image-by-many-references`. The first carries its image at 157 × 157 rather than
+512 × 512: the smallest side at which the 256 returned images still outgrow one 16 MiB ceiling,
+since the larger image cost the fuzzer 1.9 s an execution.
 
 **The zstd window is the exception, because it does not follow the geometry, and this is the
 record of why it moves.** Its size is the one the frame header declares, capped only by

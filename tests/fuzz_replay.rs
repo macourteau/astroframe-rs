@@ -533,14 +533,20 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
     // legitimately, so whatever a read builds for itself — the codec state and the buffers
     // around it — is built once per occurrence, a count `Images per source` bounds rather than
     // the input. The subject is the repetition, so the occurrences are one image repeated. On
-    // `decode_alloc` each occurrence also returns its own 1 MiB `Image`, which is what that
-    // target's per-occurrence term exists for.
+    // `decode_alloc` each occurrence also returns its own `Image`, which is what that target's
+    // per-occurrence term exists for.
+    //
+    // 157 × 157 is the smallest side at which the 256 returned images outgrow a single 16 MiB
+    // ceiling over the run, so the seed still fails the oracle that summed the term that way —
+    // 25 626 805 bytes against 25 346 944. The rebuilt-per-read working set fails `decode_any`
+    // at any size, its inflate state being a fixed 43 KB a read. Larger sides cost the fuzzer
+    // throughput for nothing: 512 × 512 took 1.9 s an execution.
     seeds.push((
         "xisf/compressed-image-by-many-references".into(),
         Unit::new()
             .attached(
-                r#"<Image uid="im" geometry="512:512:1" sampleFormat="UInt16" compression="zlib:524288" {loc}/>"#,
-                zlib(&vec![0u8; 1 << 19]),
+                r#"<Image uid="im" geometry="157:157:1" sampleFormat="UInt16" compression="zlib:49298" {loc}/>"#,
+                zlib(&vec![0u8; 157 * 157 * 2]),
             )
             .xml(&r#"<Reference ref="im"/>"#.repeat(255))
             .build(),
