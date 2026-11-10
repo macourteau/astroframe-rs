@@ -1916,8 +1916,10 @@ ran with, until the next read begins or the reader is dropped. Peak memory is th
 keeping nothing for the same reads, plus at most one row staging buffer and one chunk of
 scratch, because the stored bytes of a materialized block or a held subblock stay allocated
 beside them (`docs/intentional-patterns.md`, *A read is an occurrence*; the `Reader`
-documentation says the same to callers). A further read of a block already read costs nothing
-on a streamed path and 40 bytes on a materialized one.
+documentation says the same to callers). A read of the same block as the read before it costs
+nothing further on a streamed path and 40 bytes on a materialized one. A read that does not fit
+what the read before it left — references alternating between two different blocks, for
+example — builds its own working set, as a reader keeping nothing would.
 
 **The targets' destination is one buffer held across images, and this is the record of why.**
 The 1 MiB above is the destination for *one* image, and the bound has room for one. A target

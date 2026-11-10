@@ -239,18 +239,21 @@ pub(crate) struct Decoder {
 /// sized by what a read needs rather than by those twenty bytes, which is the rule
 /// `docs/intentional-patterns.md` states: a zlib read built a 43 KB inflate state, a zstd read
 /// about 0.9 MB of window and collected output for a 512 KiB image, and an LZ4 read its stored
-/// and decompressed block, each once per occurrence. Kept here, each is built once, at the size
-/// of the largest read that needed it.
+/// and decompressed block, each once per occurrence. Kept here, a run of reads that each fit
+/// the working set the read before it left builds it once. A read that does not fit — the
+/// next reference names a different block, say, and references alternating between two
+/// blocks can do that at every step — builds its own working set, as a reader keeping nothing
+/// would.
 ///
 /// **A read reuses the spare only if it fits in it whole.** [`Decoder::begin_pixels`] asks
 /// [`Spare::fits`] — every buffer the read will size already at least that large, its codec
 /// state already built, and a zstd state only for a read of the same block — and otherwise
-/// releases all of it before anything is sized, so nothing kept is ever live beside a buffer
-/// being allocated. A fitting read releases the kinds it does not use, so a decode never holds
-/// a buffer § Streaming's row for its shape does not name. Peak memory is that of a reader
-/// keeping nothing, plus at most one row staging buffer and one chunk of scratch: the stored
-/// bytes of a materialized block or a held subblock stay here beside those two, where a reader
-/// keeping nothing has released them before sizing the rows.
+/// releases all of it before anything is sized. A fitting read releases the kinds it does not
+/// use, so a decode never holds a buffer § Streaming's row for its shape does not name. Peak
+/// memory is that of a reader keeping nothing for the same reads, plus at most one row staging
+/// buffer and one chunk of scratch: the stored bytes of a materialized block or a held subblock
+/// stay here beside those two, where a reader keeping nothing has released them before sizing
+/// the rows.
 ///
 /// Every buffer is handed to its read exactly as a fresh one would be — zeroed, at the length
 /// the read asks for — so reuse changes which allocation holds the bytes and nothing else.

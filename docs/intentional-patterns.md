@@ -333,9 +333,11 @@ reader is dropped. Peak memory is that of a reader keeping nothing for the same 
 most one row staging buffer and one chunk of scratch, and the excess has one source: the stored
 bytes of a materialized block or a held subblock, which a reader keeping nothing releases once
 they are decoded, stay allocated beside those two row buffers. Measured, it is 2048 bytes on a
-1024-wide `UInt8` read and 2008 to 2048 on a 512 × 512 `UInt16` one, and nothing on a streamed
-path. Releasing the stored bytes after decoding would remove it and make every further read of
-such a block allocate them again, which is the per-occurrence cost the spare exists to remove.
+1024-wide `UInt8` read and 2008 to 2048 on a 512 × 512 `UInt16` one, and nothing on a zlib,
+zstd or uncompressed stream. A held-subblock read is streamed too, at `Granularity::Block`, and
+carries the same excess, its subblock's stored bytes being the buffer in question. Releasing
+the stored bytes after decoding would remove it and make every further read of such a block
+allocate them again, which is the per-occurrence cost the spare exists to remove.
 The `Reader` documentation states this to callers, and dropping the reader is how they get the
 memory back. `tests/peak_memory.rs`'s `a_held_subblock_is_released_before_a_larger_one_is_sized`
 and `a_kept_working_set_is_released_before_a_larger_one_is_sized` hold the two growth rules.
