@@ -29,7 +29,10 @@ use crate::xisf::xml::Doc;
 use std::sync::Arc;
 
 /// How to get at one image's pixel bytes.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` is what lets a decoder tell a read of the same block from a read of another;
+/// the two `Arc`s compare by pointer first, so a plan cloned from one element compares cheaply.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlockPlan {
     /// Where the block lives.
     pub(crate) location: Location,

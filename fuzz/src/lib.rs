@@ -188,18 +188,22 @@ pub fn bound(input_len: usize) -> usize {
         .saturating_add(limits().xml_header_bytes as usize)
 }
 
-/// The ceiling on `decode_alloc`'s geometry-implied term — the design document's words for
-/// it are **"the geometry-implied size"**, singular, "on top of" the general [`bound`]. It
-/// stands for the widest single legitimate expansion a compressed block's declared-versus-
-/// stored gap can produce, not a sum across every image occurrence an input can enumerate:
-/// [`bound`] already scales with input length, and more images cost more input bytes to
-/// declare, so that scaling is already covered there. Without an overall ceiling a
-/// multi-image input inflates this term without limit and the oracle stops asserting
-/// anything.
-pub const IMPLIED_CEILING: usize = 1 << 24;
-
-/// Fold one image occurrence's declared geometry onto the running geometry-implied total,
-/// clamped overall at [`IMPLIED_CEILING`] rather than per occurrence.
+/// Fold one image occurrence's declared geometry onto `decode_alloc`'s geometry-implied term.
+///
+/// The design document's words for the term are **"the geometry-implied size"** "on top of"
+/// the general [`bound`], and it is **per occurrence**: `read_image()` allocates its own
+/// destination on every call, sized from the validated geometry before the decode can find
+/// anything wrong with the block, so each occurrence it is called on is one destination the
+/// caller asked for. `<Reference>` makes an occurrence cost twenty bytes of input, which is
+/// why the term cannot be one ceiling over the whole run: 255 references to one compressed
+/// image returned 255 legitimate 1 MiB images, and 24 to an image whose read is refused
+/// allocated 24 destinations — each far over a 16 MiB sum that the input's length was
+/// supposed to have paid for.
+///
+/// Each occurrence is capped by the decoded-output cap the fuzz [`limits`] set, because that
+/// cap is what refuses a destination larger than it before the allocation. The sum therefore
+/// ends at `Images per source` such destinations, which is what an input of that many
+/// occurrences may legitimately ask `read_image()` for.
 ///
 /// `width`, `height` and `channels` are declared, attacker-controlled `u32`s, so the sample
 /// count is computed in `u64` with `saturating_mul` rather than `*`. Three `u32`s reach 2^96
@@ -219,9 +223,8 @@ pub fn accumulate_implied(
         .saturating_mul(u64::from(height))
         .saturating_mul(u64::from(channels));
     let geometry_bytes = samples.saturating_mul(u64::from(sample_bytes.max(4)));
-    total
-        .saturating_add(geometry_bytes.min(IMPLIED_CEILING as u64) as usize)
-        .min(IMPLIED_CEILING)
+    let occurrence = geometry_bytes.min(limits().decoded_output_bytes);
+    total.saturating_add(usize::try_from(occurrence).unwrap_or(usize::MAX))
 }
 
 /// Assert the oracle for a run that has finished.
@@ -258,33 +261,32 @@ pub fn walk_headers(data: &[u8]) {
 mod tests {
     use super::*;
 
-    /// A single image at the per-occurrence cap must reach `IMPLIED_CEILING` on its own — the
-    /// ceiling has to be reachable by one occurrence, not just an accumulation artifact.
+    /// One occurrence is charged at most the decoded-output cap, since `read_image()` refuses a
+    /// larger destination before allocating it.
     #[test]
-    fn one_image_can_reach_the_ceiling() {
-        let total = accumulate_implied(0, 4096, 4096, 4, 4);
-        assert_eq!(total, IMPLIED_CEILING);
+    fn one_occurrence_is_capped_by_the_decoded_output_cap() {
+        let cap = limits().decoded_output_bytes as usize;
+        assert_eq!(accumulate_implied(0, 4096, 4096, 4, 4), cap);
     }
 
-    /// Before this fix, `decode_alloc` added `min(1 << 24)` per image occurrence with no
-    /// overall ceiling, so a multi-image input pushed the term past any fixed bound. Five
-    /// occurrences each at the per-image cap must still clamp to `IMPLIED_CEILING` overall,
-    /// not `5 * IMPLIED_CEILING`.
+    /// Every occurrence is charged, not one ceiling over the run: `<Reference>` makes an
+    /// occurrence twenty bytes of input and each `read_image()` call allocates its own
+    /// destination.
     #[test]
-    fn multi_image_accumulation_is_capped_overall_not_per_image() {
+    fn every_occurrence_is_charged() {
+        let cap = limits().decoded_output_bytes as usize;
         let mut total = 0usize;
         for _ in 0..5 {
             total = accumulate_implied(total, 4096, 4096, 4, 4);
         }
-        assert_eq!(total, IMPLIED_CEILING);
+        assert_eq!(total, 5 * cap);
     }
 
-    /// A geometry small enough that neither the per-call minimum nor the overall ceiling
-    /// binds must still accumulate exactly, so the ceiling is not silently swallowing the
-    /// legitimate case it exists to bound. `sample_bytes` is floored at 4 (the normalized
+    /// A geometry small enough that the cap does not bind must accumulate exactly, so the cap
+    /// is not silently swallowing the legitimate case it exists to bound. `sample_bytes` is floored at 4 (the normalized
     /// `f32` width), matching the general bound's own widest-legitimate-expansion reasoning.
     #[test]
-    fn small_geometry_accumulates_exactly_below_the_ceiling() {
+    fn small_geometry_accumulates_exactly_below_the_cap() {
         let total = accumulate_implied(0, 10, 10, 1, 2);
         assert_eq!(total, 10 * 10 * 4);
         let total = accumulate_implied(total, 10, 10, 1, 2);
@@ -296,6 +298,6 @@ mod tests {
     #[test]
     fn a_hostile_declaration_does_not_overflow() {
         let total = accumulate_implied(0, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-        assert_eq!(total, IMPLIED_CEILING);
+        assert_eq!(total, limits().decoded_output_bytes as usize);
     }
 }

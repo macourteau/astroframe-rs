@@ -36,6 +36,7 @@ use astroframe::{DecodeOptions, EqualLengthSubblocks, Limits, Samples};
 use common::Hdu;
 use common::xisf::{Unit, le_u16, raw_unit, repeating_u16, zlib, zstd_raw};
 use std::io::Cursor;
+use std::ops::ControlFlow;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -53,19 +54,17 @@ fn bound(input_len: usize) -> usize {
         .saturating_add(limits().xml_header_bytes as usize)
 }
 
-/// `fuzz/src/lib.rs`'s `IMPLIED_CEILING`, and the one lane that is allowed it: `read_image()`
-/// allocates the destination itself, so its bound carries the geometry-implied size on top of
-/// the general one, clamped overall rather than per occurrence.
-const IMPLIED_CEILING: usize = 1 << 24;
-
+/// `fuzz/src/lib.rs`'s `accumulate_implied`, for the one lane that is allowed it:
+/// `read_image()` allocates its destination on every call, so its bound carries the
+/// geometry-implied size of every occurrence on top of the general one, each capped by the
+/// decoded-output cap that refuses a larger destination before allocating it.
 fn accumulate_implied(total: usize, width: u32, height: u32, channels: u32, bytes: u32) -> usize {
     let samples = u64::from(width)
         .saturating_mul(u64::from(height))
         .saturating_mul(u64::from(channels));
     let geometry_bytes = samples.saturating_mul(u64::from(bytes.max(4)));
-    total
-        .saturating_add(geometry_bytes.min(IMPLIED_CEILING as u64) as usize)
-        .min(IMPLIED_CEILING)
+    let occurrence = geometry_bytes.min(limits().decoded_output_bytes);
+    total.saturating_add(usize::try_from(occurrence).unwrap_or(usize::MAX))
 }
 
 /// `fuzz/src/lib.rs`'s `assert_within`, with its message: a failure is a bug in the
@@ -226,9 +225,10 @@ fn header_lane(data: &[u8], options: &DecodeOptions) {
     );
 }
 
-/// `decode_any` and `xisf_block`: a seekable source read into a destination the caller sizes
-/// from the parsed header, as `f32` and as native samples — each held across images, as the
-/// targets hold theirs.
+/// `decode_any` and `xisf_block`: a seekable source read into an `f32` destination the caller
+/// sizes from the parsed header and holds across images, and as native samples the way
+/// `xisf_block` reads them — into one held `Samples` where the image matches it, and through
+/// the chunk cursor where it does not.
 fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
@@ -246,14 +246,11 @@ fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
                 dst.resize(len, 0.0);
                 let _ = reader.read_image_into(&mut dst);
                 if let Some(f) = h.sample_format() {
-                    if !samples
-                        .as_ref()
-                        .is_some_and(|s| s.format() == f && s.len() == len)
-                    {
-                        samples = Some(Samples::zeroed(f, len));
-                    }
-                    if let Some(samples) = samples.as_mut() {
-                        let _ = reader.read_samples_into(samples);
+                    let held = samples.get_or_insert_with(|| Samples::zeroed(f, len));
+                    if held.format() == f && held.len() == len {
+                        let _ = reader.read_samples_into(held);
+                    } else {
+                        let _ = reader.for_each_chunk(|_| ControlFlow::Continue(()));
                     }
                 }
             }
@@ -530,6 +527,63 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
                 r#"<Image uid="im" geometry="512:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
                 r#"<Reference ref="im"/>"#.repeat(24)
             ))
+            .build(),
+    ));
+    // **A compressed image inside the caps, read once per occurrence.** Every read decodes
+    // legitimately, so whatever a read builds for itself — the codec state and the buffers
+    // around it — is built once per occurrence, a count `Images per source` bounds rather than
+    // the input. The subject is the repetition, so the occurrences are one image repeated. On
+    // `decode_alloc` each occurrence also returns its own `Image`, which is what that target's
+    // per-occurrence term exists for.
+    //
+    // 157 × 157 is the smallest side at which the 256 returned images outgrow a single 16 MiB
+    // ceiling over the run, so the seed still fails the oracle that summed the term that way —
+    // 25 626 805 bytes against 25 346 944. The rebuilt-per-read working set fails `decode_any`
+    // at any size, its inflate state being a fixed 43 KB a read. Larger sides cost the fuzzer
+    // throughput for nothing: 512 × 512 took 1.9 s an execution.
+    seeds.push((
+        "xisf/compressed-image-by-many-references".into(),
+        Unit::new()
+            .attached(
+                r#"<Image uid="im" geometry="157:157:1" sampleFormat="UInt16" compression="zlib:49298" {loc}/>"#,
+                zlib(&vec![0u8; 157 * 157 * 2]),
+            )
+            .xml(&r#"<Reference ref="im"/>"#.repeat(255))
+            .build(),
+    ));
+    // **An image inside the caps whose read is refused, repeated.** `read_image()` sizes its
+    // destination from the validated geometry — 2¹⁸ samples, 1 MiB of `f32` — before the
+    // decode finds that the embedded block holds two bytes where the geometry implies 524 288,
+    // so every occurrence allocates its destination and returns none. The fuzzer reached it from
+    // `xisf/over-cap-image-by-many-references` in under a minute: 25 271 586 bytes from 747,
+    // against a bound that summed the occurrences under one 16 MiB ceiling.
+    seeds.push((
+        "xisf/refused-image-by-many-references".into(),
+        Unit::new()
+            .xml(&format!(
+                r#"<Image uid="im" geometry="256:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
+                r#"<Reference ref="im"/>"#.repeat(24)
+            ))
+            .build(),
+    ));
+    // **Distinct images alternating between two eight-byte sample formats**, each declaring
+    // more samples than the cap admits. A native destination is typed by format, so a harness
+    // holding one across images still built a fresh 2 MiB one per image here: 16.9 MB from
+    // 1068 bytes. The images are distinct because the subject is the change of format, which
+    // repeating one image never makes.
+    seeds.push((
+        "xisf/distinct-images-alternating-sample-format".into(),
+        Unit::new()
+            .xml(
+                &(0..8)
+                    .map(|i| {
+                        let format = if i % 2 == 0 { "Float64" } else { "UInt64" };
+                        format!(
+                            r#"<Image geometry="5:1999999999:1" sampleFormat="{format}" location="embedded"><Data encoding="base64">AAA=</Data></Image>"#
+                        )
+                    })
+                    .collect::<String>(),
+            )
             .build(),
     ));
     seeds.push((

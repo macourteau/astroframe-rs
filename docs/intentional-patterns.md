@@ -292,6 +292,60 @@ Two shapes in `src/xisf/codec.rs` look like more code than they need, and each i
   1.43×; without them it is flat at 1.00×. Reaching for `?` and `map_err` on that path, which is what every other fallible call in
   the crate does, reintroduces it.
 
+**A read is an occurrence.** `<Reference>` makes one `<Image>` as many positions as
+`Images per source` allows, at twenty bytes of input each, and every position decodes the same
+block again. So a working set a read builds for itself — a codec state, an input window, the
+output collected from a zstd frame, a materialized block, the row buffers — is a per-occurrence
+allocation whose count is a cap, however legitimate it is for the one read. Measured on a
+512 × 512 `UInt16` image, a read cost 45 875 bytes on zlib, 928 459 on zstd and 528 403 on
+LZ4, and 255 references to the zlib one allocated 13.1 MB from 6123 bytes. Three shapes in
+`src/xisf/` follow from it, and each looks like more code than it needs.
+
+- **`Decoder` keeps a `Spare`, and `next_image` recycles into it rather than dropping the
+  read.** Every buffer in it is handed to the next read through `refit` or `Samples::refit`,
+  which produce exactly the zeroed buffer a fresh allocation would, so reuse is of allocations
+  and never of contents. Dropping the spare at `next_image` is the obvious simplification and
+  reopens the class.
+- **The spare is reused only by a read that fits in it whole, and released whole otherwise.**
+  `Spare::fits` asks it of every buffer the read will size — the row buffers, a materialized
+  block's stored and decompressed bytes, the zlib input window, the largest held subblock's two
+  buffers — and of the codec state, which must already exist; a zstd state fits only a read of
+  the same block, its window being declared by a frame header no earlier step reads. A read
+  that fits releases the kinds it does not use. One that does not releases everything before it
+  sizes anything. Growing one kept buffer in place while the others stay is the obvious
+  shape, and it is the one that stacks reads: an earlier block's 8 MiB kept while a later one's
+  4 MiB of stored bytes was sized peaked at 12.6 MB, where reading each from nothing peaks at
+  8.4. Within a read, `Stream::open` keeps the same rule for a held subblock's two buffers,
+  which are released together before either grows; holding the first subblock's 8 MiB output
+  while the second's stored bytes were sized was the same 12.6 MB.
+- **The spare stays in place until every fallible step of `begin_pixels` has passed.** A read
+  that fails part-way — a corrupt stream, a refused frame header — is an occurrence too, and a
+  spare moved out at the top of the function is dropped on the first `?`, so the next read
+  builds the state again. `SubblockWalk::begin` hands the stream back on a failed open for the
+  same reason, and `materialize` fills `spare.stored` and `spare.whole` in place and takes the
+  block out only when it returns it.
+- **zstd output is collected into a held buffer, not taken from `FrameDecoder::collect`.**
+  `collect` builds a fresh `Vec` per call, which is a frame's worth of allocations per read;
+  `collect_to_writer` drains the same bytes into `ZstdOutput::pending`.
+
+What outlives a read is the working set it ran with, until the next read begins or the
+reader is dropped. Peak memory is that of a reader keeping nothing for the same reads, plus at
+most one row staging buffer and one chunk of scratch, and the excess has one source: the stored
+bytes of a materialized block or a held subblock, which a reader keeping nothing releases once
+they are decoded, stay allocated beside those two row buffers. Measured, it is 2048 bytes on a
+1024-wide `UInt8` read and 2008 to 2048 on a 512 × 512 `UInt16` one, and nothing on a zlib,
+zstd or uncompressed stream. A held-subblock read is streamed too, at `Granularity::Block`, and
+carries the same excess, its subblock's stored bytes being the buffer in question. Releasing
+the stored bytes after decoding would remove it and make every further read of such a block
+allocate them again, which is the per-occurrence cost the spare exists to remove.
+The `Reader` documentation states this to callers, and dropping the reader is how they get the
+memory back. `tests/peak_memory.rs`'s `a_held_subblock_is_released_before_a_larger_one_is_sized`
+and `a_kept_working_set_is_released_before_a_larger_one_is_sized` hold the two growth rules.
+`tests/peak_memory.rs`'s `a_read_costs_one_read_and_not_the_occurrence_count` holds the
+marginal cost of one more read of the same block under 64 bytes on every path a read can take,
+and `tests/pipeline.rs`'s `a_reused_working_set_changes_no_bits` holds that a run of
+differently-shaped reads produces, at every position, the bits a fresh reader produces.
+
 ### How it is enforced
 
 `tests/header_alloc.rs` is where the rule is enforced. Its shapes assert the fuzz oracle's

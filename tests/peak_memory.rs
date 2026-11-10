@@ -101,6 +101,208 @@ fn peak_decode_memory_meets_the_stated_target() {
             the_attempts_cost_nothing_per_refusal(path, codec, strict, attempted);
         }
     }
+    a_read_costs_one_read_and_not_the_occurrence_count();
+    a_held_subblock_is_released_before_a_larger_one_is_sized();
+    a_kept_working_set_is_released_before_a_larger_one_is_sized();
+}
+
+/// Incompressible bytes, so a compressed block is about as long as its data.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// Within one read, a held subblock's buffers are released before the next subblock's are
+/// sized whenever either has to grow.
+///
+/// The shape is the one that inverts the two halves: a first subblock of 8 MiB of zeros, whose
+/// stored bytes are tiny, then 4 MiB of noise stored at about its own length. Holding the first
+/// subblock's 8 MiB output while the second's 4 MiB of stored bytes is sized puts both on top
+/// of each other — 12.6 MB, against the 8.4 MB of decoding each subblock from nothing. The
+/// bound is the larger subblock's stored and decompressed bytes together, plus the two row
+/// buffers and a little for the codec.
+fn a_held_subblock_is_released_before_a_larger_one_is_sized() {
+    let (width, height) = (1024u32, 12_288u32);
+    let first = vec![0u8; 8 << 20];
+    let second = noise(4 << 20);
+    let (c1, c2) = (lz4(&first), lz4(&second));
+    let list = format!("{},{}:{},{}", c1.len(), first.len(), c2.len(), second.len());
+    let template = format!(
+        r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt8" compression="lz4:{}" subblocks="{list}" {{loc}}/>"#,
+        first.len() + second.len()
+    );
+    let largest_pair = (c1.len() + first.len()).max(c2.len() + second.len());
+    let unit = Unit::new().attached(&template, [c1, c2].concat()).build();
+
+    let mut dst = astroframe::Samples::zeroed(astroframe::SampleFormat::U8, first.len() * 3 / 2);
+    let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+    assert!(reader.next_image().expect("advance"));
+    alloc::reset();
+    reader.read_samples_into(&mut dst).expect("decode");
+    let used = alloc::peak();
+    let allowed = largest_pair + 2 * width as usize + (64 << 10);
+    assert!(
+        used <= allowed,
+        "a two-subblock LZ4 read peaked at {used} bytes above its destination, over the \
+         {allowed} its larger subblock's stored and decompressed bytes allow. A held \
+         subblock kept while the next one's buffers are sized lands here."
+    );
+}
+
+/// Across reads, nothing an earlier read left is still held while a later read sizes a buffer
+/// larger than the kept one.
+///
+/// Two shuffled zlib blocks, so both are materialized whole: A is 8 MiB of zeros, stored tiny,
+/// and B 4 MiB of noise, stored at about 4 MiB. Keeping A's 8 MiB block while B's stored bytes
+/// are sized puts both on top of each other. The bound is the larger of the two reads' peaks,
+/// each measured on a reader that has read nothing before it.
+fn a_kept_working_set_is_released_before_a_larger_one_is_sized() {
+    let width = 1024u32;
+    let image = |uid: &str, height: u32, data: &[u8]| {
+        (
+            format!(
+                r#"<Image uid="{uid}" geometry="{width}:{height}:1" sampleFormat="UInt8" compression="zlib+sh:{}:1" {{loc}}/>"#,
+                data.len()
+            ),
+            zlib(data),
+        )
+    };
+    let (a, a_stored) = image("a", 8192, &vec![0u8; 8 << 20]);
+    let (b, b_stored) = image("b", 4096, &noise(4 << 20));
+    let unit = Unit::new()
+        .attached(&a, a_stored)
+        .attached(&b, b_stored)
+        .build();
+
+    let mut dst = vec![0.0f32; 8 << 20];
+    let mut alone = Vec::new();
+    for position in 0..2 {
+        let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+        for _ in 0..=position {
+            assert!(reader.next_image().expect("advance"));
+        }
+        let len = reader.destination_len().expect("a length");
+        alloc::reset();
+        reader.read_image_into(&mut dst[..len]).expect("decode");
+        alone.push(alloc::peak());
+    }
+
+    let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+    alloc::reset();
+    while reader.next_image().expect("advance") {
+        let len = reader.destination_len().expect("a length");
+        reader.read_image_into(&mut dst[..len]).expect("decode");
+    }
+    let used = alloc::peak();
+    let allowed = alone[0].max(alone[1]);
+    assert!(
+        used <= allowed,
+        "reading A then B on one reader peaked at {used} bytes above the destination, over \
+         the {allowed} the larger of the two peaks on a reader that read nothing before. A \
+         working set kept while a later read sizes a larger buffer lands here."
+    );
+}
+
+/// Reading one block again costs nothing it did not cost the first time, on every path a read
+/// can take.
+///
+/// A read is an occurrence: `<Reference>` makes one `<Image>` as many positions as `Images per
+/// source` allows, twenty bytes of input each, and each position decodes the block afresh. A
+/// working set built per read — a codec state, an input window, collected output, a
+/// materialized block — is therefore a per-occurrence allocation sized by the read rather than
+/// by those twenty bytes, which `docs/intentional-patterns.md` rules out. Measured before the
+/// working set was kept across reads, a 512 × 512 `UInt16` image cost 45 875 bytes a read on
+/// zlib, 928 459 on zstd and 528 403 on LZ4; 255 references to the zlib one allocated 13.1 MB
+/// against the fuzz oracle's 8.6 MB.
+///
+/// Only the reads are counted, the header walk being `tests/header_alloc.rs`'s subject, and the
+/// destination is allocated before them. The figure asserted is the marginal cost of an
+/// occurrence between 8 and 64 of them, against 64 bytes: what is left per read is a fixed
+/// handful, and the smallest working set in question — zlib's inflate state — is 43 KB.
+fn a_read_costs_one_read_and_not_the_occurrence_count() {
+    const COUNTS: [usize; 2] = [8, 64];
+    const PER_OCCURRENCE: usize = 64;
+    let (width, height) = (64u32, 64u32);
+    let raw = common::xisf::le_u16(&repeating_u16((width * height) as usize));
+    let len = raw.len();
+    let (front, back) = raw.split_at(len / 2);
+    let list = format!(
+        "{},{}:{},{}",
+        lz4(front).len(),
+        front.len(),
+        lz4(back).len(),
+        back.len()
+    );
+    // One per path a read can take: the two streamed codecs, LZ4 held whole and held a
+    // subblock at a time, and a shuffled block decompressed whole through the codec state.
+    let shapes: [(&str, String, Vec<u8>); 5] = [
+        (
+            "zlib, streamed",
+            format!(r#"compression="zlib:{len}""#),
+            zlib(&raw),
+        ),
+        (
+            "zstd, streamed",
+            format!(r#"compression="zstd:{len}""#),
+            zstd_raw(&raw),
+        ),
+        (
+            "lz4, materialized",
+            format!(r#"compression="lz4:{len}""#),
+            lz4(&raw),
+        ),
+        (
+            "lz4, a subblock held",
+            format!(r#"compression="lz4:{len}" subblocks="{list}""#),
+            [lz4(front), lz4(back)].concat(),
+        ),
+        (
+            "zlib+sh, materialized",
+            format!(r#"compression="zlib+sh:{len}:2""#),
+            zlib(&shuffle(&raw, 2)),
+        ),
+    ];
+    for (what, attrs, stored) in shapes {
+        let mut totals = Vec::new();
+        for count in COUNTS {
+            let template = format!(
+                r#"<Image uid="im" geometry="{width}:{height}:1" sampleFormat="UInt16" {attrs} {{loc}}/>"#
+            );
+            let unit = Unit::new()
+                .attached(&template, stored.clone())
+                .xml(&r#"<Reference ref="im"/>"#.repeat(count - 1))
+                .build();
+            let mut dst = vec![0.0f32; (width * height) as usize];
+            let mut reader = Reader::seekable(Cursor::new(&unit)).expect("open");
+            alloc::reset();
+            let mut reads = 0;
+            while reader.next_image().expect("advance") {
+                reader.read_image_into(&mut dst).expect("decode");
+                reads += 1;
+            }
+            let used = alloc::total();
+            assert_eq!(reads, count, "{what}: every reference is an occurrence");
+            totals.push(used);
+        }
+        let per = (totals[1] - totals[0]) / (COUNTS[1] - COUNTS[0]);
+        assert!(
+            per <= PER_OCCURRENCE,
+            "{what}: {} reads allocated {} bytes and {} reads {}, {per} bytes for each further \
+             read of the same block, above {PER_OCCURRENCE}. A working set built per read is \
+             sized by the read rather than by the occurrence's twenty bytes of input.",
+            COUNTS[0],
+            totals[0],
+            COUNTS[1],
+            totals[1]
+        );
+    }
 }
 
 /// What `TryDecompress` adds over the default on the same block must not grow with the split.

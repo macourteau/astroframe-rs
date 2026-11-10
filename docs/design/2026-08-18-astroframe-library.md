@@ -1777,10 +1777,10 @@ The stable replay lane runs every seed under both readings.
 **The oracle is not merely "it didn't crash".** Each target asserts that the call returns
 rather than panicking or aborting, that it terminates, and that **total allocation stays
 under `ALLOC_MULTIPLE × input_length + header_cap`, where `ALLOC_MULTIPLE = 32`** — and for
-`decode_alloc` the geometry-implied size on top of that, it being the target whose whole
-purpose is geometry-driven allocation. The caps are deliberately *not* the bound, since
-summing them would admit a gigabyte of allocation from a twenty-byte input and assert almost
-nothing. Two notes on that oracle: measuring total allocation needs a counting global
+`decode_alloc` the geometry-implied size of every occurrence on top of that, it being the
+target whose whole purpose is geometry-driven allocation. The caps are deliberately *not* the
+bound, since summing them would admit a gigabyte of allocation from a twenty-byte input and
+assert almost nothing. Two notes on that oracle: measuring total allocation needs a counting global
 allocator, which needs `unsafe impl` — that lives in the fuzz crate, not the library, so
 `#![forbid(unsafe_code)]` is unaffected; and the bound is expressed against input length
 *plus* the caps because a twenty-byte input may legitimately declare a header the reader
@@ -1894,9 +1894,32 @@ neither of the two trips before the other on normalized output. Of the geometry 
 these two move, because the other fuzz-reachable buffers follow the same geometry rather than
 needing their own tightening: at 2¹⁸ samples the whole-image scratch is at most 2 MiB for the
 widest sample type and the stored block at most 4 MiB, that cap being the geometry-implied
-size × 2. Both sit under the header-cap term on their own, and a seed reaching both at once
+size × 2. Both sit under the header-cap term on their own, and a *read* reaching both at once
 has to carry the stored block in its own bytes, which raises the `ALLOC_MULTIPLE ×
 input_length` term along with it.
+
+**That bounds one read, and a run is as many reads as the input has occurrences.** A
+`<Reference>` costs twenty bytes and makes one more position whose read decodes the same block
+again, so a figure that holds per read holds per *run* only if a read costs nothing the
+previous read already paid for. It did not. Each read built its own working set, and the
+fuzzer's corpus was one mutation away from the shape: measured on a 512 × 512 `UInt16` image,
+a read cost 45 875 bytes on zlib — a 43 296-byte inflate state, the input window and two row
+buffers — 928 459 on zstd, mostly the window and the output collected from it, and 528 403 on
+LZ4, its stored and decompressed block. 255 references to the zlib image allocated 13.1 MB
+from 6123 bytes against an 8.6 MB bound, with every one of those buffers sized by the
+geometry, inside its cap, and legitimate for the one read that built it. The decoder keeps a
+read's working set for the next read, handing each buffer over zeroed at the length asked for.
+The next read reuses it only if it fits in it whole and otherwise releases all of it before
+sizing anything, and a fitting read releases the kinds it does not use, so a decode never
+holds a buffer its § Streaming row does not name. What outlives a read is the working set it
+ran with, until the next read begins or the reader is dropped. Peak memory is that of a reader
+keeping nothing for the same reads, plus at most one row staging buffer and one chunk of
+scratch, because the stored bytes of a materialized block or a held subblock stay allocated
+beside them (`docs/intentional-patterns.md`, *A read is an occurrence*; the `Reader`
+documentation says the same to callers). A read of the same block as the read before it costs
+nothing further on a streamed path and 40 bytes on a materialized one. A read that does not fit
+what the read before it left — references alternating between two different blocks, for
+example — builds its own working set, as a reader keeping nothing would.
 
 **The targets' destination is one buffer held across images, and this is the record of why.**
 The 1 MiB above is the destination for *one* image, and the bound has room for one. A target
@@ -1908,11 +1931,45 @@ about 90 kB — every read is refused at the total-samples cap before a pixel bu
 the rest was nine 1 MiB destinations, each sized from the header and clamped to the cap as the
 table above requires. The oracle is a claim about the library, so the targets hold their
 destination across images, as a caller decoding a sequence holds one: the `f32` destination is
-resized in place and is charged at most 1 MiB whatever the sequence, and `xisf_block`'s native
-`Samples` is replaced only when an image needs a different format or length. That second rule
-covers repetition of one image, which is the shape `<Reference>` makes cheap; a run of
-*distinct* images alternating sample format still charges a buffer per change, each of those
-images paying for an element of its own. The seed is `xisf/over-cap-image-by-many-references`.
+resized in place and is charged at most 1 MiB whatever the sequence. The seed is
+`xisf/over-cap-image-by-many-references`.
+
+A native destination cannot be held that way, because `Samples` is typed by sample format and
+no one buffer serves two formats. Holding one and replacing it on a change of format still
+charged a fresh one per change: eight *distinct* images alternating `Float64` and `UInt64`,
+each declaring more samples than the cap, allocated 16.9 MB from 1068 bytes, and 256 of them
+537 MB from 30 kB, almost all of it the harness's own 2 MiB buffers. A buffer per format would
+bound it, at 6.75 MiB across XISF's six formats — four-fifths of the bound's fixed term, spent
+before the library allocates a byte. Reading every image through the chunk cursor, which every
+native read is built on, would need no destination at all, and would take
+`read_samples_into`'s checks of the buffer it is handed and its decoded-output cap at the
+native width out of the fuzzer's reach. So `xisf_block` does both: it builds one `Samples` for
+the first image that declares a geometry and holds it for the run, reads every image matching
+it in format and length through `read_samples_into` — the common case, one image repeated by
+`<Reference>` — and reads any other through the chunk cursor rather than building a second
+buffer. The same eight images cost 2.18 MB and 256 of them 2.69 MB, one 2 MiB buffer and the
+decode. The seed is `xisf/distinct-images-alternating-sample-format`.
+
+**`decode_alloc`'s geometry-implied term is charged per occurrence, each capped by the
+decoded-output cap, and this is the record of why it is not one ceiling.** `read_image()`
+allocates its own destination on every call, sized from the validated geometry before the
+decode can find anything wrong with the block, so each occurrence it is called on is one
+destination the caller asked for. The term was once a single 16 MiB ceiling over the whole run,
+on the reasoning that more images cost more input bytes to declare and the input-length term
+already scales with them. `<Reference>` makes that false — an occurrence costs twenty bytes —
+and two shapes measured it. 255 references to one compressed 512 × 512 `UInt16` image returned
+255 legitimate 1 MiB images, 268 823 416 bytes against a 25 361 760-byte bound; and the fuzzer
+mutated `xisf/over-cap-image-by-many-references` into an image inside the caps whose embedded
+block is two bytes long, so each of its 24 occurrences allocated a destination and was refused,
+25 271 586 bytes from 747 against 25 189 728. In both the library's own share was a few hundred
+kilobytes. The decoded-output cap is the per-occurrence figure because it is what refuses a
+larger destination before the allocation, so the sum ends at `Images per source` such
+destinations — what that many occurrences may legitimately ask `read_image()` for — and the
+oracle on this target asserts that the library allocates nothing per occurrence beyond them.
+The seeds are `xisf/compressed-image-by-many-references` and
+`xisf/refused-image-by-many-references`. The first carries its image at 157 × 157 rather than
+512 × 512: the smallest side at which the 256 returned images still outgrow one 16 MiB ceiling,
+since the larger image cost the fuzzer 1.9 s an execution.
 
 **The zstd window is the exception, because it does not follow the geometry, and this is the
 record of why it moves.** Its size is the one the frame header declares, capped only by
