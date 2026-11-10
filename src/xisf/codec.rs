@@ -94,7 +94,12 @@ fn hex(bytes: &[u8]) -> String {
 /// Each pair is read as [`classify`] says, which is the decision `Stream::open` acts on for
 /// the same pair on the streaming walk, and decoded by [`decode_pair`], which that walk also
 /// calls for every pair it holds whole.
+///
+/// `codecs` is one codec state for the whole block, whatever the split and whatever each pair
+/// is — and the caller's, so a block read again reuses it. `Stream` carries the same type across
+/// the streaming walk for the reason [`Codecs`] gives.
 pub(crate) fn decompress(
+    codecs: &mut Codecs,
     stored: &[u8],
     compression: &Compression,
     subblocks: Option<&[Subblock]>,
@@ -102,11 +107,6 @@ pub(crate) fn decompress(
     out: &mut [u8],
     limits: &Limits,
 ) -> Result<()> {
-    // One codec state for the whole block, whatever the split and whatever each pair is.
-    // `Stream` carries the same type across the streaming walk for the reason [`Codecs`]
-    // gives.
-    let mut codecs = Codecs::default();
-
     // §10.6.1: a block with no `subblocks` attribute is one pair, of its stored length and its
     // uncompressed size, and every rule for a pair applies to it. So the unsplit block is the
     // split one with a list of one rather than a branch of its own — which is also what makes a
@@ -133,7 +133,7 @@ pub(crate) fn decompress(
             ))
         })?;
         decode_pair(
-            &mut codecs,
+            codecs,
             classify(*pair, reading),
             src,
             compression.codec,
@@ -217,6 +217,13 @@ fn copy_stored(stored: &[u8], dst: &mut [u8]) {
 ///
 /// LZ4 is absent because it has no state to carry — `lz4_flex::block::decompress_into`
 /// allocates no codec and writes straight into the destination.
+///
+/// **It outlives the block, too.** A read is an occurrence as much as a subblock is: one
+/// `<Image>` reached by `Images per source` references is read that many times, so a state
+/// built per read is built a cap's worth of times from twenty bytes of input apiece. The decoder
+/// keeps it across reads in `Spare` and [`Codecs::keep_only`] releases whichever state the next
+/// read's codec does not use, so a decode never holds a state § Streaming's row for its codec
+/// does not name.
 #[derive(Default)]
 pub(crate) struct Codecs {
     zlib: Option<flate2::Decompress>,
@@ -224,6 +231,16 @@ pub(crate) struct Codecs {
 }
 
 impl Codecs {
+    /// Release every state but `codec`'s, before a read of a block that declares `codec`.
+    pub(crate) fn keep_only(&mut self, codec: Option<Codec>) {
+        if codec != Some(Codec::Zlib) {
+            self.zlib = None;
+        }
+        if codec != Some(Codec::Zstd) {
+            self.zstd = None;
+        }
+    }
+
     fn zlib(&mut self) -> &mut flate2::Decompress {
         self.zlib
             .get_or_insert_with(|| flate2::Decompress::new(true))
@@ -606,6 +623,9 @@ pub(crate) struct Stream {
     zlib: ZlibInput,
     zstd: ZstdOutput,
     current: Current,
+    /// A held subblock's stored bytes, kept for the next one to [`refit`]. Its decompressed
+    /// half is the `buf` of [`Current::Held`], taken back at each [`Stream::open`].
+    held_stored: Vec<u8>,
 }
 
 /// How the current subblock's bytes are delivered.
@@ -646,6 +666,31 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
+    /// Ready a stream kept from an earlier read for one of a block declaring `codec`, keeping
+    /// only what that read can use: the codec's own state and input or output buffer, and the
+    /// held-subblock buffers only where `holds` says the block holds subblocks whole.
+    ///
+    /// Run before the read sizes anything, so a buffer an earlier read needed and this one does
+    /// not is released rather than held beside the ones this read builds.
+    pub(crate) fn keep_only(&mut self, codec: Option<Codec>, holds: bool) {
+        self.codecs.keep_only(codec);
+        if codec != Some(Codec::Zlib) {
+            self.zlib = ZlibInput::default();
+        }
+        if codec != Some(Codec::Zstd) {
+            self.zstd = ZstdOutput::default();
+        }
+        if !holds {
+            self.current = Current::Ended;
+            self.held_stored = Vec::new();
+        }
+    }
+
+    /// The codec state, for the materializing walk to decode a whole block with.
+    pub(crate) fn codecs(&mut self) -> &mut Codecs {
+        &mut self.codecs
+    }
+
     /// Open the subblock the cursors describe, as `opening.kind` says, **reusing this stream's
     /// codec state**.
     ///
@@ -669,10 +714,14 @@ impl Stream {
         at: &mut u64,
         limits: &Limits,
     ) -> Result<()> {
-        // Drop the outgoing subblock's buffers *before* sizing the incoming one's: holding two
-        // held subblocks at once is twice what § Streaming's peak-memory row promises. It also
-        // leaves the stream delivering nothing if this open fails.
-        self.current = Current::Ended;
+        // Take the outgoing subblock's buffer back *before* sizing the incoming one's, and
+        // [`refit`] it in place: holding two held subblocks at once is twice what § Streaming's
+        // peak-memory row promises, and building a fresh pair per subblock is a construction
+        // per occurrence. It also leaves the stream delivering nothing if this open fails.
+        let mut held = match std::mem::take(&mut self.current) {
+            Current::Held { buf, .. } => buf,
+            _ => Vec::new(),
+        };
         let Opening {
             codec,
             kind,
@@ -689,7 +738,7 @@ impl Stream {
             (PairKind::Compressed, Codec::Zstd) => {
                 let fd = self.codecs.zstd();
                 fd.set_max_window_size(limits.zstd_window_bytes);
-                self.zstd = ZstdOutput::default();
+                self.zstd.clear();
                 let mut reader = BlockReader::new(src, limits, left, at);
                 // A zstd decoder allocates the window the frame header declares before
                 // producing a byte -- the precise shape of an allocation sized from an
@@ -705,11 +754,18 @@ impl Stream {
                 // a `Block`-granularity decode materializes.
                 let compressed_len = check_materialized(*left, limits, "a held subblock's stored")?;
                 let out_len = check_materialized(uncompressed, limits, "a held subblock's")?;
-                let mut stored = vec![0u8; compressed_len];
-                BlockReader::new(src, limits, left, at).copy(&mut stored)?;
-                let mut buf = vec![0u8; out_len];
-                decode_pair(&mut self.codecs, kind, &stored, codec, &mut buf, limits)?;
-                Current::Held { buf, at: 0 }
+                refit(&mut self.held_stored, compressed_len);
+                BlockReader::new(src, limits, left, at).copy(&mut self.held_stored)?;
+                refit(&mut held, out_len);
+                decode_pair(
+                    &mut self.codecs,
+                    kind,
+                    &self.held_stored,
+                    codec,
+                    &mut held,
+                    limits,
+                )?;
+                Current::Held { buf: held, at: 0 }
             }
         };
         Ok(())
@@ -787,6 +843,21 @@ impl Stream {
             }
         }
     }
+}
+
+/// Make `buf` exactly `len` zeroed bytes, reusing its allocation where it is large enough.
+///
+/// The buffer it hands back is the one `vec![0u8; len]` would have built, byte for byte — the
+/// reuse is of the allocation and of nothing in it. Growing drops the old allocation first, so
+/// the two are never resident together, which is the rule `Stream::open` keeps for a held
+/// subblock. It never shrinks: a buffer reused across occurrences is sized once by the largest
+/// of them, where shrinking would allocate again at every change of size.
+pub(crate) fn refit(buf: &mut Vec<u8>, len: usize) {
+    if buf.capacity() < len {
+        *buf = Vec::new();
+    }
+    buf.clear();
+    buf.resize(len, 0);
 }
 
 /// Check one declared length against the materialization cap and narrow it.
@@ -924,6 +995,12 @@ struct ZstdOutput {
 }
 
 impl ZstdOutput {
+    /// Empty it for a new frame, keeping the allocation.
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.at = 0;
+    }
+
     fn fill_upto<S: Source>(
         &mut self,
         fd: &mut ruzstd::decoding::FrameDecoder,
@@ -963,13 +1040,17 @@ impl ZstdOutput {
                 )))
             })?;
 
-            match fd.collect() {
-                Some(v) if !v.is_empty() => {
-                    self.pending = v;
-                    self.at = 0;
-                }
-                _ if *left == 0 || fd.is_finished() => return Ok(filled),
-                _ => {}
+            // Collected into `pending` rather than taken from `collect()`, which builds a fresh
+            // `Vec` per call: that is one allocation for every few rows, a frame's worth of them
+            // per read, and a read is an occurrence. The bytes are the same ones `collect()`
+            // returns — both drain the decoder's buffer to its retained window, or whole once the
+            // frame is finished — and everything before `at` has been handed over.
+            self.clear();
+            let collected = fd
+                .collect_to_writer(&mut self.pending)
+                .map_err(|e| Error::malformed(format!("zstd block does not decompress: {e}")))?;
+            if collected == 0 && (*left == 0 || fd.is_finished()) {
+                return Ok(filled);
             }
         }
         Ok(filled)

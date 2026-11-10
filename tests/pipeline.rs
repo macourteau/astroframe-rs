@@ -1345,3 +1345,115 @@ fn a_narrowed_chunk_reports_the_file_index_and_narrowed_destination_coordinates(
         }
     }
 }
+
+/// One reader decoding a run of differently-shaped images produces, at every position, the bits
+/// a fresh reader produces for that position alone.
+///
+/// The XISF decoder keeps a read's working set — codec state, input window, row buffers, a
+/// materialized block — for the next read, and hands each buffer over zeroed at the length the
+/// read asks for. This is what that has to mean: no state from one read reaches another. So the
+/// run alternates every way the working set can change — zlib, zstd, LZ4 held whole and a
+/// subblock at a time, a shuffled block, a narrower sample format, a smaller image after a
+/// larger one, a read that fails part-way — and returns to earlier images through
+/// `<Reference>`, each compared by `to_bits()` against a reader that read nothing before it.
+#[test]
+fn a_reused_working_set_changes_no_bits() {
+    let big = levels(16 * 12);
+    let small = levels(4 * 3);
+    let raw_big = xisf::le_u16(&big);
+    let raw_small = xisf::le_u16(&small);
+    let bytes_u8: Vec<u8> = (0..=255u8).cycle().take(16 * 12).collect();
+    let (front, back) = raw_big.split_at(raw_big.len() / 2);
+    let list = format!(
+        "{},{}:{},{}",
+        xisf::lz4(front).len(),
+        front.len(),
+        xisf::lz4(back).len(),
+        back.len()
+    );
+    let mut truncated = xisf::zlib(&raw_big);
+    truncated.truncate(truncated.len() / 2);
+    let n_big = raw_big.len();
+    let n_small = raw_small.len();
+
+    let unit = Unit::new()
+        .attached(
+            &format!(r#"<Image uid="zl" geometry="16:12:1" sampleFormat="UInt16" compression="zlib:{n_big}" {{loc}}/>"#),
+            xisf::zlib(&raw_big),
+        )
+        .attached(
+            &format!(r#"<Image uid="zs" geometry="4:3:1" sampleFormat="UInt16" compression="zstd:{n_small}" {{loc}}/>"#),
+            xisf::zstd_raw(&raw_small),
+        )
+        .attached(
+            &format!(r#"<Image uid="lw" geometry="16:12:1" sampleFormat="UInt16" compression="lz4:{n_big}" {{loc}}/>"#),
+            xisf::lz4(&raw_big),
+        )
+        .attached(
+            r#"<Image uid="u8" geometry="16:12:1" sampleFormat="UInt8" {loc}/>"#,
+            bytes_u8,
+        )
+        .attached(
+            &format!(r#"<Image uid="bad" geometry="16:12:1" sampleFormat="UInt16" compression="zlib:{n_big}" {{loc}}/>"#),
+            truncated,
+        )
+        .attached(
+            &format!(r#"<Image uid="lh" geometry="16:12:1" sampleFormat="UInt16" compression="lz4:{n_big}" subblocks="{list}" {{loc}}/>"#),
+            [xisf::lz4(front), xisf::lz4(back)].concat(),
+        )
+        .attached(
+            &format!(r#"<Image uid="sh" geometry="4:3:1" sampleFormat="UInt16" compression="zlib+sh:{n_small}:2" {{loc}}/>"#),
+            xisf::zlib(&xisf::shuffle(&raw_small, 2)),
+        )
+        .xml(
+            &["zs", "zl", "bad", "lw", "sh", "u8", "lh", "zl"]
+                .map(|r| format!(r#"<Reference ref="{r}"/>"#))
+                .concat(),
+        )
+        .build();
+
+    /// The position's normalized decode and its native samples, or the class of its error.
+    type Decoded = Result<(Vec<f32>, Samples), &'static str>;
+    fn decode<S: Source>(reader: &mut Reader<S>) -> Decoded {
+        let header = reader.current_header().expect("a header");
+        let len = expected_len(&header);
+        let mut dst = vec![0.0f32; len];
+        reader.read_image_into(&mut dst).map_err(|e| kind(&e))?;
+        let format = header.sample_format().expect("a sample format");
+        let mut samples = Samples::zeroed(format, len);
+        reader
+            .read_samples_into(&mut samples)
+            .map_err(|e| kind(&e))?;
+        Ok((dst, samples))
+    }
+
+    let mut reused = Reader::seekable(Cursor::new(unit.clone())).expect("construct");
+    let mut position = 0;
+    let mut failed = 0;
+    while reused.next_image().expect("advance") {
+        let got = decode(&mut reused);
+        let mut fresh = Reader::seekable(Cursor::new(unit.clone())).expect("construct");
+        for _ in 0..=position {
+            assert!(fresh.next_image().expect("advance"), "position {position}");
+        }
+        let want = decode(&mut fresh);
+        let what = format!("position {position}");
+        match (got, want) {
+            (Ok((got, got_native)), Ok((want, want_native))) => {
+                assert_same_bits(&got, &want, &what);
+                assert_eq!(got_native, want_native, "{what}: native samples");
+            }
+            (got, want) => {
+                assert_eq!(
+                    got.err(),
+                    want.err(),
+                    "{what}: a position that fails fails the same way"
+                );
+                failed += 1;
+            }
+        }
+        position += 1;
+    }
+    assert_eq!(position, 15, "seven images and eight references");
+    assert_eq!(failed, 2, "the truncated block, directly and by reference");
+}

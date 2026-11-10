@@ -9,7 +9,7 @@ use crate::samples::{SampleSlice, Samples, slice_samples};
 use crate::source::Source;
 use crate::xisf::block::{self, Codec, Location, unshuffled_byte};
 use crate::xisf::cache::decline_from;
-use crate::xisf::codec::{self, Opening, Stream};
+use crate::xisf::codec::{self, Opening, Stream, refit};
 use crate::xisf::image::{BlockPlan, Occurrence, walk_occurrences};
 use crate::xisf::xml;
 
@@ -71,8 +71,11 @@ struct SubblockWalk {
 }
 
 impl SubblockWalk {
-    /// Open the first pair of a block whose stored bytes begin at `position`.
+    /// Open the first pair of a block whose stored bytes begin at `position`, through the
+    /// stream an earlier read left in `stream`, so its codec state and buffers are reused
+    /// rather than built again. A failed open hands the stream back.
     fn begin<S: Source>(
+        stream: &mut Stream,
         plan: &BlockPlan,
         codec: Codec,
         position: u64,
@@ -80,11 +83,17 @@ impl SubblockWalk {
         limits: &Limits,
     ) -> Result<SubblockWalk> {
         let mut walk = SubblockWalk {
+            stream: std::mem::take(stream),
             next_at: position,
             ..SubblockWalk::default()
         };
-        walk.open(plan, codec, 0, src, limits)?;
-        Ok(walk)
+        match walk.open(plan, codec, 0, src, limits) {
+            Ok(()) => Ok(walk),
+            Err(error) => {
+                *stream = walk.stream;
+                Err(error)
+            }
+        }
     }
 
     /// Open pair `index`, which begins where the pair before it ends.
@@ -214,9 +223,58 @@ pub(crate) struct Decoder {
     /// The next occurrence to advance to.
     next: usize,
     pixels: Option<PixelState>,
+    /// What the last read left behind, for the next one to reuse.
+    spare: Spare,
     /// Set once the current image's samples have been read, which is what makes a re-read
     /// need a seekable source.
     pixels_read: bool,
+}
+
+/// The working set one read builds and the next can reuse: the codec state and the buffers
+/// around it, the row buffers, and a materialized block's buffers.
+///
+/// **A read is an occurrence.** `<Reference>` makes one `<Image>` as many positions as
+/// `Images per source` allows, twenty bytes of input apiece, and every position decodes the
+/// same block afresh. A working set built per read is therefore a per-occurrence allocation
+/// sized by what a read needs rather than by those twenty bytes, which is the rule
+/// `docs/intentional-patterns.md` states: a zlib read built a 43 KB inflate state, a zstd read
+/// about 0.9 MB of window and collected output for a 512 KiB image, and an LZ4 read its stored
+/// and decompressed block, each once per occurrence. Kept here, each is built once, at the size
+/// of the largest read that needed it.
+///
+/// **Only what the next read uses survives into it.** [`Decoder::begin_pixels`] releases the
+/// rest before it sizes anything, so a decode never holds a buffer § Streaming's row for its
+/// shape does not name; what stays alive is what the last read built, until the next read or
+/// the reader goes.
+///
+/// Every buffer is handed to its read exactly as a fresh one would be — zeroed, at the length
+/// the read asks for — so reuse changes which allocation holds the bytes and nothing else.
+#[derive(Debug, Default)]
+struct Spare {
+    stream: Stream,
+    raw: Vec<u8>,
+    scratch: Option<Samples>,
+    /// A materialized block's stored bytes, when it is compressed and they are not the block.
+    stored: Vec<u8>,
+    /// A materialized block: decompressed, or the stored bytes of an uncompressed one.
+    whole: Vec<u8>,
+}
+
+impl Spare {
+    /// Take back what a finished or abandoned read holds.
+    ///
+    /// A `whole` still shared — an embedded block's bytes, which the plan holds too — is not
+    /// this reader's to reuse, and only the reference is dropped.
+    fn reclaim(&mut self, p: PixelState) {
+        self.stream = p.walk.stream;
+        self.raw = p.raw;
+        self.scratch = Some(p.scratch);
+        if let Some(whole) = p.whole
+            && let Ok(whole) = std::sync::Arc::try_unwrap(whole)
+        {
+            self.whole = whole;
+        }
+    }
 }
 
 impl Decoder {
@@ -273,8 +331,16 @@ impl Decoder {
             current: None,
             next: 0,
             pixels: None,
+            spare: Spare::default(),
             pixels_read: false,
         })
+    }
+
+    /// End the current read, keeping its working set for the next.
+    fn recycle(&mut self) {
+        if let Some(p) = self.pixels.take() {
+            self.spare.reclaim(p);
+        }
     }
 
     pub(crate) fn header(&self) -> Option<&Header> {
@@ -307,7 +373,7 @@ impl Decoder {
         }
         self.current = Some(self.next);
         self.next += 1;
-        self.pixels = None;
+        self.recycle();
         self.pixels_read = false;
         Ok(true)
     }
@@ -315,7 +381,7 @@ impl Decoder {
     /// XISF blocks are located by declared offset rather than by walking past them, so a
     /// declined or abandoned image never blocks the next one and there is nothing to skip.
     pub(crate) fn abandon<S: Source>(&mut self, _src: &mut S, _limits: &Limits) -> Result<()> {
-        self.pixels = None;
+        self.recycle();
         Ok(())
     }
 
@@ -418,6 +484,38 @@ impl Decoder {
         }
 
         let streaming = is_streamable(&block);
+
+        // Release what this read will not use before sizing what it will — see [`Spare`]. The
+        // rest stays in `self.spare` until every step that can fail has passed, so a read that
+        // fails part-way leaves it for the next instead of dropping it: a failed read is an
+        // occurrence too.
+        self.recycle();
+        let spare = &mut self.spare;
+        spare.stream.keep_only(
+            block.compression.map(|c| c.codec),
+            streaming && block.holds_whole_subblocks(),
+        );
+        // `materialize` reads an attachment into `stored` and decompresses into `whole`.
+        let attached = matches!(block.location, Location::Attachment { .. });
+        let compressed = block.compression.is_some();
+        match (streaming, attached, compressed) {
+            (false, true, true) => {}
+            // The stored bytes are the block, so one buffer serves: the larger of the two,
+            // since the last such block came back in `whole`.
+            (false, true, false) => {
+                if spare.whole.capacity() > spare.stored.capacity() {
+                    std::mem::swap(&mut spare.stored, &mut spare.whole);
+                }
+                spare.whole = Vec::new();
+            }
+            // An embedded block's stored bytes are the plan's.
+            (false, false, true) => spare.stored = Vec::new(),
+            _ => {
+                spare.stored = Vec::new();
+                spare.whole = Vec::new();
+            }
+        }
+
         let mut walk = SubblockWalk::default();
         let whole = if streaming {
             // `is_streamable` returns false for every location but `Attachment`, so this is
@@ -432,7 +530,8 @@ impl Decoder {
             if let Some(c) = &block.compression {
                 // zstd parses its frame header here, which is also where the declared window
                 // is checked -- before the window is allocated.
-                walk = SubblockWalk::begin(&block, c.codec, position, src, limits)?;
+                walk =
+                    SubblockWalk::begin(&mut spare.stream, &block, c.codec, position, src, limits)?;
             }
             None
         } else {
@@ -443,8 +542,19 @@ impl Decoder {
                     block.implied_bytes, limits.materialized_bytes
                 )));
             }
-            Some(materialize(&block, src, limits)?)
+            Some(materialize(&block, src, limits, spare)?)
         };
+
+        let row_len = narrow(row_bytes, "row staging buffer")?;
+        let chunk_len = narrow(u64::from(g.width), "chunk")?;
+
+        // Nothing below can fail, so the working set moves into the read.
+        if !streaming || block.compression.is_none() {
+            walk.stream = std::mem::take(&mut spare.stream);
+        }
+        let mut raw = std::mem::take(&mut spare.raw);
+        refit(&mut raw, row_len);
+        let scratch = Samples::refit(spare.scratch.take(), block.format, chunk_len);
 
         // One chunk per (channel, row) pair the decode delivers.
         let chunks_total = match plan.selected_channel {
@@ -457,11 +567,11 @@ impl Decoder {
             chunks_total,
             chunks_done: 0,
             whole,
-            raw: vec![0u8; narrow(row_bytes, "row staging buffer")?],
+            raw,
             raw_row: None,
             walk,
             stream_row: 0,
-            scratch: Samples::zeroed(block.format, narrow(u64::from(g.width), "chunk")?),
+            scratch,
             plan: block,
         });
         self.pixels_read = false;
@@ -873,16 +983,22 @@ fn decode_row(
 ///
 /// The pipeline order is fixed and nothing may be reordered to save a pass: §10.6.2 is
 /// explicit that decompressing a block that failed verification is exploitable.
+///
+/// Its buffers are `spare`'s, filled in place — an attachment's stored bytes in `spare.stored`,
+/// a decompressed block in `spare.whole` — and the one it hands back is taken out only once
+/// every step has passed, so a block read again, or a read that fails part-way, builds neither
+/// again ([`Spare`]).
 fn materialize<S: Source>(
     block: &BlockPlan,
     src: &mut S,
     limits: &Limits,
+    spare: &mut Spare,
 ) -> Result<std::sync::Arc<Vec<u8>>> {
     // 1. Read the stored block. Shared rather than copied where it is already resident — an
     //    embedded block's bytes live in the header region this reader already holds — but the
     //    sharing stops here: the pipeline below still runs in full, because a shared buffer is
     //    still a *stored* block and may be compressed, checksummed or both.
-    let stored: std::sync::Arc<Vec<u8>> = match &block.location {
+    let stored: &[u8] = match &block.location {
         Location::Attachment { position, size } => {
             // Measured against `Materialized bytes`, not merely narrowed. This buffer is the
             // largest thing a `WholeImage` decode allocates and it is sized from a *declared*
@@ -896,12 +1012,12 @@ fn materialize<S: Source>(
             // buffer.
             let size = crate::xisf::codec::check_materialized(*size, limits, "a stored block's")?;
             src.seek_to(*position, limits)?;
-            let mut buf = vec![0u8; size];
-            src.read_exact(&mut buf)?;
-            std::sync::Arc::new(buf)
+            refit(&mut spare.stored, size);
+            src.read_exact(&mut spare.stored)?;
+            &spare.stored
         }
         Location::Embedded | Location::Inline(_) => match &block.materialized {
-            Some(bytes) => bytes.clone(),
+            Some(bytes) => bytes,
             None => {
                 return Err(Error::malformed(
                     "an embedded block carries no serialized data",
@@ -921,7 +1037,7 @@ fn materialize<S: Source>(
     //    block that failed verification is exploitable, so nothing may be reordered here to
     //    save a pass. The digest covers the entire *stored* block (§10.5).
     if let Some(checksum) = &block.checksum {
-        codec::verify(checksum, &stored)?;
+        codec::verify(checksum, stored)?;
     }
 
     // 3. Decompress into a destination sized from the geometry, never from a declared length.
@@ -934,24 +1050,37 @@ fn materialize<S: Source>(
             )));
         }
         // Uncompressed: the stored bytes *are* the block, so the buffer is handed on rather
-        // than copied.
-        return Ok(stored);
+        // than copied — the plan's own for an embedded block, `spare.stored` for an attachment.
+        return Ok(match (&block.location, &block.materialized) {
+            (Location::Attachment { .. }, _) => {
+                std::sync::Arc::new(std::mem::take(&mut spare.stored))
+            }
+            (_, Some(bytes)) => bytes.clone(),
+            // Step 1 returned for a resident block with no bytes.
+            (_, None) => unreachable!(
+                "internal invariant violated: a resident block reached decompression with no bytes"
+            ),
+        });
     };
 
     if let Some(list) = &block.subblocks {
         block::check_subblock_sums(list, stored.len() as u64, block.implied_bytes)?;
     }
 
-    let mut out = vec![0u8; narrow(block.implied_bytes, "decompressed block")?];
+    refit(
+        &mut spare.whole,
+        narrow(block.implied_bytes, "decompressed block")?,
+    );
     codec::decompress(
-        &stored,
+        spare.stream.codecs(),
+        stored,
         compression,
         block.subblocks.as_deref(),
         block.equal_length_subblocks,
-        &mut out,
+        &mut spare.whole,
         limits,
     )?;
-    Ok(std::sync::Arc::new(out))
+    Ok(std::sync::Arc::new(std::mem::take(&mut spare.whole)))
 }
 
 #[cfg(test)]

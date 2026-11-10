@@ -115,6 +115,24 @@ impl Samples {
         }
     }
 
+    /// [`Samples::zeroed`], reusing `spare`'s allocation where it is the same format.
+    ///
+    /// The buffer handed back is the one `zeroed` would have built, sample for sample; only
+    /// the allocation holding it differs.
+    #[cfg(feature = "xisf")]
+    pub(crate) fn refit(spare: Option<Samples>, format: SampleFormat, len: usize) -> Samples {
+        match spare {
+            Some(mut s) if s.format() == format => {
+                samples_dispatch!(Samples, &mut s, v => {
+                    v.clear();
+                    v.resize(len, Default::default());
+                });
+                s
+            }
+            _ => Samples::zeroed(format, len),
+        }
+    }
+
     /// Which variant this is.
     pub fn format(&self) -> SampleFormat {
         match self {

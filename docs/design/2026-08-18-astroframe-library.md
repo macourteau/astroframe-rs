@@ -1894,9 +1894,26 @@ neither of the two trips before the other on normalized output. Of the geometry 
 these two move, because the other fuzz-reachable buffers follow the same geometry rather than
 needing their own tightening: at 2¹⁸ samples the whole-image scratch is at most 2 MiB for the
 widest sample type and the stored block at most 4 MiB, that cap being the geometry-implied
-size × 2. Both sit under the header-cap term on their own, and a seed reaching both at once
+size × 2. Both sit under the header-cap term on their own, and a *read* reaching both at once
 has to carry the stored block in its own bytes, which raises the `ALLOC_MULTIPLE ×
 input_length` term along with it.
+
+**That bounds one read, and a run is as many reads as the input has occurrences.** A
+`<Reference>` costs twenty bytes and makes one more position whose read decodes the same block
+again, so a figure that holds per read holds per *run* only if a read costs nothing the
+previous read already paid for. It did not. Each read built its own working set, and the
+fuzzer's corpus was one mutation away from the shape: measured on a 512 × 512 `UInt16` image,
+a read cost 45 875 bytes on zlib — a 43 296-byte inflate state, the input window and two row
+buffers — 928 459 on zstd, mostly the window and the output collected from it, and 528 403 on
+LZ4, its stored and decompressed block. 255 references to the zlib image allocated 13.1 MB
+from 6123 bytes against an 8.6 MB bound, with every one of those buffers sized by the
+geometry, inside its cap, and legitimate for the one read that built it. The decoder keeps a
+read's working set for the next read, handing each buffer over zeroed at the length asked for,
+and releases whatever the next read's shape does not use before that read sizes anything — so
+a decode never holds a buffer its § Streaming row does not name, and what outlives a read is
+that read's own working set, until the next read or the reader goes
+(`docs/intentional-patterns.md`, *A read is an occurrence*). A further read of a block
+already read costs nothing on a streamed path and 40 bytes on a materialized one.
 
 **The targets' destination is one buffer held across images, and this is the record of why.**
 The 1 MiB above is the destination for *one* image, and the bound has room for one. A target
