@@ -29,6 +29,8 @@ fuzz_target!(|data: &[u8]| {
     let run = start_counting();
     let source = Forward { data, at: 0 };
     if let Ok(mut reader) = options(data).sequential(source) {
+        // Held across images, for the reason `decode_any` gives.
+        let mut dst: Vec<f32> = Vec::new();
         while matches!(reader.next_image(), Ok(true)) {
             let Ok(h) = reader.current_header() else {
                 break;
@@ -37,7 +39,8 @@ fuzz_target!(|data: &[u8]| {
                 continue;
             };
             let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
-            let mut dst = vec![0.0f32; len];
+            dst.clear();
+            dst.resize(len, 0.0);
             let _ = reader.read_image_into(&mut dst);
         }
     }

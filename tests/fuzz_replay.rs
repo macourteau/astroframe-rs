@@ -227,10 +227,13 @@ fn header_lane(data: &[u8], options: &DecodeOptions) {
 }
 
 /// `decode_any` and `xisf_block`: a seekable source read into a destination the caller sizes
-/// from the parsed header, as `f32` and as native samples.
+/// from the parsed header, as `f32` and as native samples — each held across images, as the
+/// targets hold theirs.
 fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     if let Ok(mut reader) = options.seekable(Cursor::new(data)) {
+        let mut dst: Vec<f32> = Vec::new();
+        let mut samples: Option<Samples> = None;
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -239,11 +242,19 @@ fn decode_any_lane(data: &[u8], options: &DecodeOptions) {
             };
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
-                let mut dst = vec![0.0f32; len];
+                dst.clear();
+                dst.resize(len, 0.0);
                 let _ = reader.read_image_into(&mut dst);
                 if let Some(f) = h.sample_format() {
-                    let mut samples = Samples::zeroed(f, len);
-                    let _ = reader.read_samples_into(&mut samples);
+                    if !samples
+                        .as_ref()
+                        .is_some_and(|s| s.format() == f && s.len() == len)
+                    {
+                        samples = Some(Samples::zeroed(f, len));
+                    }
+                    if let Some(samples) = samples.as_mut() {
+                        let _ = reader.read_samples_into(samples);
+                    }
                 }
             }
         }
@@ -282,6 +293,7 @@ fn decode_alloc_lane(data: &[u8], options: &DecodeOptions) {
 fn decode_sequential_lane(data: &[u8], options: &DecodeOptions) {
     alloc::reset();
     if let Ok(mut reader) = options.sequential(Forward { data, at: 0 }) {
+        let mut dst: Vec<f32> = Vec::new();
         let mut advances = 0;
         while matches!(reader.next_image(), Ok(true)) && advances < 256 {
             advances += 1;
@@ -290,7 +302,8 @@ fn decode_sequential_lane(data: &[u8], options: &DecodeOptions) {
             };
             if let (Some(w), Some(ht), Some(c)) = (h.width(), h.height(), h.channels()) {
                 let len = (w as u64 * ht as u64 * c as u64).min(1 << 18) as usize;
-                let mut dst = vec![0.0f32; len];
+                dst.clear();
+                dst.resize(len, 0.0);
                 let _ = reader.read_image_into(&mut dst);
             }
         }
@@ -499,6 +512,22 @@ fn synthetic_seeds() -> Vec<(String, Vec<u8>)> {
         Unit::new()
             .xml(&format!(
                 r#"<Image uid="im" id="{big}" geometry="1:1:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
+                r#"<Reference ref="im"/>"#.repeat(24)
+            ))
+            .build(),
+    ));
+    // **The same image, declaring more samples than the total-samples cap admits.** The
+    // library reports each occurrence's geometry and refuses each read at the cap before a
+    // pixel buffer exists, so what multiplies here is the *harness's* destination: sized from
+    // the header and clamped to the cap, it is 1 MiB of `f32` per occurrence. The fuzzer
+    // reached this from the seed above — nine occurrences, 9.5 MB against an 8.4 MB bound,
+    // of which the library's share was 90 kB — so the targets hold one destination across
+    // images, as a caller decoding a sequence does.
+    seeds.push((
+        "xisf/over-cap-image-by-many-references".into(),
+        Unit::new()
+            .xml(&format!(
+                r#"<Image uid="im" geometry="512:1024:1" sampleFormat="UInt16" location="embedded"><Data encoding="base64">AAA=</Data></Image>{}"#,
                 r#"<Reference ref="im"/>"#.repeat(24)
             ))
             .build(),
