@@ -244,8 +244,9 @@ pub(crate) struct Decoder {
 ///
 /// **Only what the next read uses survives into it.** [`Decoder::begin_pixels`] releases the
 /// rest before it sizes anything, so a decode never holds a buffer § Streaming's row for its
-/// shape does not name; what stays alive is what the last read built, until the next read or
-/// the reader goes.
+/// shape does not name. What stays alive is the working set the last read ran with, until
+/// the next read begins or the reader is dropped; a buffer is never shrunk, so it is the size
+/// of the largest read of its kind so far.
 ///
 /// Every buffer is handed to its read exactly as a fresh one would be — zeroed, at the length
 /// the read asks for — so reuse changes which allocation holds the bytes and nothing else.

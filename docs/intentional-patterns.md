@@ -319,7 +319,10 @@ LZ4, and 255 references to the zlib one allocated 13.1 MB from 6123 bytes. Three
   `collect` builds a fresh `Vec` per call, which is a frame's worth of allocations per read;
   `collect_to_writer` drains the same bytes into `ZstdOutput::pending`.
 
-What outlives a read is that read's own working set, until the next read or the reader goes.
+What outlives a read is the working set it ran with, until the next read begins or the
+reader is dropped. A buffer is never shrunk, so each is the size of the largest read of its
+kind so far, and peak memory never rises above the largest single read's; the `Reader`
+documentation states this to callers, and dropping the reader is how they get the memory back.
 `tests/peak_memory.rs`'s `a_read_costs_one_read_and_not_the_occurrence_count` holds the
 marginal cost of one more read of the same block under 64 bytes on every path a read can take,
 and `tests/pipeline.rs`'s `a_reused_working_set_changes_no_bits` holds that a run of

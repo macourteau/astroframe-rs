@@ -1910,9 +1910,11 @@ from 6123 bytes against an 8.6 MB bound, with every one of those buffers sized b
 geometry, inside its cap, and legitimate for the one read that built it. The decoder keeps a
 read's working set for the next read, handing each buffer over zeroed at the length asked for,
 and releases whatever the next read's shape does not use before that read sizes anything — so
-a decode never holds a buffer its § Streaming row does not name, and what outlives a read is
-that read's own working set, until the next read or the reader goes
-(`docs/intentional-patterns.md`, *A read is an occurrence*). A further read of a block
+a decode never holds a buffer its § Streaming row does not name. What outlives a read is
+the working set it ran with, until the next read begins or the reader is dropped; a buffer is
+never shrunk, so it is the size of the largest read of its kind so far, and peak memory never
+rises above the largest single read's (`docs/intentional-patterns.md`, *A read is an
+occurrence*; the `Reader` documentation says the same to callers). A further read of a block
 already read costs nothing on a streamed path and 40 bytes on a materialized one.
 
 **The targets' destination is one buffer held across images, and this is the record of why.**

@@ -995,7 +995,7 @@ struct ZstdOutput {
 }
 
 impl ZstdOutput {
-    /// Empty it for a new frame, keeping the allocation.
+    /// Empty it for the next frame, keeping the allocation.
     fn clear(&mut self) {
         self.pending.clear();
         self.at = 0;
